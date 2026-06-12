@@ -30,6 +30,21 @@ export function __setLockfileModuleForTests(module) {
 }
 export const loadLanceDB = async () => {
     if (!lancedbImportPromise) {
+        // @lancedb/lancedb's napi-rs loader (dist/native.js) detects musl via
+        // process.report.getReport(). The report's network section performs
+        // reverse-DNS lookups for every network interface, synchronously on the
+        // calling thread; on hosts with several interfaces and a slow or flaky
+        // DNS path (measured on WSL2 + Tailscale) this blocks the event loop for
+        // 110-250s on the FIRST LanceDB load — the host app's HTTP server and
+        // pollers freeze with CPU at 0% (main thread stuck in poll()). Excluding
+        // the network section turns the measured 235s hang into ~3ms and loses
+        // nothing: isMusl() only reads report.header.glibcVersionRuntime.
+        try {
+            process.report.excludeNetwork = true;
+        }
+        catch {
+            /* Node < 22 without the flag — keep the previous behavior */
+        }
         // Use a createRequire-built require() so LanceDB's CommonJS native bindings
         // keep Windows-safe CJS semantics while still working in pure ESM runtimes.
         // Do not name this binding "require": bundlers may rewrite bare require()
@@ -361,6 +376,8 @@ export class MemoryStore {
     _lastFtsError = null;
     updateQueue = Promise.resolve();
     nativeCosineFallbackLogged = false;
+    dataModsSinceIndexFold = 0;
+    indexFoldInFlight = false;
     // Cross-call batch accumulator（Issue #690）
     // 多個 concurrent bulkStore() 會先累積在這裡，每 100ms flush 一次，
     // 合併成一個 lock acquisition，大幅降低 lock contention。
@@ -381,6 +398,10 @@ export class MemoryStore {
     // 【MR2 fix】pendingBatch 上限，防止高生產率時無限增長。
     // 當 pending callers 超過此值時，block 並同步 flush，確保 pendingBatch 不會無限膨胀。
     static MAX_PENDING_BATCH_SIZE = 1000;
+    // LanceDB indices are point-in-time snapshots; the SDK recommends running
+    // optimize() after ~20 data modification operations so indices fold in
+    // newly written rows instead of leaving them in the brute-force-scanned tail.
+    static INDEX_FOLD_OP_THRESHOLD = 20;
     config;
     disableNativeCosine;
     constructor(config) {
@@ -538,6 +559,63 @@ export class MemoryStore {
             };
         });
     }
+    /**
+     * Fold newly written rows into existing indices without touching version
+     * history. LanceDB indices are point-in-time snapshots: rows added after
+     * index creation sit in an unindexed tail that searches must brute-force
+     * scan, so without periodic optimize() the FTS index never covers rows
+     * written after first init. The epoch cleanupOlderThan cutoff makes the
+     * prune step a no-op; version retention stays under the opt-in
+     * storageMaintenance.autoCleanup path (see runStorageMaintenance).
+     */
+    async foldIndices(reason) {
+        if (this.indexFoldInFlight || !this.table || typeof this.table.optimize !== "function") {
+            return;
+        }
+        this.indexFoldInFlight = true;
+        const mods = this.dataModsSinceIndexFold;
+        this.dataModsSinceIndexFold = 0;
+        try {
+            await this.runWithFileLock(async () => {
+                await this.table.optimize({ cleanupOlderThan: new Date(0) });
+            });
+            console.log(`[memory-lancedb-pro] index fold completed (reason=${reason}, modsSinceLast=${mods})`);
+        }
+        catch (err) {
+            // Re-arm the counter so a transient failure retries on later writes.
+            this.dataModsSinceIndexFold += mods;
+            console.warn(`[memory-lancedb-pro] index fold failed (reason=${reason}): ${err instanceof Error ? err.message : String(err)}`);
+        }
+        finally {
+            this.indexFoldInFlight = false;
+        }
+    }
+    noteDataModification() {
+        this.dataModsSinceIndexFold += 1;
+        if (this.dataModsSinceIndexFold >= MemoryStore.INDEX_FOLD_OP_THRESHOLD) {
+            void this.foldIndices("write-threshold");
+        }
+    }
+    async scheduleStartupIndexCatchUp() {
+        try {
+            const table = this.table;
+            if (!table || typeof table.indexStats !== "function")
+                return;
+            const indices = await table.listIndices();
+            const fts = indices.find((idx) => idx.indexType === "FTS" || idx.columns?.includes("text"));
+            if (!fts)
+                return;
+            const stats = await table.indexStats(fts.name ?? "text_idx");
+            const backlog = stats?.numUnindexedRows ?? 0;
+            if (backlog >= MemoryStore.INDEX_FOLD_OP_THRESHOLD) {
+                console.log(`[memory-lancedb-pro] FTS index has ${backlog} unindexed rows; scheduling catch-up fold`);
+                void this.foldIndices("startup-backlog");
+            }
+        }
+        catch {
+            // Index stats are best-effort; failures must never affect initialization.
+        }
+    }
     async ensureInitialized() {
         if (this.table) {
             return;
@@ -658,6 +736,9 @@ export class MemoryStore {
         }
         this.db = db;
         this.table = table;
+        // Fold any unindexed backlog accumulated while no maintenance ran
+        // (best-effort, runs in the background, never blocks initialization).
+        void this.scheduleStartupIndexCatchUp();
     }
     async backfillLegacySecondTimestamps(table) {
         try {
@@ -774,7 +855,7 @@ export class MemoryStore {
     }
     async upsert(entry) {
         await this.ensureInitialized();
-        return this.runWithFileLock(() => this.runSerializedUpdate(async () => {
+        const result = await this.runWithFileLock(() => this.runSerializedUpdate(async () => {
             const safeId = escapeSqlLiteral(entry.id);
             await this.table.delete(`id = '${safeId}'`).catch(() => undefined);
             const normalizedEntry = {
@@ -784,6 +865,8 @@ export class MemoryStore {
             await this.table.add([normalizedEntry]);
             return normalizedEntry;
         }));
+        this.noteDataModification();
+        return result;
     }
     /**
      * Store multiple memory entries in a single batch operation.
@@ -928,6 +1011,7 @@ export class MemoryStore {
                     await this.runWithFileLock(async () => {
                         await this.table.add(chunk);
                     });
+                    this.noteDataModification();
                 }
                 catch (err) {
                     lastError = err;
@@ -1645,6 +1729,7 @@ export class MemoryStore {
                     await this.table.delete(`(${deleteWhereClause})`);
                     deleted = true;
                     await this.table.add(updatedEntries);
+                    this.noteDataModification();
                     for (let index = 0; index < updatedEntries.length; index++) {
                         results.set(updatedInputIndices[index], {
                             id: updatedEntries[index].id,
@@ -1812,6 +1897,7 @@ export class MemoryStore {
                 throw new Error(`Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
                     `Write error: ${addError instanceof Error ? addError.message : String(addError)}`);
             }
+            this.noteDataModification();
             return updated;
         }));
     }
