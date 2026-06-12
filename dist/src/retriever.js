@@ -341,7 +341,9 @@ export class MemoryRetriever {
         const { query, limit, scopeFilter, category, source, signal } = context;
         const safeLimit = clampInt(limit, 1, 20);
         this.lastDiagnostics = null;
-        // FLEET-PATCH(#884): resolve lazy store init BEFORE routing reads hasFtsSupport.
+        // FLEET-PATCH(#884): resolve lazy store init BEFORE routing reads hasFtsSupport,
+        // otherwise the first retrieve() in a fresh process silently routes vector-only.
+        // (unknown-cast: ensureInitialized is private on MemoryStore, strict tsc rejects a direct cast)
         await this.store.ensureInitialized?.();
         const diagnostics = {
             source,

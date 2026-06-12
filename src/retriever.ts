@@ -592,7 +592,8 @@ export class MemoryRetriever {
 
     // FLEET-PATCH(#884): resolve lazy store init BEFORE routing reads hasFtsSupport,
     // otherwise the first retrieve() in a fresh process silently routes vector-only.
-    await (this.store as { ensureInitialized?: () => Promise<void> }).ensureInitialized?.();
+    // (unknown-cast: ensureInitialized is private on MemoryStore, strict tsc rejects a direct cast)
+    await (this.store as unknown as { ensureInitialized?: () => Promise<void> }).ensureInitialized?.();
     const diagnostics: RetrievalDiagnostics = {
       source,
       mode: this.config.mode,
