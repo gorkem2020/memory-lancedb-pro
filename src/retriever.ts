@@ -772,7 +772,7 @@ export class MemoryRetriever {
       );
 
       const filtered = category
-        ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
+        ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
         : results;
 
       // Filter expired memories early — before scoring — so they don't
@@ -855,7 +855,7 @@ export class MemoryRetriever {
       { excludeInactive: true },
     );
     const categoryFiltered = category
-      ? bm25Results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
+      ? bm25Results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
       : bm25Results;
     const mustContainFiltered = categoryFiltered.filter((r) => {
       const textLower = r.entry.text.toLowerCase();
@@ -1146,7 +1146,7 @@ export class MemoryRetriever {
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
+      ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
       : results;
 
     return filtered.map((result, index) => ({
@@ -1165,7 +1165,7 @@ export class MemoryRetriever {
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category))
+      ? results.filter((r) => matchesMemoryCategoryFilter(r.entry.category, category, r.entry.metadata))
       : results;
 
     return filtered.map((result, index) => ({
