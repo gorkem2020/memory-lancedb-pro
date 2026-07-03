@@ -145,6 +145,10 @@ interface PluginConfig {
    *  suppressed from auto-recall for this many ms from now. Default: 1800000 (30min). */
   autoRecallSuppressionDurationMs?: number;
   autoRecallTimeoutMs?: number;
+  /** Outer time budget for each startup health check phase (embedding, retrieval).
+   *  Raise on hosts where a cold boot exceeds 8s; the checks run after startup
+   *  and never block the gateway. Default: 8000. */
+  startupCheckTimeoutMs?: number;
   autoRecallMaxItems?: number;
   autoRecallMaxChars?: number;
   autoRecallPerItemMaxChars?: number;
@@ -5014,6 +5018,8 @@ const memoryLanceDBProPlugin = {
           }
         };
 
+        const STARTUP_CHECK_TIMEOUT_MS = parsePositiveInt(config.startupCheckTimeoutMs) ?? 8_000;
+
         const runStartupPhase = async <T extends { success: boolean; error?: string }>(
           label: string,
           check: () => Promise<T>,
@@ -5021,7 +5027,7 @@ const memoryLanceDBProPlugin = {
           const startedAt = Date.now();
           api.logger.info(`memory-lancedb-pro: startup check ${label} started`);
           try {
-            const result = await withTimeout(check(), 8_000, `${label} startup check`);
+            const result = await withTimeout(check(), STARTUP_CHECK_TIMEOUT_MS, `${label} startup check`);
             const elapsedMs = Date.now() - startedAt;
             if (result.success) {
               api.logger.info(
@@ -5049,9 +5055,17 @@ const memoryLanceDBProPlugin = {
               `memory-lancedb-pro: startup checks started (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
             );
 
+            // Warm the one-time store initialization (first table open, FTS
+            // index build) outside the probe timers so the checks measure
+            // steady-state behavior instead of cold-start costs.
+            await runStartupPhase("store", async () => {
+              await store.ensureInitialized();
+              return { success: true };
+            });
+
             const embedTest = await runStartupPhase(
               "embedding",
-              () => embedder.test({ timeoutMs: 7_500 }),
+              () => embedder.test({ timeoutMs: Math.max(1_000, STARTUP_CHECK_TIMEOUT_MS - 500) }),
             );
             const retrievalTest = await runStartupPhase(
               "retrieval",
@@ -5062,8 +5076,8 @@ const memoryLanceDBProPlugin = {
               `memory-lancedb-pro: initialized successfully ` +
               `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
               `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
-              `mode: ${retrievalTest.mode}, ` +
-              `FTS: ${retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
+              `mode: ${retrievalTest.mode ?? "unknown"}, ` +
+              `FTS: ${retrievalTest.hasFtsSupport === undefined ? "unknown" : retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
             );
 
             if (!embedTest.success) {
@@ -5319,6 +5333,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
     autoRecallMaxQueryLength: clampInt(parsePositiveInt(cfg.autoRecallMaxQueryLength) ?? 2_000, 100, 10_000),
     autoRecallTimeoutMs: parsePositiveInt(cfg.autoRecallTimeoutMs) ?? 5000,
+    startupCheckTimeoutMs: parsePositiveInt(cfg.startupCheckTimeoutMs) ?? 8000,
     maxRecallPerTurn: parsePositiveInt(cfg.maxRecallPerTurn) ?? 10,
     recallMode: (cfg.recallMode === "full" || cfg.recallMode === "summary" || cfg.recallMode === "adaptive" || cfg.recallMode === "off") ? cfg.recallMode : "full",
     autoRecallExcludeAgents: Array.isArray(cfg.autoRecallExcludeAgents)
