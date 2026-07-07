@@ -72,6 +72,33 @@ function stripReasoningTrace(text: string): string {
   return text.slice(closingThinkTag + "</think>".length).trim();
 }
 
+/**
+ * Best-effort recovery when a model streams its answer only into a reasoning
+ * field and leaves the regular content empty (e.g. a gateway that doesn't
+ * honor enable_thinking:false). Checks both naming conventions seen across
+ * providers: OpenAI/DeepSeek's `reasoning_content` and vLLM's `reasoning`.
+ */
+function pickReasoningText(source: unknown): string | undefined {
+  if (!source || typeof source !== "object") return undefined;
+  const record = source as Record<string, unknown>;
+  const reasoningContent = record.reasoning_content;
+  if (typeof reasoningContent === "string" && reasoningContent.trim()) return reasoningContent;
+  const reasoning = record.reasoning;
+  if (typeof reasoning === "string" && reasoning.trim()) return reasoning;
+  return undefined;
+}
+
+function recoverJsonFromReasoning<T>(reasoningText: string | undefined): T | null {
+  if (!reasoningText) return null;
+  const jsonStr = extractJsonFromResponse(reasoningText);
+  if (!jsonStr) return null;
+  try {
+    return JSON.parse(jsonStr) as T;
+  } catch {
+    return null;
+  }
+}
+
 function shouldDisableReasoningForJson(model: string): boolean {
   return /qwen3|deepseek.*r1|qwq/i.test(model);
 }
@@ -220,8 +247,16 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
 
         const response = await client.chat.completions.create(request as any);
 
-        const raw = response.choices?.[0]?.message?.content;
+        const message = response.choices?.[0]?.message;
+        const raw = message?.content;
         if (!raw) {
+          const recovered = recoverJsonFromReasoning<T>(pickReasoningText(message));
+          if (recovered !== null) {
+            log(
+              `memory-lancedb-pro: llm-client [${label}] recovered JSON from reasoning field (model ${config.model})`,
+            );
+            return recovered;
+          }
           lastError =
             `memory-lancedb-pro: llm-client [${label}] empty response content from model ${config.model}`;
           log(lastError);
