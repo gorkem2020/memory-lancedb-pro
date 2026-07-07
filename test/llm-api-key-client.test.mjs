@@ -108,4 +108,94 @@ describe("LLM api-key client", () => {
     assert.equal(shouldDisableReasoningForJson("gpt-4o-mini"), false);
     assert.equal(stripReasoningTrace("<think>{\"bad\":true}</think>{\"ok\":true}"), "{\"ok\":true}");
   });
+
+  it("recovers JSON from reasoning_content when message content is empty", async () => {
+    const logs = [];
+    server = http.createServer(async (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: "",
+              reasoning_content: "thinking it through... {\"memories\":[]}",
+            },
+          },
+        ],
+      }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "gpt-4o-mini",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+      log: (message) => logs.push(message),
+    });
+
+    const result = await llm.completeJson("extract", "reasoning-content-probe");
+    assert.deepEqual(result, { memories: [] });
+    assert.ok(logs.some((message) => message.includes("recovered JSON from reasoning field")));
+  });
+
+  it("recovers JSON from the vLLM-style reasoning field when message content is empty", async () => {
+    server = http.createServer(async (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: "",
+              reasoning: "thinking...\n{\"memories\":[{\"text\":\"recovered\"}]}",
+            },
+          },
+        ],
+      }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "Qwen3-235B-A22B",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+    });
+
+    const result = await llm.completeJson("extract", "reasoning-probe");
+    assert.deepEqual(result, { memories: [{ text: "recovered" }] });
+  });
+
+  it("falls through to null when neither content nor reasoning fields yield JSON", async () => {
+    const logs = [];
+    server = http.createServer(async (_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: "",
+              reasoning: "just thinking out loud, nothing structured here",
+            },
+          },
+        ],
+      }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "gpt-4o-mini",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+      log: (message) => logs.push(message),
+    });
+
+    const result = await llm.completeJson("extract", "reasoning-fallthrough");
+    assert.equal(result, null);
+    assert.ok(logs.some((message) => message.includes("empty response content")));
+  });
 });
