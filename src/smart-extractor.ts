@@ -61,6 +61,14 @@ type PendingSupersedeInvalidation = {
   scopeFilter?: string[];
 };
 
+// Discriminates WHY extractCandidates() came back empty, so the caller can
+// tell a genuine "LLM found nothing" verdict from a gateway/model failure or
+// a malformed response shape — only the former is a real noise signal.
+type ExtractCandidatesResult =
+  | { status: "ok"; candidates: CandidateMemory[] }
+  | { status: "llm_failure"; candidates: [] }
+  | { status: "malformed"; candidates: [] };
+
 // ============================================================================
 // Envelope Metadata Stripping
 // ============================================================================
@@ -379,12 +387,19 @@ export class SmartExtractor {
     const agentId = options.agentId;
 
     // Step 1: LLM extraction
-    const candidates = await this.extractCandidates(conversationText);
+    const extraction = await this.extractCandidates(conversationText);
+    const candidates = extraction.candidates;
 
     if (candidates.length === 0) {
       this.log("memory-pro: smart-extractor: no memories extracted");
-      // LLM returned zero candidates → strongest noise signal → feedback to noise bank
-      this.learnAsNoise(conversationText);
+      if (extraction.status === "ok") {
+        // LLM genuinely returned zero candidates → strongest noise signal → feedback to noise bank
+        this.learnAsNoise(conversationText);
+      } else {
+        this.debugLog(
+          `memory-pro: smart-extractor: skipping noise-bank learning (status=${extraction.status})`,
+        );
+      }
       return stats;
     }
 
@@ -725,7 +740,7 @@ export class SmartExtractor {
    */
   private async extractCandidates(
     conversationText: string,
-  ): Promise<CandidateMemory[]> {
+  ): Promise<ExtractCandidatesResult> {
     const maxChars = this.config.extractMaxChars ?? 8000;
     const truncated =
       conversationText.length > maxChars
@@ -753,13 +768,13 @@ export class SmartExtractor {
       this.debugLog(
         "memory-lancedb-pro: smart-extractor: extract-candidates returned null",
       );
-      return [];
+      return { status: "llm_failure", candidates: [] };
     }
     if (!result.memories || !Array.isArray(result.memories)) {
       this.debugLog(
         `memory-lancedb-pro: smart-extractor: extract-candidates returned unexpected shape keys=${Object.keys(result).join(",") || "(none)"}`,
       );
-      return [];
+      return { status: "malformed", candidates: [] };
     }
 
     this.debugLog(
@@ -815,7 +830,7 @@ export class SmartExtractor {
       `memory-lancedb-pro: smart-extractor: validation summary accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}`,
     );
 
-    return candidates;
+    return { status: "ok", candidates };
   }
 
   // --------------------------------------------------------------------------
