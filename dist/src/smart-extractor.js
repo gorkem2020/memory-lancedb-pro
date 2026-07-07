@@ -233,11 +233,17 @@ export class SmartExtractor {
             : [targetScope];
         const agentId = options.agentId;
         // Step 1: LLM extraction
-        const candidates = await this.extractCandidates(conversationText);
+        const extraction = await this.extractCandidates(conversationText);
+        const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
-            // LLM returned zero candidates → strongest noise signal → feedback to noise bank
-            this.learnAsNoise(conversationText);
+            if (extraction.status === "ok") {
+                // LLM genuinely returned zero candidates → strongest noise signal → feedback to noise bank
+                this.learnAsNoise(conversationText);
+            }
+            else {
+                this.debugLog(`memory-pro: smart-extractor: skipping noise-bank learning (status=${extraction.status})`);
+            }
             return stats;
         }
         this.log(`memory-pro: smart-extractor: extracted ${candidates.length} candidate(s)`);
@@ -511,11 +517,11 @@ export class SmartExtractor {
         const result = await this.llm.completeJson(prompt, "extract-candidates");
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");
-            return [];
+            return { status: "llm_failure", candidates: [] };
         }
         if (!result.memories || !Array.isArray(result.memories)) {
             this.debugLog(`memory-lancedb-pro: smart-extractor: extract-candidates returned unexpected shape keys=${Object.keys(result).join(",") || "(none)"}`);
-            return [];
+            return { status: "malformed", candidates: [] };
         }
         this.debugLog(`memory-lancedb-pro: smart-extractor: extract-candidates raw memories=${result.memories.length}`);
         // Validate and normalize candidates
@@ -552,7 +558,7 @@ export class SmartExtractor {
             candidates.push({ category, abstract, overview, content });
         }
         this.debugLog(`memory-lancedb-pro: smart-extractor: validation summary accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}`);
-        return candidates;
+        return { status: "ok", candidates };
     }
     // --------------------------------------------------------------------------
     // Step 2: Dedup + Persist
