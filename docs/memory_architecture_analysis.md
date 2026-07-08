@@ -634,7 +634,7 @@ graph LR
 
 - 默认关闭，避免模型直接回显 memory block
 - 注入前先走 `shouldSkipRetrieval()`，避免问候语、小确认、emoji、slash 命令触发检索
-- 注入文本带 `[UNTRUSTED DATA]` 提示，防止把 memory 当指令执行
+- 注入文本以一句来源说明开头（由 memory 插件在 prompt build 时自动生成，非用户消息），交由 agent 自行判断可信度，而非直接下达信任指令
 - 显示内容优先使用 `l0_abstract`
 - 显示时会附上 category、scope、tier、分数与来源标记
 
