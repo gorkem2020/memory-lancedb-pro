@@ -767,6 +767,12 @@ function asNonEmptyString(value) {
 function isInternalReflectionSessionKey(sessionKey) {
     return typeof sessionKey === "string" && sessionKey.trim().startsWith("temp:memory-reflection");
 }
+// Memory sub-completions (active-memory's embedded recall sub-build, and any :subagent:
+// sub-build) must not re-enter memory prompt injection: they would waste an embedding+vector
+// search per turn, and their injected block can leak into the main prompt via shared session messages.
+function isMemorySubsessionKey(sessionKey) {
+    return typeof sessionKey === "string" && (sessionKey.includes(":subagent:") || sessionKey.includes(":active-memory:"));
+}
 function extractTextContent(content) {
     if (!content)
         return null;
@@ -1713,6 +1719,7 @@ function _initPluginState(api) {
         dbPath: resolvedDbPath,
         vectorDim,
         disableNativeCosine: config.retrieval?.disableNativeCosine === true,
+        readConsistencyInterval: config.storageMaintenance?.readConsistencyIntervalSeconds ?? 0,
         redisLock: config.locking?.redis,
         onStoragePathWarning: (message) => api.logger.warn(message),
         onLockWarning: (message) => api.logger.warn(message),
@@ -1859,10 +1866,6 @@ function _initPluginState(api) {
     const autoCaptureSeenTextCount = new Map();
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
-    const logReg = isCliMode() ? api.logger.debug : api.logger.info;
-    logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered [singleton init] `
-        + `(db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`);
-    logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
     return {
         config,
         resolvedDbPath,
@@ -1983,6 +1986,7 @@ const memoryLanceDBProPlugin = {
         _registeredApis.add(api); // claim before init (Phase 2 singleton guard)
         _registeredApisMap.set(api, true); // dual-track: explicit claim for rollback
         let registrationStopped = false;
+        const isFirstRegistration = !_singletonState;
         let singleton;
         try {
             if (!_singletonState) {
@@ -2194,8 +2198,10 @@ const memoryLanceDBProPlugin = {
         };
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
-        logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`);
-        logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+        if (isFirstRegistration) {
+            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`);
+            logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+        }
         // Dual-memory model warning: help users understand the two-layer architecture
         // Runs synchronously and logs warnings; does NOT block gateway startup.
         // Once per process via the CLI-aware logReg (#888): repeated per-registration
@@ -2399,7 +2405,7 @@ const memoryLanceDBProPlugin = {
                 const autoRecallDeadlineMs = Date.now() + AUTO_RECALL_TIMEOUT_MS;
                 // Skip auto-recall for sub-agent sessions — their context comes from the parent.
                 const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
-                if (sessionKey.includes(":subagent:"))
+                if (isMemorySubsessionKey(sessionKey))
                     return;
                 // Per-agent inclusion/exclusion: autoRecallIncludeAgents takes precedence over autoRecallExcludeAgents.
                 // - If autoRecallIncludeAgents is set: ONLY these agents receive auto-recall
@@ -2432,6 +2438,10 @@ const memoryLanceDBProPlugin = {
                     shouldSkipRetrieval(gatingText, config.autoRecallMinLength)) {
                     return;
                 }
+                // Validation BEFORE dedup, same convention as the bootstrap/selfImprovement/
+                // reflection guards above: skipped events must NOT pollute the shared dedup set.
+                if (_dedupHookEvent("autoRecall", event))
+                    return;
                 const currentTurn = (turnCounter.get(sessionId) || 0) + 1;
                 turnCounter.set(sessionId, currentTurn);
                 // Wrap the entire recall pipeline in a timeout so slow embedding/rerank
@@ -3329,6 +3339,8 @@ const memoryLanceDBProPlugin = {
                 };
                 api.on("before_prompt_build", async (event, ctx) => {
                     const sessionKey = getSelfImprovementSessionKey(event, ctx);
+                    if (isMemorySubsessionKey(sessionKey))
+                        return;
                     if (!sessionKey || !pendingSelfImprovementResetReminderBySession.delete(sessionKey)) {
                         return;
                     }
@@ -3431,7 +3443,7 @@ const memoryLanceDBProPlugin = {
             api.on("before_prompt_build", async (_event, ctx) => {
                 const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
                 // Skip reflection injection for sub-agent sessions.
-                if (sessionKey.includes(":subagent:"))
+                if (isMemorySubsessionKey(sessionKey))
                     return;
                 if (isInternalReflectionSessionKey(sessionKey))
                     return;
@@ -3465,7 +3477,7 @@ const memoryLanceDBProPlugin = {
             api.on("before_prompt_build", async (_event, ctx) => {
                 const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
                 // Skip reflection injection for sub-agent sessions.
-                if (sessionKey.includes(":subagent:"))
+                if (isMemorySubsessionKey(sessionKey))
                     return;
                 if (isInternalReflectionSessionKey(sessionKey))
                     return;
@@ -4422,6 +4434,7 @@ export function parsePluginConfig(value) {
     const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
         ? storageMaintenanceRaw.autoCleanup
         : null;
+    const readConsistencyIntervalSecondsRaw = parseNonNegativeInt(storageMaintenanceRaw?.readConsistencyIntervalSeconds);
     const lockingRaw = typeof cfg.locking === "object" && cfg.locking !== null
         ? cfg.locking
         : null;
@@ -4496,14 +4509,21 @@ export function parsePluginConfig(value) {
             clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
         },
         dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
-        storageMaintenance: storageAutoCleanupRaw
+        storageMaintenance: (storageAutoCleanupRaw || readConsistencyIntervalSecondsRaw !== undefined)
             ? {
-                autoCleanup: {
-                    enabled: storageAutoCleanupRaw.enabled === true,
-                    intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
-                    retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
-                    initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
-                },
+                ...(storageAutoCleanupRaw
+                    ? {
+                        autoCleanup: {
+                            enabled: storageAutoCleanupRaw.enabled === true,
+                            intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
+                            retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
+                            initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+                        },
+                    }
+                    : {}),
+                ...(readConsistencyIntervalSecondsRaw !== undefined
+                    ? { readConsistencyIntervalSeconds: readConsistencyIntervalSecondsRaw }
+                    : {}),
             }
             : undefined,
         redisUrl: legacyRedisUrl,
