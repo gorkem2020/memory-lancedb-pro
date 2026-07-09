@@ -72,6 +72,20 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.trunc(n)));
 }
 
+// A running gateway process holds its own long-lived LanceDB table handle
+// (separate from this CLI's own connection). With a non-zero
+// readConsistencyIntervalSeconds, its next read may still observe the
+// pre-delete state for up to that many seconds. Strong consistency (0,
+// the default) or an unset interval need no hint.
+function printReadConsistencyHint(store: { readConsistencyInterval?: number }): void {
+  const interval = store.readConsistencyInterval;
+  if (typeof interval === "number" && interval > 0) {
+    console.log(
+      `Note: a running gateway process may take up to ${interval}s to observe this change (readConsistencyIntervalSeconds).`,
+    );
+  }
+}
+
 function resolveOpenClawConfigPath(explicit?: string): string {
   const openclawHome = resolveOpenClawHome();
   if (explicit && explicit.trim()) {
@@ -1459,6 +1473,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
 
         if (deleted) {
           console.log(`Memory ${id} deleted successfully.`);
+          printReadConsistencyHint(context.store);
         } else {
           console.log(`Memory ${id} not found or access denied.`);
           process.exit(1);
@@ -1503,6 +1518,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         } else {
           const deletedCount = await context.store.bulkDelete(options.scope, beforeTimestamp);
           console.log(`Deleted ${deletedCount} memories.`);
+          printReadConsistencyHint(context.store);
         }
       } catch (error) {
         console.error("Bulk delete failed:", error);
