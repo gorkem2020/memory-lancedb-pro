@@ -3602,7 +3602,13 @@ const memoryLanceDBProPlugin = {
                 const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {});
                 const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
                 let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
-                const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+                const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
+                const sourceAgentId = parsedAgentId || "main";
+                // Ownership written into persisted reflection metadata must never be minted as
+                // "main" when the sessionKey fails to resolve to a real agent, that would silently
+                // misattribute the reflection to (and make it inheritable by) an unrelated agent.
+                // isOwnedByAgent() treats an empty owner as non-inheritable.
+                const ownerAgentId = parsedAgentId || "";
                 const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
                 if (isSessionBoundaryReflectionAction(action)) {
                     const now = Date.now();
@@ -3860,7 +3866,7 @@ const memoryLanceDBProPlugin = {
                         const baseMetadata = buildReflectionMappedMetadata({
                             mappedItem: mapped,
                             eventId: reflectionEventId,
-                            agentId: sourceAgentId,
+                            agentId: ownerAgentId,
                             sessionKey,
                             sessionId: currentSessionId || "unknown",
                             runAt: nowTs,
@@ -3903,7 +3909,7 @@ const memoryLanceDBProPlugin = {
                             reflectionText,
                             sessionKey,
                             sessionId: currentSessionId || "unknown",
-                            agentId: sourceAgentId,
+                            agentId: ownerAgentId,
                             command: String(event.action || "unknown"),
                             scope: targetScope,
                             toolErrorSignals,
