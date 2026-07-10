@@ -2209,6 +2209,30 @@ const memoryLanceDBProPlugin = {
             reflectionByAgentCache.set(cacheKey, next);
             return next;
         };
+        // Invalidate in-process reflection read caches after an in-process delete
+        // (CLI delete/delete-bulk, sharing this same plugin instance) removes rows,
+        // so injected reflection context cannot keep serving deleted content.
+        // reflectionByAgentCache is keyed "<agentId>::scopes:<sorted,scopes>" (or
+        // "<agentId>::<NO_SCOPE_FILTER>"); drop any entry whose scope set intersects
+        // the deleted scopes, plus every no-scope-filter entry (it spans all scopes).
+        // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
+        // cleared in full rather than left to (possibly never) expire on its own.
+        const invalidateReflectionCachesAfterDelete = (deletedScopes) => {
+            const deletedSet = new Set(deletedScopes ?? []);
+            for (const cacheKey of reflectionByAgentCache.keys()) {
+                const sepIdx = cacheKey.indexOf("::");
+                const scopePart = sepIdx === -1 ? "" : cacheKey.slice(sepIdx + 2);
+                if (scopePart === "<NO_SCOPE_FILTER>" || deletedSet.size === 0) {
+                    reflectionByAgentCache.delete(cacheKey);
+                    continue;
+                }
+                const cachedScopes = scopePart.startsWith("scopes:") ? scopePart.slice("scopes:".length).split(",") : [];
+                if (cachedScopes.some((s) => deletedSet.has(s))) {
+                    reflectionByAgentCache.delete(cacheKey);
+                }
+            }
+            reflectionDerivedBySession.clear();
+        };
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
         if (isFirstRegistration) {
@@ -2351,6 +2375,7 @@ const memoryLanceDBProPlugin = {
             store,
             retriever,
             scopeManager,
+            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
             migrator,
             embedder,
             llmClient: smartExtractor ? (() => {
