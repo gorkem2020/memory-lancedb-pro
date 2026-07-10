@@ -62,6 +62,14 @@ export interface StoreConfig {
   vectorDim: number;
   /** Disable LanceDB native vector search and rank scanned rows with JS cosine. */
   disableNativeCosine?: boolean;
+  /**
+   * Seconds between checks for table updates committed by other processes
+   * (e.g. a separate CLI invocation deleting rows while a gateway process
+   * holds a long-lived read handle). Unset: no check, matches the LanceDB
+   * SDK default. 0: strong consistency, every read checks for updates.
+   * >0: eventual consistency, bounded staleness of that many seconds.
+   */
+  readConsistencyInterval?: number;
   redisLock?: RedisLockConfig;
   onStoragePathWarning?: (message: string) => void;
   onLockWarning?: (message: string) => void;
@@ -771,6 +779,10 @@ export class MemoryStore {
     return this.config.dbPath;
   }
 
+  get readConsistencyInterval(): number | undefined {
+    return this.config.readConsistencyInterval;
+  }
+
   async runStorageMaintenance(retentionDays = 7): Promise<StorageMaintenanceResult> {
     if (this.destroyed) {
       throw new Error("MemoryStore instance has been destroyed");
@@ -889,7 +901,9 @@ export class MemoryStore {
 
     let db: LanceDB.Connection;
     try {
-      db = await lancedb.connect(this.config.dbPath);
+      db = await lancedb.connect(this.config.dbPath, {
+        readConsistencyInterval: this.config.readConsistencyInterval,
+      });
     } catch (err: any) {
       const code = err.code || "";
       const message = err.message || String(err);
