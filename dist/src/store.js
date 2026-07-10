@@ -1702,7 +1702,9 @@ export class MemoryStore {
             const scopeConditions = scopeFilter
                 .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
                 .join(" OR ");
-            conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+            // NULL-scope rows are pre-scoping legacy data with no owner; including them here
+            // would make every such row visible to every agent's scope filter. Do not pass them.
+            conditions.push(`(${scopeConditions})`);
         }
         if (category) {
             const categoryConditions = resolveCategoryFilterCandidates(category)

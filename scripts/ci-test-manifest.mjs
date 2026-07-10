@@ -102,6 +102,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/register-scope-dedup.test.mjs", args: ["--test"] },
   // Reflection distiller sub-session must not receive auto-recall/injected blocks
   { group: "core-regression", runner: "node", file: "test/reflection-distiller-hook-skip.test.mjs", args: ["--test"] },
+  // Scope/ownership leak hardening: NULL-scope visibility, isOwnedByAgent main/blank leaks, parse-failure attribution
+  { group: "core-regression", runner: "node", file: "test/scope-owner-leak-hardening.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
