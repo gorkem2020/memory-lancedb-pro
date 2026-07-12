@@ -2975,8 +2975,16 @@ const memoryLanceDBProPlugin = {
                                 extractionRateLimiter.recordExtraction();
                                 if (stats.created > 0 || stats.merged > 0) {
                                     api.logger.info(`memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`);
-                                    // issue #417 Fix #5: reset counter after successful extraction
-                                    autoCaptureSeenTextCount.set(sessionKey, 0);
+                                    // issue #417 Fix #9 windowing applies to ingress-fed sessions:
+                                    // their counter is a pure accumulator of new texts toward
+                                    // minMessages, so it restarts at 0 after a successful
+                                    // extraction. For history-carrying sessions (agent_end
+                                    // delivers the whole session each turn) the same counter is
+                                    // also the slice cursor; resetting it to 0 made the next
+                                    // turn re-read and re-extract the entire history. Record the
+                                    // consumed history length there instead, so the next turn
+                                    // only sees the delta.
+                                    autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
