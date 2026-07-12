@@ -102,6 +102,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/reflection-distiller-hook-skip.test.mjs", args: ["--test"] },
   // register() re-registration hardening (scope cache-miss log/handler dedup)
   { group: "core-regression", runner: "node", file: "test/register-scope-dedup.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-internal-session-guard.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
