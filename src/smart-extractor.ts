@@ -27,6 +27,7 @@ import {
   type ExtractionStats,
   type MemoryCategory,
   ALWAYS_MERGE_CATEGORIES,
+  getStorageCategoryForMemoryCategory,
   MERGE_SUPPORTED_CATEGORIES,
   MEMORY_CATEGORIES,
   TEMPORAL_VERSIONED_CATEGORIES,
@@ -1759,25 +1760,19 @@ export class SmartExtractor {
   /**
    * Map 6-category to existing 5-category store type for backward compatibility.
    */
+  /**
+   * Map a smart register onto its legacy storage category, delegating to the
+   * shared SMART_TO_STORAGE_CATEGORY constant (memory-categories) so the
+   * mapping has a single source of truth. Note: "reflection" is a legacy
+   * storage category minted only by the reflection writer and is deliberately
+   * absent from this map; smart extraction never produces reflection rows.
+   * The "other" fallback covers non-union values arriving from untyped
+   * callers at runtime, matching the old switch's default arm.
+   */
   private mapToStoreCategory(
     category: MemoryCategory,
   ): "preference" | "fact" | "decision" | "entity" | "other" {
-    switch (category) {
-      case "profile":
-        return "fact";
-      case "preferences":
-        return "preference";
-      case "entities":
-        return "entity";
-      case "events":
-        return "decision";
-      case "cases":
-        return "fact";
-      case "patterns":
-        return "other";
-      default:
-        return "other";
-    }
+    return getStorageCategoryForMemoryCategory(category) ?? "other";
   }
 
   /**
