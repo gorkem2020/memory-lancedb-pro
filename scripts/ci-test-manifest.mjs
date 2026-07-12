@@ -100,6 +100,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/memory-subsession-prompt-hooks.test.mjs", args: ["--test"] },
   // Reflection distiller sub-session must not receive auto-recall/injected blocks
   { group: "core-regression", runner: "node", file: "test/reflection-distiller-hook-skip.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-fallback-gating.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
