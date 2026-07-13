@@ -33,7 +33,7 @@ export type AdmissionControlPreset =
 export interface AdmissionControlConfig {
   preset: AdmissionControlPreset;
   enabled: boolean;
-  utilityMode: "standalone" | "off";
+  utilityMode: "standalone" | "off" | "batch";
   weights: AdmissionWeights;
   rejectThreshold: number;
   admitThreshold: number;
@@ -310,7 +310,9 @@ export function normalizeAdmissionControlConfig(raw: unknown): AdmissionControlC
         ? "off"
         : obj.utilityMode === "standalone"
           ? "standalone"
-          : base.utilityMode,
+          : obj.utilityMode === "batch"
+            ? "batch"
+            : base.utilityMode,
     weights: normalizeWeights(obj.weights, base.weights),
     rejectThreshold,
     admitThreshold: normalizedAdmit,
@@ -510,6 +512,101 @@ Candidate memory:
 - Conversation register: ${candidate.conversationRegister ?? "unknown (legacy payload)"}`;
 
   return { system, user };
+}
+
+/** Max candidates scored in a single batch-utility LLM call; larger batches are chunked. */
+const BATCH_UTILITY_MAX_SIZE = 10;
+
+interface BatchUtilityResponse {
+  results?: Array<{ index?: number; utility?: number; reason?: string }>;
+}
+
+/**
+ * Builds the batch-utility prompt as {system, user} so the eventual merge
+ * with the system/user prompt-architecture split is mechanical: on this
+ * branch the two are concatenated before the single-string completeJson()
+ * call, since that split hasn't landed here yet.
+ */
+function buildBatchUtilityPrompt(
+  candidates: CandidateMemory[],
+  conversationText: string,
+): { system: string; user: string } {
+  const excerpt =
+    conversationText.length > 3000
+      ? conversationText.slice(-3000)
+      : conversationText;
+
+  const system = `You are an admission judge. Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
+
+Score each candidate's future usefulness independently on a 0.0-1.0 scale. Score every item on its own absolute merit — do not rank or curve candidates relative to each other within this batch; a batch of entirely weak candidates should all score low, and a batch of entirely strong candidates should all score high.
+
+Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
+Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
+
+Example of absolute scoring across a mixed-quality batch:
+Candidates:
+1. Category: preferences — "User's preferred name is Alex"
+2. Category: events — "User said hello"
+3. Category: entities — "The project uses PostgreSQL as its primary datastore"
+Expected response:
+{"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}
+Candidate 2 scores low even though candidates 1 and 3 score high in the same batch: each item is judged on its own merit, never curved against its neighbors.
+
+Return JSON only, with exactly one entry per candidate, in this shape:
+{
+  "results": [
+    { "index": 1, "utility": 0.0, "reason": "short explanation" }
+  ]
+}`;
+
+  const candidateBlocks = candidates
+    .map((candidate, i) => {
+      const n = i + 1;
+      return `${n}. Category: ${candidate.category}
+   Abstract: ${candidate.abstract}
+   Overview: ${candidate.overview}
+   Content: ${candidate.content}`;
+    })
+    .join("\n");
+
+  const user = `Conversation excerpt:
+${excerpt}
+
+Candidates:
+${candidateBlocks}`;
+
+  return { system, user };
+}
+
+/**
+ * Validates a batch-utility response and maps it back to per-candidate
+ * scores in input order. Returns null (triggering standalone fallback) on
+ * any malformed shape: non-array results, wrong count, or a missing/invalid
+ * index — this must never silently admit or reject the whole batch.
+ */
+function parseBatchUtilityResponse(
+  response: BatchUtilityResponse | null,
+  expectedCount: number,
+): Array<{ score: number; reason?: string }> | null {
+  if (!response || !Array.isArray(response.results)) return null;
+  if (response.results.length !== expectedCount) return null;
+
+  const byIndex = new Map<number, { utility?: number; reason?: string }>();
+  for (const entry of response.results) {
+    if (!entry || typeof entry.index !== "number") return null;
+    byIndex.set(entry.index, entry);
+  }
+
+  const out: Array<{ score: number; reason?: string }> = [];
+  for (let i = 1; i <= expectedCount; i++) {
+    const entry = byIndex.get(i);
+    if (!entry) return null;
+    out.push({
+      score: clamp01(entry.utility, 0.5),
+      reason: typeof entry.reason === "string" ? entry.reason.trim() : undefined,
+    });
+  }
+  return out;
 }
 
 function buildReason(details: {
@@ -775,6 +872,40 @@ export class AdmissionController {
     /** Honest framing for the excerpt shown to the admission judge. Defaults to "conversation". */
     sourceKind?: AdmissionSourceKind;
   }): Promise<AdmissionEvaluation> {
+    // Deterministic pre-admission short-circuit, checked before any LLM call
+    // (including utility scoring): see the fuller comment on this same check
+    // in evaluateWithUtility, which guards the evaluateBatch() path.
+    if (params.candidate.grounding === "constructed") {
+      return this.rejectConstructed(params.candidate, params.now ?? Date.now());
+    }
+
+    const utility = await scoreUtility(
+      this.llm,
+      this.config.utilityMode,
+      params.candidate,
+      params.conversationText,
+      params.sourceKind ?? "conversation",
+    );
+    return this.evaluateWithUtility(params, utility);
+  }
+
+  /**
+   * Evaluate a single candidate given an already-scored utility feature.
+   * Shared by evaluate() (per-candidate utility scoring) and evaluateBatch()
+   * (utility scored once for the whole batch) — every other feature
+   * (confidence/novelty/recency/typePrior) and the decision/audit logic stay
+   * identical between the two paths.
+   */
+  private async evaluateWithUtility(
+    params: {
+      candidate: CandidateMemory;
+      candidateVector: number[];
+      conversationText: string;
+      scopeFilter: string[];
+      now?: number;
+    },
+    utility: { score: number; reason?: string },
+  ): Promise<AdmissionEvaluation> {
     const now = params.now ?? Date.now();
 
     // Deterministic pre-admission short-circuit: a candidate tagged
@@ -793,13 +924,6 @@ export class AdmissionController {
       params.scopeFilter,
     );
 
-    const utility = await scoreUtility(
-      this.llm,
-      this.config.utilityMode,
-      params.candidate,
-      params.conversationText,
-      params.sourceKind ?? "conversation",
-    );
     const confidence = scoreConfidenceSupport(params.candidate, params.conversationText);
     const novelty = scoreNoveltyFromMatches(params.candidateVector, relevantMatches);
     const recency = scoreRecencyGap(now, relevantMatches, this.config.recency.halfLifeDays);
@@ -863,5 +987,121 @@ export class AdmissionController {
     );
 
     return { decision, hint, audit };
+  }
+
+  /**
+   * Evaluate a batch of candidates that share one conversation/source
+   * excerpt, scoring utility with a single LLM call per chunk of up to
+   * BATCH_UTILITY_MAX_SIZE candidates (chunking larger batches). Every other
+   * feature (confidence/novelty/recency/typePrior) and the decision/audit
+   * logic remain fully per-candidate, unchanged from evaluate().
+   *
+   * When utilityMode isn't "batch", or a chunk's batch response comes back
+   * malformed, falls back to one standalone evaluate() call per candidate in
+   * that chunk — this never fails the batch open or closed, it just costs
+   * more calls for that chunk.
+   */
+  async evaluateBatch(
+    items: Array<{
+      candidate: CandidateMemory;
+      candidateVector: number[];
+      conversationText: string;
+      scopeFilter: string[];
+      now?: number;
+    }>,
+  ): Promise<AdmissionEvaluation[]> {
+    if (items.length === 0) return [];
+
+    const chunks: (typeof items)[] = [];
+    for (let i = 0; i < items.length; i += BATCH_UTILITY_MAX_SIZE) {
+      chunks.push(items.slice(i, i + BATCH_UTILITY_MAX_SIZE));
+    }
+
+    const results: AdmissionEvaluation[] = [];
+    for (const chunk of chunks) {
+      results.push(...(await this.evaluateChunk(chunk)));
+    }
+    return results;
+  }
+
+  private async evaluateChunk(
+    chunk: Array<{
+      candidate: CandidateMemory;
+      candidateVector: number[];
+      conversationText: string;
+      scopeFilter: string[];
+      now?: number;
+    }>,
+  ): Promise<AdmissionEvaluation[]> {
+    if (this.config.utilityMode !== "batch") {
+      const out: AdmissionEvaluation[] = [];
+      for (const item of chunk) {
+        out.push(await this.evaluate(item));
+      }
+      return out;
+    }
+
+    // Same deterministic short-circuit as evaluate(): constructed candidates
+    // never reach an LLM call, batched or otherwise. Score utility only for
+    // the scoreable subset, then merge results back in original order.
+    const out: (AdmissionEvaluation | undefined)[] = new Array(chunk.length);
+    const scoreableIndices: number[] = [];
+    for (let i = 0; i < chunk.length; i++) {
+      if (chunk[i].candidate.grounding === "constructed") {
+        out[i] = this.rejectConstructed(chunk[i].candidate, chunk[i].now ?? Date.now());
+      } else {
+        scoreableIndices.push(i);
+      }
+    }
+
+    if (scoreableIndices.length > 0) {
+      const utilities = await this.scoreUtilityBatch(
+        scoreableIndices.map((i) => chunk[i].candidate),
+        chunk[0].conversationText,
+      );
+      for (let j = 0; j < scoreableIndices.length; j++) {
+        const i = scoreableIndices[j];
+        out[i] = await this.evaluateWithUtility(chunk[i], utilities[j]);
+      }
+    }
+
+    return out as AdmissionEvaluation[];
+  }
+
+  private async scoreUtilityBatch(
+    candidates: CandidateMemory[],
+    conversationText: string,
+  ): Promise<Array<{ score: number; reason?: string }>> {
+    const fallbackToStandalone = async (): Promise<Array<{ score: number; reason?: string }>> => {
+      const out: Array<{ score: number; reason?: string }> = [];
+      for (const candidate of candidates) {
+        out.push(await scoreUtility(this.llm, "standalone", candidate, conversationText));
+      }
+      return out;
+    };
+
+    const { system, user } = buildBatchUtilityPrompt(candidates, conversationText);
+    let response: BatchUtilityResponse | null = null;
+    try {
+      response = await this.llm.completeJson<BatchUtilityResponse>(
+        user,
+        "admission-utility-batch",
+        system,
+      );
+    } catch {
+      this.debugLog(
+        "memory-lancedb-pro: admission-control: batch utility scoring failed, falling back to standalone",
+      );
+      return fallbackToStandalone();
+    }
+
+    const parsed = parseBatchUtilityResponse(response, candidates.length);
+    if (!parsed) {
+      this.debugLog(
+        "memory-lancedb-pro: admission-control: malformed batch utility response, falling back to standalone",
+      );
+      return fallbackToStandalone();
+    }
+    return parsed;
   }
 }
