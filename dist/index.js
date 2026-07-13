@@ -51,7 +51,7 @@ import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, toLifecycleMemory, } from "./src/smart-metadata.js";
 import { computeTier1Patch, isSuppressed as isTier1Suppressed, TIER1_DEFAULT_BAD_RECALL_DECAY_MS, TIER1_DEFAULT_SUPPRESSION_DURATION_MS, } from "./src/auto-recall-tier1.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./src/workspace-boundary.js";
-import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
+import { normalizeAdmissionControlConfig, createAdmissionController, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
@@ -368,7 +368,6 @@ const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES = 200;
-const DEFAULT_REFLECTION_CACHE_TTL_MS = 15_000;
 // After /new or /reset, the just-closed session may have generated fresh
 // derived deltas. Keep those out of the immediately opened prompt window.
 const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
@@ -1811,7 +1810,8 @@ function _initPluginState(api) {
     // callback below closes over it.
     const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
-    if (config.smartExtraction !== false) {
+    let admissionController = null;
+    if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
             const llmApiKey = llmAuth === "oauth"
@@ -1841,30 +1841,42 @@ function _initPluginState(api) {
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
             });
-            const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
-            noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
-            const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
-            smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-                user: "User",
-                extractMinMessages: config.extractMinMessages ?? 4,
-                extractMaxChars: config.extractMaxChars ?? 8000,
-                defaultScope: config.scopes?.default ?? "global",
-                workspaceBoundary: config.workspaceBoundary,
-                admissionControl: config.admissionControl,
-                onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-                onPersisted: mdMirror ?? undefined,
-                log: (msg) => api.logger.info(msg),
-                debugLog: (msg) => api.logger.debug(msg),
-                noiseBank,
-            });
-            (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
-                + llmModel
-                + ", timeoutMs: "
-                + llmTimeoutMs
-                + ", noise bank: ON)");
+            // Constructed independently of SmartExtractor so admission gating is
+            // available to other write paths (e.g. reflection-mapped rows, the
+            // regex fallback) even when smart extraction itself is disabled.
+            admissionController = createAdmissionController(store, llmClient, config.admissionControl, (msg) => api.logger.debug(msg));
+            if (config.smartExtraction !== false) {
+                const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
+                noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
+                const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
+                smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+                    user: "User",
+                    extractMinMessages: config.extractMinMessages ?? 4,
+                    extractMaxChars: config.extractMaxChars ?? 8000,
+                    defaultScope: config.scopes?.default ?? "global",
+                    workspaceBoundary: config.workspaceBoundary,
+                    admissionControl: config.admissionControl,
+                    admissionController,
+                    onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+                    onPersisted: mdMirror ?? undefined,
+                    log: (msg) => api.logger.info(msg),
+                    debugLog: (msg) => api.logger.debug(msg),
+                    noiseBank,
+                });
+                (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
+                    + llmModel
+                    + ", timeoutMs: "
+                    + llmTimeoutMs
+                    + ", noise bank: ON)");
+            }
         }
         catch (err) {
-            api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            if (config.smartExtraction !== false) {
+                api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            }
+            else {
+                api.logger.warn(`memory-lancedb-pro: standalone admission control init failed, admission gating unavailable: ${String(err)}`);
+            }
         }
     }
     const extractionRateLimiter = createExtractionRateLimiter({
@@ -1875,11 +1887,6 @@ function _initPluginState(api) {
     const reflectionDerivedBySession = new Map();
     const reflectionDerivedSuppressionBySession = new Map();
     const reflectionByAgentCache = new Map();
-    // Bumped on every invalidateReflectionCachesAfterDelete call. loadAgentReflectionSlices
-    // snapshots this before its awaited store.list() reads and skips caching its result if
-    // it changed mid-flight, so an in-flight read can never publish a stale pre-delete
-    // snapshot back into the cache after the delete already invalidated it.
-    const reflectionByAgentCacheGeneration = { count: 0 };
     const recallHistory = new Map();
     const turnCounter = new Map();
     const autoCaptureSeenTextCount = new Map();
@@ -1900,13 +1907,13 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        admissionController,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
         reflectionDerivedBySession,
         reflectionDerivedSuppressionBySession,
         reflectionByAgentCache,
-        reflectionByAgentCacheGeneration,
         recallHistory,
         turnCounter,
         autoCaptureSeenTextCount,
@@ -2020,7 +2027,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2183,9 +2190,8 @@ const memoryLanceDBProPlugin = {
                 : "<NO_SCOPE_FILTER>";
             const cacheKey = `${agentId}::${scopeKey}`;
             const cached = reflectionByAgentCache.get(cacheKey);
-            if (cached && Date.now() - cached.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS)
+            if (cached && Date.now() - cached.updatedAt < 15_000)
                 return cached;
-            const generationAtStart = reflectionByAgentCacheGeneration.count;
             // Prefer reflection-category rows to avoid full-table reads on bypass callers.
             // Fall back to an uncategorized scan only when the category query produced no
             // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
@@ -2214,54 +2220,13 @@ const memoryLanceDBProPlugin = {
             }
             const { invariants, derived } = slices;
             const next = { updatedAt: Date.now(), invariants, derived };
-            // Only cache if no delete invalidated this cacheKey while the awaits above were in
-            // flight (TOCTOU guard); otherwise this late-arriving, possibly-stale read would
-            // silently resurrect a cache entry the delete just cleared.
-            if (reflectionByAgentCacheGeneration.count === generationAtStart) {
-                reflectionByAgentCache.set(cacheKey, next);
-            }
+            reflectionByAgentCache.set(cacheKey, next);
             return next;
-        };
-        // Fast-path invalidation for SAME-PROCESS deletes only: CLI delete/delete-bulk
-        // commands run as a short-lived, separate process from the long-running Gateway
-        // in typical deployments, so this callback firing there does not reach (and
-        // cannot invalidate) the Gateway process own in-memory caches. It only has an
-        // effect when a delete genuinely happens inside this same plugin instance.
-        //
-        // The actual cross-process staleness bound comes from two other layers:
-        //   - DEFAULT_REFLECTION_CACHE_TTL_MS bounds how long either cache below can
-        //     serve stale content after ANY delete, same-process or not (see the read
-        //     sites in loadAgentReflectionSlices and the derived-focus injector).
-        //   - readConsistencyInterval (store config) bounds how long the underlying
-        //     LanceDB table handle can serve stale rows to a fresh query in the first
-        //     place, which is what a TTL-expired cache re-populates from.
-        //
-        // reflectionByAgentCache is keyed "<agentId>::scopes:<sorted,scopes>" (or
-        // "<agentId>::<NO_SCOPE_FILTER>"); drop any entry whose scope set intersects
-        // the deleted scopes, plus every no-scope-filter entry (it spans all scopes).
-        // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
-        // cleared in full rather than left to expire on its own TTL.
-        const invalidateReflectionCachesAfterDelete = (deletedScopes) => {
-            reflectionByAgentCacheGeneration.count++;
-            const deletedSet = new Set(deletedScopes ?? []);
-            for (const cacheKey of reflectionByAgentCache.keys()) {
-                const sepIdx = cacheKey.indexOf("::");
-                const scopePart = sepIdx === -1 ? "" : cacheKey.slice(sepIdx + 2);
-                if (scopePart === "<NO_SCOPE_FILTER>" || deletedSet.size === 0) {
-                    reflectionByAgentCache.delete(cacheKey);
-                    continue;
-                }
-                const cachedScopes = scopePart.startsWith("scopes:") ? scopePart.slice("scopes:".length).split(",") : [];
-                if (cachedScopes.some((s) => deletedSet.has(s))) {
-                    reflectionByAgentCache.delete(cacheKey);
-                }
-            }
-            reflectionDerivedBySession.clear();
         };
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
         if (isFirstRegistration) {
-            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`);
+            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'}, admissionControl: ${admissionController ? 'ON' : 'OFF'})`);
             logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
         }
         // Dual-memory model warning: help users understand the two-layer architecture
@@ -2361,9 +2326,6 @@ const memoryLanceDBProPlugin = {
             mdMirror,
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
-            // Mirrors the CLI context wiring below: keep in-process reflection caches
-            // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
-            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         }, {
             enableManagementTools: config.enableManagementTools,
             enableSelfImprovementTools: config.selfImprovement?.enabled === true,
@@ -2403,7 +2365,6 @@ const memoryLanceDBProPlugin = {
             store,
             retriever,
             scopeManager,
-            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
             migrator,
             embedder,
             llmClient: smartExtractor ? (() => {
@@ -3590,8 +3551,7 @@ const memoryLanceDBProPlugin = {
                                 reflectionDerivedSuppressionBySession.delete(sessionKey);
                             const scopes = resolveScopeFilter(scopeManager, agentId);
                             const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-                            const derivedCacheFresh = derivedCache && Date.now() - derivedCache.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS;
-                            const derivedLines = derivedCacheFresh && derivedCache.derived.length
+                            const derivedLines = derivedCache?.derived?.length
                                 ? derivedCache.derived
                                 : (await loadAgentReflectionSlices(agentId, scopes)).derived;
                             if (derivedLines.length > 0) {
@@ -3987,13 +3947,7 @@ const memoryLanceDBProPlugin = {
                         });
                         if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
                             reflectionDerivedBySession.set(sessionKey, {
-                                // Deliberately Date.now(), not nowTs (which mirrors the host-supplied
-                                // event.timestamp and can be skewed/future-dated): this field is a TTL
-                                // bookkeeping mark, and DEFAULT_REFLECTION_CACHE_TTL_MS above compares it
-                                // against a fresh Date.now() on every read. A skewed updatedAt can make
-                                // "Date.now() - updatedAt" go negative, which is always < the TTL, so the
-                                // cache would read as fresh indefinitely until wall-clock time caught up.
-                                updatedAt: Date.now(),
+                                updatedAt: nowTs,
                                 derived: stored.slices.derived,
                             });
                         }
