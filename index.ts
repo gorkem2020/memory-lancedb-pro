@@ -5122,12 +5122,14 @@ const memoryLanceDBProPlugin = {
             }
 
             // Writer-1 admission routing: mapped rows previously bypassed
-            // admission control entirely. Gate each row through the same
-            // AdmissionController as extraction candidates, independent of
-            // whether smart extraction is on; passthrough only when
-            // admission control itself is disabled.
+            // admission control entirely. Gate each row through the
+            // reflection-lane AdmissionController -- the judge auditing the
+            // distiller's own output should never be dumber than the model
+            // that wrote it (see resolveAdmissionModel's lane affinity) --
+            // independent of whether smart extraction is on; passthrough
+            // only when admission control itself is disabled.
             const mappedGate = await gateMappedReflectionEntry({
-              admissionController,
+              admissionController: admissionControllerReflectionLane,
               attachAudit: config.admissionControl.enabled && config.admissionControl.auditMetadata !== false,
               text: mapped.text,
               category: mapped.category,
