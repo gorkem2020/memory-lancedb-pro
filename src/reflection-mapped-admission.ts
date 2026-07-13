@@ -42,6 +42,7 @@ export interface MappedReflectionAdmissionGate {
     candidateVector: number[];
     conversationText: string;
     scopeFilter: string[];
+    sourceKind?: "conversation" | "reflection";
   }): Promise<AdmissionEvaluation>;
 }
 
@@ -92,6 +93,7 @@ export async function gateMappedReflectionEntry(params: {
       candidateVector: params.vector,
       conversationText: params.reflectionText,
       scopeFilter: params.scopeFilter,
+      sourceKind: "reflection",
     });
   } catch (err) {
     params.warnLog?.(

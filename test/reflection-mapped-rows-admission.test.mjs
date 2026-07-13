@@ -109,6 +109,25 @@ describe("gateMappedReflectionEntry", () => {
     assert.equal(seenCandidate.content, baseParams.text);
   });
 
+  it("frames the excerpt as a reflection source document, not a conversation, when scored", async () => {
+    let seenSourceKind = null;
+    const controller = {
+      async evaluate(params) {
+        seenSourceKind = params.sourceKind;
+        return {
+          decision: "pass_to_dedup",
+          audit: { decision: "pass_to_dedup", reason: "ok" },
+        };
+      },
+    };
+    await gateMappedReflectionEntry({
+      ...baseParams,
+      admissionController: controller,
+      attachAudit: false,
+    });
+    assert.equal(seenSourceKind, "reflection", "mapped reflection rows must be scored as reflection-sourced, not conversation-sourced");
+  });
+
   it("omits the audit when auditMetadata persistence is off", async () => {
     const controller = {
       async evaluate() {
@@ -144,8 +163,10 @@ describe("gateMappedReflectionEntry", () => {
 
   it("integrates with a real AdmissionController end to end (admit path)", async () => {
     const store = { async vectorSearch() { return []; } };
+    const seenPrompts = [];
     const llm = {
-      async completeJson(_prompt, mode) {
+      async completeJson(userPrompt, mode) {
+        if (mode === "admission-utility") seenPrompts.push(userPrompt);
         return mode === "admission-utility" ? { utility: 0.9, reason: "useful" } : null;
       },
     };
@@ -160,6 +181,9 @@ describe("gateMappedReflectionEntry", () => {
     const audit = JSON.parse(result.auditJson);
     assert.equal(audit.provenance, "memory-reflection-mapped");
     assert.equal(audit.decision, "pass_to_dedup");
+    assert.equal(seenPrompts.length, 1);
+    assert.match(seenPrompts[0], /Source document \(agent reflection\)/, "the real admission judge must see the reflection framing, not a conversation excerpt heading");
+    assert.doesNotMatch(seenPrompts[0], /Conversation excerpt:/);
   });
 });
 
