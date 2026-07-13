@@ -125,6 +125,7 @@ export const CI_TEST_MANIFEST = [
   // D3: admission model resolution and lane affinity
   { group: "core-regression", runner: "node", file: "test/admission-model-resolution.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/admission-lane-model-affinity.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-batch-lane-composition.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
