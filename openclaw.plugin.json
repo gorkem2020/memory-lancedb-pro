@@ -463,9 +463,11 @@
             "type": "string",
             "enum": [
               "standalone",
-              "off"
+              "off",
+              "batch"
             ],
-            "default": "standalone"
+            "default": "standalone",
+            "description": "standalone scores each candidate with its own LLM call; batch scores a whole extraction's candidates with one call per chunk of up to 10; off disables utility scoring entirely."
           },
           "rejectThreshold": {
             "type": "number",
