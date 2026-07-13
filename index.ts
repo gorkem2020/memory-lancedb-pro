@@ -191,7 +191,8 @@ interface PluginConfig {
   autoRecallExcludeAgents?: string[];
   /** Agent IDs included in auto-recall injection (whitelist mode). When set, ONLY these agents receive auto-recall. Unresolved agent context falls back to 'main'. If both include and exclude are set, include wins. */
   autoRecallIncludeAgents?: string[];
-  captureAssistant?: boolean;
+  /** true: capture assistant turns as eligible content (existing behavior). "context": include assistant turns as marked, non-extractable context without counting them toward extraction eligibility. */
+  captureAssistant?: boolean | "context";
   retrieval?: {
     mode?: "hybrid" | "vector";
     vectorWeight?: number;
@@ -2340,6 +2341,7 @@ interface PluginSingletonState {
   autoCaptureSeenTextCount: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
   autoCaptureRecentTexts: Map<string, string[]>;
+  autoCaptureRecentAssistantTexts: Map<string, string[]>;
 }
 
 interface DreamingSchedulerState {
@@ -2539,6 +2541,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureSeenTextCount = new Map<string, number>();
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
+  const autoCaptureRecentAssistantTexts = new Map<string, string[]>();
 
   return {
     config,
@@ -2566,6 +2569,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureSeenTextCount,
     autoCapturePendingIngressTexts,
     autoCaptureRecentTexts,
+    autoCaptureRecentAssistantTexts,
   };
 }
 
@@ -2718,6 +2722,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
       autoCaptureRecentTexts,
+      autoCaptureRecentAssistantTexts,
     } = singleton;
 
     warnForDisabledChannelPlugin(
@@ -3726,12 +3731,16 @@ const memoryLanceDBProPlugin = {
           const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
 
           api.logger.debug(
-            `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
+            `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${JSON.stringify(config.captureAssistant)}, ${summarizeAgentEndMessages(event.messages)})`,
           );
 
           // Extract text content from messages
           const eligibleTexts: string[] = [];
+          const assistantContextTexts: string[] = [];
           let skippedAutoCaptureTexts = 0;
+          const captureAssistantValue = config.captureAssistant;
+          const captureAssistantEligible = captureAssistantValue === true;
+          const captureAssistantAsContext = captureAssistantValue === "context";
           for (const msg of event.messages) {
             if (!msg || typeof msg !== "object") {
               continue;
@@ -3739,13 +3748,13 @@ const memoryLanceDBProPlugin = {
             const msgObj = msg as Record<string, unknown>;
 
             const role = msgObj.role;
-            const captureAssistant = config.captureAssistant === true;
-            if (
-              role !== "user" &&
-              !(captureAssistant && role === "assistant")
-            ) {
+            const isEligibleRole =
+              role === "user" || (captureAssistantEligible && role === "assistant");
+            const isContextOnlyRole = captureAssistantAsContext && role === "assistant";
+            if (!isEligibleRole && !isContextOnlyRole) {
               continue;
             }
+            const targetTexts = isEligibleRole ? eligibleTexts : assistantContextTexts;
 
             const content = msgObj.content;
 
@@ -3754,7 +3763,7 @@ const memoryLanceDBProPlugin = {
               if (!normalized) {
                 skippedAutoCaptureTexts++;
               } else {
-                eligibleTexts.push(normalized);
+                targetTexts.push(normalized);
               }
               continue;
             }
@@ -3774,7 +3783,7 @@ const memoryLanceDBProPlugin = {
                   if (!normalized) {
                     skippedAutoCaptureTexts++;
                   } else {
-                    eligibleTexts.push(normalized);
+                    targetTexts.push(normalized);
                   }
                 }
               }
@@ -3814,6 +3823,14 @@ const memoryLanceDBProPlugin = {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
+
+          const priorAssistantContextTexts = autoCaptureRecentAssistantTexts.get(sessionKey) || [];
+          let assistantContextForRun = priorAssistantContextTexts;
+          if (assistantContextTexts.length > 0) {
+            assistantContextForRun = [...priorAssistantContextTexts, ...assistantContextTexts].slice(-6);
+            autoCaptureRecentAssistantTexts.set(sessionKey, assistantContextForRun);
+            pruneMapIfOver(autoCaptureRecentAssistantTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
           const minMessages = config.extractMinMessages ?? 4;
@@ -3900,7 +3917,7 @@ const memoryLanceDBProPlugin = {
               try {
                 stats = await smartExtractor.extractAndPersist(
                   conversationText, sessionKey,
-                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId },
+                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun },
                 );
               } catch (err) {
                 api.logger.error(
@@ -3916,6 +3933,7 @@ const memoryLanceDBProPlugin = {
                 );
                 // issue #417 Fix #5: reset counter after successful extraction
                 autoCaptureSeenTextCount.set(sessionKey, 0);
+                autoCaptureRecentAssistantTexts.delete(sessionKey);
                 return; // Smart extraction handled everything
               }
 
@@ -5811,7 +5829,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       }
       return s;
     })(),
-    captureAssistant: cfg.captureAssistant === true,
+    captureAssistant: cfg.captureAssistant === "context" ? "context" : cfg.captureAssistant === true,
     retrieval:
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
         ? (() => {
