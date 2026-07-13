@@ -105,6 +105,8 @@ export const CI_TEST_MANIFEST = [
   // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
   { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-watermark-reset.test.mjs", args: ["--test"] },
+  // Consolidation command: cross-lane dedup/supersede reconciliation for existing rows
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
