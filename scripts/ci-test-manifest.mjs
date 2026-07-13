@@ -135,6 +135,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/memory-consolidate.test.mjs", args: ["--test"] },
   // Assembly-level: batch admission utility scoring over the host-managed runtime LLM transport
   { group: "core-regression", runner: "node", file: "test/batch-admission-host-transport.test.mjs", args: ["--test"] },
+// A valid-empty extraction must reset the auto-capture watermark the same way a successful extraction does
+  { group: "core-regression", runner: "node", file: "test/autocapture-reset-on-valid-empty-extraction.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
