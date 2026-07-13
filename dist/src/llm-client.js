@@ -5,6 +5,25 @@
 import OpenAI from "openai";
 import { buildOauthEndpoint, extractOutputTextFromSse, loadOAuthSession, needsRefresh, normalizeOauthModel, refreshOAuthSession, saveOAuthSession, } from "./llm-oauth.js";
 /**
+ * Strips a core-style provider prefix (e.g. "openrouter/anthropic/claude-...")
+ * down to the bare "<vendor>/<model>" form a direct OpenRouter-compatible API
+ * needs. Any other prefix, or a string with no "/", passes through unchanged.
+ * Shared by the host->direct transport fallback (see createLlmClient) and by
+ * admission-control.ts's per-lane model resolution, so both paths agree on
+ * exactly one definition of "what a direct client can accept."
+ */
+export function normalizeDirectModelRef(modelRef) {
+    const trimmed = modelRef.trim();
+    const idx = trimmed.indexOf("/");
+    if (idx <= 0)
+        return trimmed;
+    const provider = trimmed.slice(0, idx).trim().toLowerCase();
+    if (provider !== "openrouter")
+        return trimmed;
+    const rest = trimmed.slice(idx + 1).trim();
+    return rest || trimmed;
+}
+/**
  * Extract JSON from an LLM response that may be wrapped in markdown fences
  * or contain surrounding text.
  */
@@ -506,6 +525,12 @@ export function createLlmClient(config) {
             return createHostClient(config, config.runtimeLlmComplete, log, warnLog);
         }
         (warnLog ?? log)("memory-lancedb-pro: llm-client transport \"host\" is configured but the OpenClaw runtime.llm.complete surface is unavailable on this host; falling back to the direct transport");
+        // The configured model may be a core-style catalog reference (e.g.
+        // "openrouter/anthropic/claude-...") that only the host-managed runtime
+        // resolves; the direct transport needs the bare provider-stripped id.
+        // Only this fallback path normalizes -- an explicitly configured direct
+        // transport keeps sending whatever model string it was given, unchanged.
+        config = { ...config, model: normalizeDirectModelRef(config.model) };
     }
     if (config.auth === "oauth") {
         return createOauthClient(config, log, warnLog);
