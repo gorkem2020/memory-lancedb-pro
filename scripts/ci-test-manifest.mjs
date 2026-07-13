@@ -105,6 +105,9 @@ export const CI_TEST_MANIFEST = [
   // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
   { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-watermark-reset.test.mjs", args: ["--test"] },
+  // D2: batch admission utility scoring mode
+  { group: "core-regression", runner: "node", file: "test/admission-control-batch-utility.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-admission.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
