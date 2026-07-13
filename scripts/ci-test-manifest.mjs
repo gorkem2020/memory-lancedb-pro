@@ -124,6 +124,9 @@ export const CI_TEST_MANIFEST = [
 // D2: batch utility mode for admission scoring
   { group: "core-regression", runner: "node", file: "test/admission-control-batch-utility.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-admission.test.mjs", args: ["--test"] },
+// D3: per-lane admission model affinity
+  { group: "core-regression", runner: "node", file: "test/admission-model-resolution.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-lane-model-affinity.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
