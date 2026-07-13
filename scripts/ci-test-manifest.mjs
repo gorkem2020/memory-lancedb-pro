@@ -106,6 +106,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/scope-owner-leak-hardening.test.mjs", args: ["--test"] },
   // Delete/delete-bulk must synchronously invalidate in-process reflection read caches
   { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
+  // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
+  { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
