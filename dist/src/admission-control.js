@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { normalizeDirectModelRef } from "./llm-client.js";
 import { DURABLE_CATEGORIES } from "./memory-categories.js";
 import { parseSmartMetadata } from "./smart-metadata.js";
 const DEFAULT_WEIGHTS = {
@@ -434,28 +435,6 @@ function parseBatchUtilityResponse(response, expectedCount) {
     return out;
 }
 /**
- * The admission-control LLM client talks directly to OpenRouter, so it needs
- * the bare "<vendor>/<model>" id OpenRouter's chat-completions API expects.
- * Model refs sourced from memoryReflection.model (or an explicit override)
- * may instead be in the core-style "openrouter/<vendor>/<model>" form the
- * reflection distiller's own embedded runner accepts — that runner picks a
- * backend from the leading segment, then forwards the rest as the model id.
- * Strip that literal "openrouter/" prefix so both forms reach this plugin's
- * direct client correctly; a bare "<vendor>/<model>" or an "@preset/<name>"
- * alias already work against OpenRouter unchanged, so they pass through.
- */
-export function normalizeAdmissionModelRef(modelRef) {
-    const trimmed = modelRef.trim();
-    const idx = trimmed.indexOf("/");
-    if (idx <= 0)
-        return trimmed;
-    const provider = trimmed.slice(0, idx).trim().toLowerCase();
-    if (provider !== "openrouter")
-        return trimmed;
-    const rest = trimmed.slice(idx + 1).trim();
-    return rest || trimmed;
-}
-/**
  * Resolves which LLM model an admission call should use, in order:
  * 1. An explicit admissionControl.model override always wins, on every lane.
  * 2. When modelAffinity is "lane", the reflection lane resolves the
@@ -465,7 +444,8 @@ export function normalizeAdmissionModelRef(modelRef) {
  * 3. Default ("global", or the knob absent): every lane uses the global
  *    model — today's behavior, unchanged.
  * When transport is "direct" (the default), every returned model passes
- * through normalizeAdmissionModelRef so a core-style provider-prefixed
+ * through normalizeDirectModelRef (src/llm-client.ts — shared with the
+ * host->direct transport fallback) so a core-style provider-prefixed
  * string reaches this plugin's OpenRouter-direct client in the form it
  * requires. When transport is "host", the model passes through unmodified:
  * the host-managed runtime LLM catalog resolves core-style catalog
@@ -473,7 +453,7 @@ export function normalizeAdmissionModelRef(modelRef) {
  * resolution (https://github.com/CortexReach/memory-lancedb-pro/issues/901).
  */
 export function resolveAdmissionModel(params) {
-    const normalize = (modelRef) => params.transport === "host" ? modelRef : normalizeAdmissionModelRef(modelRef);
+    const normalize = (modelRef) => params.transport === "host" ? modelRef : normalizeDirectModelRef(modelRef);
     const explicit = params.admissionControl.model?.trim();
     if (explicit) {
         return normalize(explicit);

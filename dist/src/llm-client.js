@@ -4,7 +4,6 @@
  */
 import OpenAI from "openai";
 import { buildOauthEndpoint, extractOutputTextFromSse, loadOAuthSession, needsRefresh, normalizeOauthModel, refreshOAuthSession, saveOAuthSession, } from "./llm-oauth.js";
-const DEFAULT_SYSTEM_PROMPT = "You are a memory extraction assistant. Always respond with valid JSON only.";
 /**
  * Strips a core-style provider prefix (e.g. "openrouter/anthropic/claude-...")
  * down to the bare "<vendor>/<model>" form a direct OpenRouter-compatible API
@@ -24,6 +23,7 @@ export function normalizeDirectModelRef(modelRef) {
     const rest = trimmed.slice(idx + 1).trim();
     return rest || trimmed;
 }
+const DEFAULT_SYSTEM_PROMPT = "You are a memory extraction assistant. Always respond with valid JSON only.";
 /**
  * Extract JSON from an LLM response that may be wrapped in markdown fences
  * or contain surrounding text.
