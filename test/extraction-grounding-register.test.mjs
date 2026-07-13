@@ -279,13 +279,13 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
 
   it("buildExtractionPrompt documents the v3 grounding contract (structural check)", async () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const { system } = buildExtractionPrompt("some conversation", "test-user");
 
-    assert.match(prompt, /grounding/i);
-    assert.match(prompt, /"real"\s*\|\s*"constructed"|real.*constructed/i);
-    assert.match(prompt, /about-the-fiction is real/i, "the v3 about/within one-line rule must be present");
-    assert.match(prompt, /within-the-fiction/i, "the within-the-fiction definition of constructed must be present");
-    assert.doesNotMatch(prompt, /at most one/i, "the per-extraction constructed cap must be fully removed from the prompt");
+    assert.match(system, /grounding/i);
+    assert.match(system, /"real"\s*\|\s*"constructed"|real.*constructed/i);
+    assert.match(system, /about-the-fiction is real/i, "the v3 about/within one-line rule must be present");
+    assert.match(system, /within-the-fiction/i, "the within-the-fiction definition of constructed must be present");
+    assert.doesNotMatch(system, /at most one/i, "the per-extraction constructed cap must be fully removed from the prompt");
   });
 });
 
@@ -478,12 +478,12 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
 
   it("buildExtractionPrompt documents the batch register contract (structural check)", () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const { system } = buildExtractionPrompt("some conversation", "test-user");
 
-    assert.match(prompt, /conversation_register/);
-    assert.match(prompt, /"real\|mixed\|fiction"/);
-    assert.match(prompt, /self-consistency/i, "the batch self-consistency instruction must be present");
-    assert.doesNotMatch(prompt, /storage rule applied after tagging/i, "the deleted per-extraction cap language must not remain in the prompt");
+    assert.match(system, /conversation_register/);
+    assert.match(system, /"real\|mixed\|fiction"/);
+    assert.match(system, /self-consistency/i, "the batch self-consistency instruction must be present");
+    assert.doesNotMatch(system, /storage rule applied after tagging/i, "the deleted per-extraction cap language must not remain in the prompt");
   });
 });
 
@@ -577,9 +577,9 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
   it("buildUtilityPrompt interpolates grounding and names all six registers (structural check)", async () => {
     const llm = {
       prompts: [],
-      async completeJson(prompt, mode) {
+      async completeJson(prompt, mode, systemPrompt) {
         if (mode === "admission-utility") {
-          this.prompts.push(prompt);
+          this.prompts.push(`${systemPrompt ?? ""}\n${prompt}`);
           return { utility: 0.5, reason: "mock" };
         }
         return null;
