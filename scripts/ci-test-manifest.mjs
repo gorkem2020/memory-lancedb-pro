@@ -129,6 +129,8 @@ export const CI_TEST_MANIFEST = [
   // Consolidation command: cross-lane dedup/supersede reconciliation for existing rows
   { group: "core-regression", runner: "node", file: "test/memory-consolidate.test.mjs", args: ["--test"] },
 
+  // CLI subcommand attachment: pins every command under the memory-pro group, root program stays clean
+  { group: "core-regression", runner: "node", file: "test/cli-subcommand-attachment.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
