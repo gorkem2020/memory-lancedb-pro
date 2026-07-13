@@ -2406,6 +2406,7 @@ const memoryLanceDBProPlugin = {
             onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
             migrator,
             embedder,
+            mdMirror,
             llmClient: smartExtractor ? (() => {
                 try {
                     const llmAuth = config.llm?.auth || "api-key";
