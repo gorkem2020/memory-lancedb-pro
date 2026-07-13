@@ -127,6 +127,8 @@ export const CI_TEST_MANIFEST = [
 // D3: per-lane admission model affinity
   { group: "core-regression", runner: "node", file: "test/admission-model-resolution.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/admission-lane-model-affinity.test.mjs", args: ["--test"] },
+// CLI subcommand attachment structural test
+  { group: "core-regression", runner: "node", file: "test/cli-subcommand-attachment.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
