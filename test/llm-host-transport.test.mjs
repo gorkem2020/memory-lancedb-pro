@@ -121,6 +121,66 @@ describe("LLM host transport", () => {
     );
   });
 
+  it("normalizes a core-style catalog model to the bare id when falling back from host to direct", async () => {
+    let requestBody;
+    server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      requestBody = JSON.parse(body);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "{\"memories\":[]}" } }] }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      transport: "host",
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "openrouter/openai/gpt-oss-120b",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+      warnLog: () => {},
+    });
+
+    const result = await llm.completeJson("hello", "fallback-model-probe");
+
+    assert.deepEqual(result, { memories: [] });
+    assert.equal(
+      requestBody.model,
+      "openai/gpt-oss-120b",
+      "the direct client sent by the host->direct fallback must receive the bare provider-stripped id",
+    );
+  });
+
+  it("keeps an explicit direct transport's catalog-style model string unchanged (byte-identical regression)", async () => {
+    let requestBody;
+    server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      requestBody = JSON.parse(body);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "{\"memories\":[]}" } }] }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "openrouter/openai/gpt-oss-120b",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+    });
+
+    const result = await llm.completeJson("hello", "explicit-direct-probe");
+
+    assert.deepEqual(result, { memories: [] });
+    assert.equal(
+      requestBody.model,
+      "openrouter/openai/gpt-oss-120b",
+      "an explicitly-configured direct transport must send the model unchanged, exactly as before this change",
+    );
+  });
+
   it("returns null and records lastError on a malformed host transport response", async () => {
     const runtimeLlmComplete = async () => ({ text: "this is not json at all" });
 
