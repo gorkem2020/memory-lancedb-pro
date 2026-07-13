@@ -105,6 +105,10 @@ export const CI_TEST_MANIFEST = [
   // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
   { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-watermark-reset.test.mjs", args: ["--test"] },
+  // D1: standalone admission controller decoupled from SmartExtractor
+  { group: "core-regression", runner: "node", file: "test/admission-controller-standalone.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-admission-controller-injection.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-without-smart-extraction.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
