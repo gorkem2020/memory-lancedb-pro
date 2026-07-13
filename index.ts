@@ -262,6 +262,7 @@ interface PluginConfig {
     oauthPath?: string;
     timeoutMs?: number;
     transport?: "direct" | "host";
+    reasoningEffort?: string;
   };
   extractMinMessages?: number;
   extractMaxChars?: number;
@@ -2506,6 +2507,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         oauthPath: llmOauthPath,
         timeoutMs: llmTimeoutMs,
         transport: config.llm?.transport,
+        reasoningEffort: config.llm?.reasoningEffort,
         runtimeLlmComplete: resolveRuntimeLlmComplete(api),
         log: (msg: string) => api.logger.debug(msg),
         warnLog: (msg: string) => api.logger.warn(msg),
@@ -3202,6 +3204,7 @@ const memoryLanceDBProPlugin = {
               oauthPath: llmOauthPath,
               timeoutMs: llmTimeoutMs,
               transport: config.llm?.transport,
+              reasoningEffort: config.llm?.reasoningEffort,
               runtimeLlmComplete: resolveRuntimeLlmComplete(api),
               log: (msg: string) => api.logger.debug(msg),
             });
