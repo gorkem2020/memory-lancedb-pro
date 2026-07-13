@@ -9,6 +9,17 @@ const TOPIC_TOKEN_STOPWORDS = new Set([
     "more", "longer", "stopped", "quit", "used", "no", "not", "the", "a", "an",
     "of", "to", "and", "with", "their", "they", "was", "is", "are", "were",
     "has", "have", "had", "will", "would", "their", "for", "at", "in", "on",
+    // Generic life-update narration: these appear across many unrelated life
+    // events/decisions and would otherwise let a single multi-topic narrative
+    // row bridge several unrelated topic clusters via incidental overlap.
+    "decided", "decide", "redesign", "redesigning", "relocate",
+    "relocating", "moved", "move", "moving", "changed", "change", "changing",
+    "switched", "switch", "started", "start", "starting", "continuing",
+    "continues", "testing", "tested", "experiment", "experimenting", "after",
+    "before", "now", "previously", "recently", "incident", "productivity",
+    "better", "correctly", "confirmed", "offered", "each", "record", "records",
+    "distinct", "fact", "facts", "note", "notes", "update", "updates", "updated",
+    "from", "into", "this", "that", "these", "those", "it", "its", "them",
 ]);
 function looksLikeReversal(text) {
     return REVERSAL_SIGNAL_PATTERN.test(text);
@@ -17,12 +28,35 @@ function extractTopicTokens(text) {
     const words = text.toLowerCase().match(/[a-z0-9][a-z0-9'-]{2,}/g) || [];
     return new Set(words.filter((w) => !TOPIC_TOKEN_STOPWORDS.has(w)));
 }
+// Reversal statements are typically short ("User will no longer drink
+// cola"); a long multi-fact narrative recap can mention almost every topic
+// in a scope at once and would otherwise bridge unrelated clusters through
+// incidental keyword overlap. Only short, single-topic-looking statements
+// participate in the topic-overlap fallback.
+const REVERSAL_TOPIC_LINK_MAX_LENGTH = 120;
+function isEligibleForTopicLink(abstract) {
+    return abstract.length <= REVERSAL_TOPIC_LINK_MAX_LENGTH;
+}
+// Tokens match on exact equality or containment (one is a substring of the
+// other, e.g. "cola" inside "coca-cola"), since brand/product names are
+// routinely abbreviated across lanes. The shorter token must still be long
+// enough (>= 4 chars) to keep an accidental short-token containment match
+// from firing.
+function tokensMatch(a, b) {
+    if (a === b)
+        return true;
+    const shorter = a.length <= b.length ? a : b;
+    const longer = a.length <= b.length ? b : a;
+    return shorter.length >= 4 && longer.includes(shorter);
+}
 function shareSignificantTopicToken(a, b) {
     const tokensA = extractTopicTokens(a);
     const tokensB = extractTopicTokens(b);
-    for (const token of tokensA) {
-        if (tokensB.has(token))
-            return true;
+    for (const tokenA of tokensA) {
+        for (const tokenB of tokensB) {
+            if (tokensMatch(tokenA, tokenB))
+                return true;
+        }
     }
     return false;
 }
@@ -55,63 +89,65 @@ export function buildConsolidateCandidate(entry) {
         source: meta.source,
     };
 }
+function isDirectlyLinked(a, b, similarityThreshold) {
+    const va = a.entry.vector;
+    const vb = b.entry.vector;
+    if (va.length > 0 && vb.length > 0 && cosineSimilarity(va, vb) >= similarityThreshold) {
+        return true;
+    }
+    if (a.factKey && a.factKey === b.factKey) {
+        return true;
+    }
+    // Reflection-mapped rows carry no stored fact_key, and a naturally phrased
+    // reversal rarely follows the "[Merge key]: text" convention that
+    // deriveFactKey needs to align across lanes, so its derived key is
+    // effectively unique. Gate a topic-word-overlap fallback to rows that look
+    // like a reversal, in the same category, and short enough to plausibly be
+    // about one topic, so it only widens linking for the exact case cosine +
+    // fact_key miss, not for arbitrary unrelated or multi-topic narrative rows.
+    if ((looksLikeReversal(a.abstract) || looksLikeReversal(b.abstract)) &&
+        a.memoryCategory &&
+        a.memoryCategory === b.memoryCategory &&
+        isEligibleForTopicLink(a.abstract) &&
+        isEligibleForTopicLink(b.abstract) &&
+        shareSignificantTopicToken(a.abstract, b.abstract)) {
+        return true;
+    }
+    return false;
+}
 /**
- * Union-find clustering: two rows join the same cluster if they are similar
- * enough by embedding cosine, OR if they share a non-empty fact_key. The
- * fact_key link lets a low-cosine reversal row (e.g. "quit X") land in the
- * same cluster as the rows it contradicts, which plain vector similarity
- * would place too far apart.
+ * Seed-based clustering: for each not-yet-assigned row (in order), it
+ * becomes the seed of a new cluster, and every OTHER unassigned row joins
+ * that cluster only if it is DIRECTLY linked to the seed itself (cosine,
+ * fact_key, or the topic-overlap fallback) -- never transitively through
+ * another cluster member. Plain union-find (transitive closure) chains
+ * unrelated rows together whenever a series of only-moderately-similar
+ * pairs bridges them (row A links to B, B links to C, so A and C end up in
+ * one cluster even though A and C are never themselves similar); seed-based
+ * grouping caps that at a single hop from the seed, which is what keeps a
+ * handful of distinct topics from collapsing into one grab-bag cluster.
  */
 export function clusterConsolidateCandidates(candidates, similarityThreshold) {
     const n = candidates.length;
-    const parent = Array.from({ length: n }, (_, i) => i);
-    function find(x) {
-        while (parent[x] !== x) {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
+    const assigned = new Array(n).fill(false);
+    const clusters = [];
+    for (let seedIdx = 0; seedIdx < n; seedIdx++) {
+        if (assigned[seedIdx])
+            continue;
+        assigned[seedIdx] = true;
+        const cluster = [seedIdx];
+        for (let j = 0; j < n; j++) {
+            if (assigned[j])
+                continue;
+            if (isDirectlyLinked(candidates[seedIdx], candidates[j], similarityThreshold)) {
+                assigned[j] = true;
+                cluster.push(j);
+            }
         }
-        return x;
+        if (cluster.length >= 2)
+            clusters.push(cluster);
     }
-    function union(a, b) {
-        const ra = find(a);
-        const rb = find(b);
-        if (ra !== rb)
-            parent[ra] = rb;
-    }
-    for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
-            let linked = false;
-            const vi = candidates[i].entry.vector;
-            const vj = candidates[j].entry.vector;
-            if (vi.length > 0 && vj.length > 0 && cosineSimilarity(vi, vj) >= similarityThreshold) {
-                linked = true;
-            }
-            if (!linked && candidates[i].factKey && candidates[i].factKey === candidates[j].factKey) {
-                linked = true;
-            }
-            // Reflection-mapped rows carry no stored fact_key, and a naturally
-            // phrased reversal rarely follows the "[Merge key]: text" convention
-            // that deriveFactKey needs to align across lanes, so its derived key
-            // is effectively unique. Gate a topic-word-overlap fallback to rows
-            // that look like a reversal, so it only widens linking for the exact
-            // case cosine + fact_key miss, not for arbitrary unrelated rows.
-            if (!linked &&
-                (looksLikeReversal(candidates[i].abstract) || looksLikeReversal(candidates[j].abstract)) &&
-                shareSignificantTopicToken(candidates[i].abstract, candidates[j].abstract)) {
-                linked = true;
-            }
-            if (linked)
-                union(i, j);
-        }
-    }
-    const groups = new Map();
-    for (let i = 0; i < n; i++) {
-        const root = find(i);
-        if (!groups.has(root))
-            groups.set(root, []);
-        groups.get(root).push(i);
-    }
-    return [...groups.values()].filter((g) => g.length >= 2);
+    return clusters;
 }
 export function chunkCluster(indices, maxSize) {
     const chunks = [];
@@ -271,8 +307,12 @@ export async function runConsolidate(deps, options) {
                 continue;
             if (verdict.verdict === "skip" || verdict.verdict === "contradict")
                 continue;
-            if (members.some((m) => m.memoryCategory && APPEND_ONLY_CATEGORIES.has(m.memoryCategory))) {
-                deps.log?.(`memory-consolidate: refusing to ${verdict.verdict} a cluster containing an append-only category (events/cases); skipping`);
+            const actedUponIndices = [verdict.survivorIndex, ...verdict.absorbedIndices];
+            if (actedUponIndices.some((idx) => {
+                const category = members[idx - 1].memoryCategory;
+                return category && APPEND_ONLY_CATEGORIES.has(category);
+            })) {
+                deps.log?.(`memory-consolidate: refusing to ${verdict.verdict} an append-only row (events/cases); skipping this verdict`);
                 continue;
             }
             try {
