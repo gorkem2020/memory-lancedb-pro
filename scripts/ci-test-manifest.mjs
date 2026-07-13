@@ -102,6 +102,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/reflection-distiller-hook-skip.test.mjs", args: ["--test"] },
   // register() re-registration hardening (scope cache-miss log/handler dedup)
   { group: "core-regression", runner: "node", file: "test/register-scope-dedup.test.mjs", args: ["--test"] },
+  // CLI subcommand attachment: pins every command under the memory-pro group, root program stays clean
+  { group: "core-regression", runner: "node", file: "test/cli-subcommand-attachment.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
