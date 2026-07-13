@@ -753,7 +753,7 @@ export class SmartExtractor {
     const cleaned = stripEnvelopeMetadata(truncated);
 
     const user = this.config.user ?? "User";
-    const prompt = buildExtractionPrompt(cleaned, user);
+    const { system, user: userPrompt } = buildExtractionPrompt(cleaned, user);
 
     const result = await this.llm.completeJson<{
       memories: Array<{
@@ -762,7 +762,7 @@ export class SmartExtractor {
         overview: string;
         content: string;
       }>;
-    }>(prompt, "extract-candidates");
+    }>(userPrompt, "extract-candidates", system);
 
     if (!result) {
       this.debugLog(
@@ -1099,7 +1099,7 @@ export class SmartExtractor {
       })
       .join("\n");
 
-    const prompt = buildDedupPrompt(
+    const { system, user: userPrompt } = buildDedupPrompt(
       candidate.abstract,
       candidate.overview,
       candidate.content,
@@ -1111,7 +1111,7 @@ export class SmartExtractor {
         decision: string;
         reason: string;
         match_index?: number;
-      }>(prompt, "dedup-decision");
+      }>(userPrompt, "dedup-decision", system);
 
       if (!data) {
         this.log(
@@ -1280,7 +1280,7 @@ export class SmartExtractor {
     }
 
     // Call LLM to merge
-    const prompt = buildMergePrompt(
+    const { system, user: userPrompt } = buildMergePrompt(
       existingAbstract,
       existingOverview,
       existingContent,
@@ -1294,7 +1294,7 @@ export class SmartExtractor {
       abstract: string;
       overview: string;
       content: string;
-    }>(prompt, "merge-memory");
+    }>(userPrompt, "merge-memory", system);
 
     if (!merged) {
       this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
