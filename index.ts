@@ -100,6 +100,7 @@ import {
 } from "./src/workspace-boundary.js";
 import {
   normalizeAdmissionControlConfig,
+  resolveAdmissionModel,
   createAdmissionController,
   resolveRejectedAuditFilePath,
   type AdmissionControlConfig,
@@ -2339,6 +2340,7 @@ interface PluginSingletonState {
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
   admissionController: AdmissionController | null;
+  admissionControllerReflectionLane: AdmissionController | null;
   mdMirror: MdMirrorWriter | null;
   extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
   // Session Maps — persist across scope refreshes instead of being recreated
@@ -2473,6 +2475,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
 
   let smartExtractor: SmartExtractor | null = null;
   let admissionController: AdmissionController | null = null;
+  let admissionControllerReflectionLane: AdmissionController | null = null;
   if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
     try {
       const llmAuth = config.llm?.auth || "api-key";
@@ -2505,15 +2508,55 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         warnLog: (msg: string) => api.logger.warn(msg),
       });
 
-      // Constructed independently of SmartExtractor so admission gating is
-      // available to other write paths (e.g. reflection-mapped rows, the
-      // regex fallback) even when smart extraction itself is disabled.
+      // Model resolution for admission calls: explicit admissionControl.model
+      // override > lane affinity (reflection lane resolves the
+      // memoryReflection model) > global default. See resolveAdmissionModel().
+      // Both controllers are constructed independently of SmartExtractor so
+      // admission gating is available to other write paths (e.g.
+      // reflection-mapped rows, the regex fallback) even when smart
+      // extraction itself is disabled.
+      const reflectionModelForAdmission = asNonEmptyString(config.memoryReflection?.model);
+      const admissionModelExtraction = resolveAdmissionModel({
+        admissionControl: config.admissionControl,
+        lane: "other",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
+      });
+      const admissionModelReflection = resolveAdmissionModel({
+        admissionControl: config.admissionControl,
+        lane: "reflection",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
+      });
+      const buildAdmissionLlmClient = (model: string) =>
+        model === llmModel
+          ? llmClient
+          : createLlmClient({
+              auth: llmAuth,
+              apiKey: llmApiKey,
+              model,
+              baseURL: llmBaseURL,
+              oauthProvider: llmOauthProvider,
+              oauthPath: llmOauthPath,
+              timeoutMs: llmTimeoutMs,
+              log: (msg: string) => api.logger.debug(msg),
+              warnLog: (msg: string) => api.logger.warn(msg),
+            });
       admissionController = createAdmissionController(
         store,
-        llmClient,
+        buildAdmissionLlmClient(admissionModelExtraction),
         config.admissionControl,
         (msg: string) => api.logger.debug(msg),
       );
+      admissionControllerReflectionLane =
+        admissionModelReflection === admissionModelExtraction
+          ? admissionController
+          : createAdmissionController(
+              store,
+              buildAdmissionLlmClient(admissionModelReflection),
+              config.admissionControl,
+              (msg: string) => api.logger.debug(msg),
+            );
 
       if (config.smartExtraction !== false) {
         const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
@@ -2587,6 +2630,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     migrator,
     smartExtractor,
     admissionController,
+    admissionControllerReflectionLane,
     mdMirror,
     extractionRateLimiter,
     reflectionErrorStateBySession,
@@ -2739,6 +2783,7 @@ const memoryLanceDBProPlugin = {
       migrator,
       smartExtractor,
       admissionController,
+      admissionControllerReflectionLane,
       mdMirror,
       decayEngine,
       tierManager,
