@@ -28,6 +28,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         preset: "balanced",
         enabled: false,
         utilityMode: "standalone",
+        modelAffinity: "global",
         weights: DEFAULT_WEIGHTS,
         rejectThreshold: 0.45,
         admitThreshold: 0.6,
@@ -44,6 +45,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         preset: "conservative",
         enabled: false,
         utilityMode: "standalone",
+        modelAffinity: "global",
         weights: {
             utility: 0.16,
             confidence: 0.16,
@@ -73,6 +75,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         preset: "high-recall",
         enabled: false,
         utilityMode: "standalone",
+        modelAffinity: "global",
         weights: {
             utility: 0.08,
             confidence: 0.1,
@@ -203,6 +206,10 @@ export function normalizeAdmissionControlConfig(raw) {
             obj.rejectedAuditFilePath.trim().length > 0
             ? obj.rejectedAuditFilePath.trim()
             : undefined,
+        model: typeof obj.model === "string" && obj.model.trim().length > 0
+            ? obj.model.trim()
+            : undefined,
+        modelAffinity: obj.modelAffinity === "lane" ? "lane" : "global",
     };
 }
 export function resolveRejectedAuditFilePath(dbPath, config) {
@@ -334,6 +341,27 @@ Return JSON only:
   "reason": "short explanation"
 }`;
 }
+/**
+ * Resolves which LLM model an admission call should use, in order:
+ * 1. An explicit admissionControl.model override always wins, on every lane.
+ * 2. When modelAffinity is "lane", the reflection lane resolves the
+ *    memoryReflection model (falling back to the global model if none is
+ *    configured) — the judge is never dumber than the author whose rows it
+ *    audits. Every other lane stays on the global model.
+ * 3. Default ("global", or the knob absent): every lane uses the global
+ *    model — today's behavior, unchanged.
+ */
+export function resolveAdmissionModel(params) {
+    const explicit = params.admissionControl.model?.trim();
+    if (explicit) {
+        return explicit;
+    }
+    if (params.admissionControl.modelAffinity === "lane" && params.lane === "reflection") {
+        const reflectionModel = params.reflectionModel?.trim();
+        return reflectionModel || params.globalModel;
+    }
+    return params.globalModel;
+}
 function buildReason(details) {
     const scoreText = details.score.toFixed(3);
     const similarityText = details.maxSimilarity.toFixed(3);
@@ -425,6 +453,17 @@ async function scoreUtility(llm, mode, candidate, conversationText) {
         score: clamp01(response.utility, 0.5),
         reason: typeof response.reason === "string" ? response.reason.trim() : undefined,
     };
+}
+/**
+ * Construct an AdmissionController independently of any extraction engine.
+ * Availability depends only on the admission config's `enabled` flag, so
+ * callers that never build a SmartExtractor (e.g. smartExtraction: false)
+ * can still obtain a working controller to gate other write paths.
+ */
+export function createAdmissionController(store, llm, config, debugLog = () => { }) {
+    return config?.enabled === true
+        ? new AdmissionController(store, llm, config, debugLog)
+        : null;
 }
 export class AdmissionController {
     store;

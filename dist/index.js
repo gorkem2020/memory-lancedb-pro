@@ -51,7 +51,7 @@ import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, toLifecycleMemory, } from "./src/smart-metadata.js";
 import { computeTier1Patch, isSuppressed as isTier1Suppressed, TIER1_DEFAULT_BAD_RECALL_DECAY_MS, TIER1_DEFAULT_SUPPRESSION_DURATION_MS, } from "./src/auto-recall-tier1.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./src/workspace-boundary.js";
-import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
+import { normalizeAdmissionControlConfig, resolveAdmissionModel, createAdmissionController, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
@@ -1802,6 +1802,8 @@ function _initPluginState(api) {
     // callback below closes over it.
     const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
+    let admissionController = null;
+    let admissionControllerReflectionLane = null;
     if (config.smartExtraction !== false) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
@@ -1835,6 +1837,40 @@ function _initPluginState(api) {
             const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
             noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
             const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
+            // Model resolution for admission calls: explicit admissionControl.model
+            // override > lane affinity (reflection lane resolves the
+            // memoryReflection model) > global default. See resolveAdmissionModel().
+            const reflectionModelForAdmission = asNonEmptyString(config.memoryReflection?.model);
+            const admissionModelExtraction = resolveAdmissionModel({
+                admissionControl: config.admissionControl,
+                lane: "other",
+                globalModel: llmModel,
+                reflectionModel: reflectionModelForAdmission,
+            });
+            const admissionModelReflection = resolveAdmissionModel({
+                admissionControl: config.admissionControl,
+                lane: "reflection",
+                globalModel: llmModel,
+                reflectionModel: reflectionModelForAdmission,
+            });
+            const buildAdmissionLlmClient = (model) => model === llmModel
+                ? llmClient
+                : createLlmClient({
+                    auth: llmAuth,
+                    apiKey: llmApiKey,
+                    model,
+                    baseURL: llmBaseURL,
+                    oauthProvider: llmOauthProvider,
+                    oauthPath: llmOauthPath,
+                    timeoutMs: llmTimeoutMs,
+                    log: (msg) => api.logger.debug(msg),
+                    warnLog: (msg) => api.logger.warn(msg),
+                });
+            admissionController = createAdmissionController(store, buildAdmissionLlmClient(admissionModelExtraction), config.admissionControl, (msg) => api.logger.debug(msg));
+            admissionControllerReflectionLane =
+                admissionModelReflection === admissionModelExtraction
+                    ? admissionController
+                    : createAdmissionController(store, buildAdmissionLlmClient(admissionModelReflection), config.admissionControl, (msg) => api.logger.debug(msg));
             smartExtractor = new SmartExtractor(store, embedder, llmClient, {
                 user: "User",
                 extractMinMessages: config.extractMinMessages ?? 4,
@@ -1842,6 +1878,7 @@ function _initPluginState(api) {
                 defaultScope: config.scopes?.default ?? "global",
                 workspaceBoundary: config.workspaceBoundary,
                 admissionControl: config.admissionControl,
+                admissionController,
                 onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
                 onPersisted: mdMirror ?? undefined,
                 log: (msg) => api.logger.info(msg),
@@ -1886,6 +1923,8 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        admissionController,
+        admissionControllerReflectionLane,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
@@ -2005,7 +2044,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, admissionControllerReflectionLane, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
