@@ -99,9 +99,12 @@ import {
 } from "./src/workspace-boundary.js";
 import {
   normalizeAdmissionControlConfig,
+  resolveAdmissionModel,
+  createAdmissionController,
   resolveRejectedAuditFilePath,
   type AdmissionControlConfig,
   type AdmissionRejectionAuditEntry,
+  type AdmissionController,
 } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
@@ -2333,6 +2336,8 @@ interface PluginSingletonState {
   scopeManager: ReturnType<typeof createScopeManager>;
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
+  admissionController: AdmissionController | null;
+  admissionControllerReflectionLane: AdmissionController | null;
   mdMirror: MdMirrorWriter | null;
   extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
   // Session Maps — persist across scope refreshes instead of being recreated
@@ -2465,6 +2470,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const mdMirror = createMdMirrorWriter(api, config);
 
   let smartExtractor: SmartExtractor | null = null;
+  let admissionController: AdmissionController | null = null;
+  let admissionControllerReflectionLane: AdmissionController | null = null;
   if (config.smartExtraction !== false) {
     try {
       const llmAuth = config.llm?.auth || "api-key";
@@ -2504,6 +2511,52 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
 
       const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
 
+      // Model resolution for admission calls: explicit admissionControl.model
+      // override > lane affinity (reflection lane resolves the
+      // memoryReflection model) > global default. See resolveAdmissionModel().
+      const reflectionModelForAdmission = asNonEmptyString(config.memoryReflection?.model);
+      const admissionModelExtraction = resolveAdmissionModel({
+        admissionControl: config.admissionControl,
+        lane: "other",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
+      });
+      const admissionModelReflection = resolveAdmissionModel({
+        admissionControl: config.admissionControl,
+        lane: "reflection",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
+      });
+      const buildAdmissionLlmClient = (model: string) =>
+        model === llmModel
+          ? llmClient
+          : createLlmClient({
+              auth: llmAuth,
+              apiKey: llmApiKey,
+              model,
+              baseURL: llmBaseURL,
+              oauthProvider: llmOauthProvider,
+              oauthPath: llmOauthPath,
+              timeoutMs: llmTimeoutMs,
+              log: (msg: string) => api.logger.debug(msg),
+              warnLog: (msg: string) => api.logger.warn(msg),
+            });
+      admissionController = createAdmissionController(
+        store,
+        buildAdmissionLlmClient(admissionModelExtraction),
+        config.admissionControl,
+        (msg: string) => api.logger.debug(msg),
+      );
+      admissionControllerReflectionLane =
+        admissionModelReflection === admissionModelExtraction
+          ? admissionController
+          : createAdmissionController(
+              store,
+              buildAdmissionLlmClient(admissionModelReflection),
+              config.admissionControl,
+              (msg: string) => api.logger.debug(msg),
+            );
+
       smartExtractor = new SmartExtractor(store, embedder, llmClient, {
         user: "User",
         extractMinMessages: config.extractMinMessages ?? 4,
@@ -2511,6 +2564,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         defaultScope: config.scopes?.default ?? "global",
         workspaceBoundary: config.workspaceBoundary,
         admissionControl: config.admissionControl,
+        admissionController,
         onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
         onPersisted: mdMirror ?? undefined,
         log: (msg: string) => api.logger.info(msg),
@@ -2560,6 +2614,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     scopeManager,
     migrator,
     smartExtractor,
+    admissionController,
+    admissionControllerReflectionLane,
     mdMirror,
     extractionRateLimiter,
     reflectionErrorStateBySession,
@@ -2710,6 +2766,8 @@ const memoryLanceDBProPlugin = {
       scopeManager,
       migrator,
       smartExtractor,
+      admissionController,
+      admissionControllerReflectionLane,
       mdMirror,
       decayEngine,
       tierManager,
