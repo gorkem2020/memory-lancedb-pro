@@ -96,6 +96,15 @@ assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthProvider"),
   "configSchema should declare llm.oauthProvider",
 );
+assert.ok(
+  manifest.configSchema.properties.llm.properties.transport.enum.includes("host"),
+  "llm.transport schema should declare the host transport option",
+);
+assert.equal(
+  manifest.configSchema.properties.llm.properties.transport.default,
+  "direct",
+  "llm.transport schema default should remain direct (host routing is opt-in)",
+);
 
 assert.equal(
   manifest.configSchema.properties.autoRecallMinRepeated.default,
