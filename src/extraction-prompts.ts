@@ -327,11 +327,6 @@ ${newContent}`;
   return { system, user: userMessage };
 }
 
-export interface SplitPrompt {
-  system: string;
-  user: string;
-}
-
 export interface ConsolidateMember {
   index: number;
   category: string;

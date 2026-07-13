@@ -166,7 +166,7 @@ export interface ConsolidateWriteDeps {
   ) => Promise<unknown>;
   delete: (id: string, scopeFilter?: string[]) => Promise<unknown>;
   embed: (text: string) => Promise<number[]>;
-  completeJson: <T>(prompt: string, label?: string) => Promise<T | null>;
+  completeJson: <T>(prompt: string, label?: string, systemPrompt?: string) => Promise<T | null>;
 }
 
 async function applyMergeVerdict(
@@ -194,8 +194,9 @@ async function applyMergeVerdict(
       survivor.memoryCategory || "preferences"
     );
     const merged = await deps.completeJson<{ abstract: string; overview: string; content: string }>(
-      prompt,
-      "consolidate-merge"
+      prompt.user,
+      "consolidate-merge",
+      prompt.system
     );
     if (merged) {
       abstract = merged.abstract;
@@ -351,8 +352,7 @@ export async function runConsolidate(
           source: m.source,
         }))
       );
-      const combinedPrompt = `${prompt.system}\n\n${prompt.user}`;
-      const raw = await deps.completeJson<Record<string, unknown>>(combinedPrompt, "consolidate-decide");
+      const raw = await deps.completeJson<Record<string, unknown>>(prompt.user, "consolidate-decide", prompt.system);
       const verdict = raw ? parseConsolidateVerdict(raw, members.length) : null;
 
       if (!verdict) {

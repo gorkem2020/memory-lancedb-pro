@@ -117,7 +117,7 @@ async function applyMergeVerdict(deps, members, verdict, scopeFilter, now) {
     for (const idx of verdict.absorbedIndices) {
         const absorbed = members[idx - 1];
         const prompt = buildMergePrompt(abstract, overview, content, absorbed.abstract, absorbed.overview, absorbed.content, survivor.memoryCategory || "preferences");
-        const merged = await deps.completeJson(prompt, "consolidate-merge");
+        const merged = await deps.completeJson(prompt.user, "consolidate-merge", prompt.system);
         if (merged) {
             abstract = merged.abstract;
             overview = merged.overview;
@@ -212,8 +212,7 @@ export async function runConsolidate(deps, options) {
                 content: m.content,
                 source: m.source,
             })));
-            const combinedPrompt = `${prompt.system}\n\n${prompt.user}`;
-            const raw = await deps.completeJson(combinedPrompt, "consolidate-decide");
+            const raw = await deps.completeJson(prompt.user, "consolidate-decide", prompt.system);
             const verdict = raw ? parseConsolidateVerdict(raw, members.length) : null;
             if (!verdict) {
                 skippedMalformed += 1;
