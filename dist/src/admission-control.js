@@ -342,6 +342,28 @@ Return JSON only:
 }`;
 }
 /**
+ * The admission-control LLM client talks directly to OpenRouter, so it needs
+ * the bare "<vendor>/<model>" id OpenRouter's chat-completions API expects.
+ * Model refs sourced from memoryReflection.model (or an explicit override)
+ * may instead be in the core-style "openrouter/<vendor>/<model>" form the
+ * reflection distiller's own embedded runner accepts — that runner picks a
+ * backend from the leading segment, then forwards the rest as the model id.
+ * Strip that literal "openrouter/" prefix so both forms reach this plugin's
+ * direct client correctly; a bare "<vendor>/<model>" or an "@preset/<name>"
+ * alias already work against OpenRouter unchanged, so they pass through.
+ */
+export function normalizeAdmissionModelRef(modelRef) {
+    const trimmed = modelRef.trim();
+    const idx = trimmed.indexOf("/");
+    if (idx <= 0)
+        return trimmed;
+    const provider = trimmed.slice(0, idx).trim().toLowerCase();
+    if (provider !== "openrouter")
+        return trimmed;
+    const rest = trimmed.slice(idx + 1).trim();
+    return rest || trimmed;
+}
+/**
  * Resolves which LLM model an admission call should use, in order:
  * 1. An explicit admissionControl.model override always wins, on every lane.
  * 2. When modelAffinity is "lane", the reflection lane resolves the
@@ -350,17 +372,21 @@ Return JSON only:
  *    audits. Every other lane stays on the global model.
  * 3. Default ("global", or the knob absent): every lane uses the global
  *    model — today's behavior, unchanged.
+ * Every returned model passes through normalizeAdmissionModelRef so a
+ * core-style provider-prefixed string reaches this plugin's OpenRouter-direct
+ * client in the form it requires, regardless of which of the three paths
+ * above produced it.
  */
 export function resolveAdmissionModel(params) {
     const explicit = params.admissionControl.model?.trim();
     if (explicit) {
-        return explicit;
+        return normalizeAdmissionModelRef(explicit);
     }
     if (params.admissionControl.modelAffinity === "lane" && params.lane === "reflection") {
         const reflectionModel = params.reflectionModel?.trim();
-        return reflectionModel || params.globalModel;
+        return normalizeAdmissionModelRef(reflectionModel || params.globalModel);
     }
-    return params.globalModel;
+    return normalizeAdmissionModelRef(params.globalModel);
 }
 function buildReason(details) {
     const scoreText = details.score.toFixed(3);
