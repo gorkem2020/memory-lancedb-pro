@@ -462,24 +462,20 @@ function cosineSimilarity(left: number[], right: number[]): number {
   return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 }
 
-function buildUtilityPrompt(candidate: CandidateMemory, conversationText: string): string {
+/** Where the excerpt shown to the admission judge came from. */
+export type AdmissionSourceKind = "conversation" | "reflection";
+
+function buildUtilityPrompt(
+  candidate: CandidateMemory,
+  conversationText: string,
+  sourceKind: AdmissionSourceKind = "conversation",
+): { system: string; user: string } {
   const excerpt =
     conversationText.length > 3000
       ? conversationText.slice(-3000)
       : conversationText;
 
-  return `Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
-
-Conversation excerpt:
-${excerpt}
-
-Candidate memory:
-- Category: ${candidate.category}
-- Abstract: ${candidate.abstract}
-- Overview: ${candidate.overview}
-- Content: ${candidate.content}
-- Grounding: ${candidate.grounding ?? "unknown (legacy payload, treat as real)"}
-- Conversation register: ${candidate.conversationRegister ?? "unknown (legacy payload)"}
+  const system = `You are an admission judge. Evaluate whether a candidate memory is worth keeping for future cross-session interactions.
 
 Score future usefulness on a 0.0-1.0 scale.
 
@@ -496,6 +492,24 @@ Return JSON only:
   "utility": 0.0,
   "reason": "short explanation"
 }`;
+
+  const excerptHeading =
+    sourceKind === "reflection"
+      ? "Source document (agent reflection):"
+      : "Conversation excerpt:";
+
+  const user = `${excerptHeading}
+${excerpt}
+
+Candidate memory:
+- Category: ${candidate.category}
+- Abstract: ${candidate.abstract}
+- Overview: ${candidate.overview}
+- Content: ${candidate.content}
+- Grounding: ${candidate.grounding ?? "unknown (legacy payload, treat as real)"}
+- Conversation register: ${candidate.conversationRegister ?? "unknown (legacy payload)"}`;
+
+  return { system, user };
 }
 
 function buildReason(details: {
@@ -635,6 +649,7 @@ async function scoreUtility(
   mode: AdmissionControlConfig["utilityMode"],
   candidate: CandidateMemory,
   conversationText: string,
+  sourceKind: AdmissionSourceKind = "conversation",
 ): Promise<{ score: number; reason?: string }> {
   if (mode === "off") {
     return { score: 0.5, reason: "Utility scoring disabled" };
@@ -642,9 +657,11 @@ async function scoreUtility(
 
   let response: { utility?: number; reason?: string } | null = null;
   try {
+    const { system, user } = buildUtilityPrompt(candidate, conversationText, sourceKind);
     response = await llm.completeJson<{ utility?: number; reason?: string }>(
-      buildUtilityPrompt(candidate, conversationText),
+      user,
       "admission-utility",
+      system,
     );
   } catch {
     return { score: 0.5, reason: "Utility scoring failed" };
@@ -738,6 +755,8 @@ export class AdmissionController {
     conversationText: string;
     scopeFilter: string[];
     now?: number;
+    /** Honest framing for the excerpt shown to the admission judge. Defaults to "conversation". */
+    sourceKind?: AdmissionSourceKind;
   }): Promise<AdmissionEvaluation> {
     const now = params.now ?? Date.now();
 
@@ -762,6 +781,7 @@ export class AdmissionController {
       this.config.utilityMode,
       params.candidate,
       params.conversationText,
+      params.sourceKind ?? "conversation",
     );
     const confidence = scoreConfidenceSupport(params.candidate, params.conversationText);
     const novelty = scoreNoveltyFromMatches(params.candidateVector, relevantMatches);
