@@ -281,11 +281,11 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
     const prompt = buildExtractionPrompt("some conversation", "test-user");
 
-    assert.match(prompt, /grounding/i);
-    assert.match(prompt, /"real"\s*\|\s*"constructed"|real.*constructed/i);
-    assert.match(prompt, /about-the-fiction is real/i, "the v3 about/within one-line rule must be present");
-    assert.match(prompt, /within-the-fiction/i, "the within-the-fiction definition of constructed must be present");
-    assert.doesNotMatch(prompt, /at most one/i, "the per-extraction constructed cap must be fully removed from the prompt");
+    assert.match(prompt.system, /grounding/i);
+    assert.match(prompt.system, /"real"\s*\|\s*"constructed"|real.*constructed/i);
+    assert.match(prompt.system, /about-the-fiction is real/i, "the v3 about/within one-line rule must be present");
+    assert.match(prompt.system, /within-the-fiction/i, "the within-the-fiction definition of constructed must be present");
+    assert.doesNotMatch(prompt.system, /at most one/i, "the per-extraction constructed cap must be fully removed from the prompt");
   });
 });
 
@@ -480,10 +480,10 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
     const prompt = buildExtractionPrompt("some conversation", "test-user");
 
-    assert.match(prompt, /conversation_register/);
-    assert.match(prompt, /"real\|mixed\|fiction"/);
-    assert.match(prompt, /self-consistency/i, "the batch self-consistency instruction must be present");
-    assert.doesNotMatch(prompt, /storage rule applied after tagging/i, "the deleted per-extraction cap language must not remain in the prompt");
+    assert.match(prompt.system, /conversation_register/);
+    assert.match(prompt.system, /"real\|mixed\|fiction"/);
+    assert.match(prompt.system, /self-consistency/i, "the batch self-consistency instruction must be present");
+    assert.doesNotMatch(prompt.system, /storage rule applied after tagging/i, "the deleted per-extraction cap language must not remain in the prompt");
   });
 });
 
@@ -577,9 +577,9 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
   it("buildUtilityPrompt interpolates grounding and names all six registers (structural check)", async () => {
     const llm = {
       prompts: [],
-      async completeJson(prompt, mode) {
+      async completeJson(userPrompt, mode, systemPrompt) {
         if (mode === "admission-utility") {
-          this.prompts.push(prompt);
+          this.prompts.push({ userPrompt, systemPrompt });
           return { utility: 0.5, reason: "mock" };
         }
         return null;
@@ -602,12 +602,12 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
     });
 
     assert.equal(llm.prompts.length, 1);
-    const prompt = llm.prompts[0];
-    assert.match(prompt, /Grounding: real/);
-    assert.match(prompt, /Conversation register: fiction/);
+    const { userPrompt, systemPrompt } = llm.prompts[0];
+    assert.match(userPrompt, /Grounding: real/);
+    assert.match(userPrompt, /Conversation register: fiction/);
     for (const register of ["profile", "preferences", "entities", "events", "cases", "patterns"]) {
-      assert.match(prompt, new RegExp(register), `utility prompt must name the ${register} register`);
+      assert.match(systemPrompt, new RegExp(register), `utility prompt must name the ${register} register`);
     }
-    assert.match(prompt, /roleplay/i, "utility prompt must carry the fiction guidance");
+    assert.match(systemPrompt, /roleplay/i, "utility prompt must carry the fiction guidance");
   });
 });
