@@ -1866,6 +1866,7 @@ function _initPluginState(api) {
     const autoCaptureSeenTextCount = new Map();
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
+    const autoCaptureRecentAssistantTexts = new Map();
     const logReg = isCliMode() ? api.logger.debug : api.logger.info;
     logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered [singleton init] `
         + `(db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`);
@@ -1896,6 +1897,7 @@ function _initPluginState(api) {
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
         autoCaptureRecentTexts,
+        autoCaptureRecentAssistantTexts,
     };
 }
 export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
@@ -2003,7 +2005,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentAssistantTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2821,21 +2823,26 @@ const memoryLanceDBProPlugin = {
                             ? config.scopes?.default ?? "global"
                             : scopeManager.getDefaultScope(agentId);
                         const sessionKey = ctx?.sessionKey || event.sessionKey || "unknown";
-                        api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`);
+                        api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${JSON.stringify(config.captureAssistant)}, ${summarizeAgentEndMessages(event.messages)})`);
                         // Extract text content from messages
                         const eligibleTexts = [];
+                        const assistantContextTexts = [];
                         let skippedAutoCaptureTexts = 0;
+                        const captureAssistantValue = config.captureAssistant;
+                        const captureAssistantEligible = captureAssistantValue === true;
+                        const captureAssistantAsContext = captureAssistantValue === "context";
                         for (const msg of event.messages) {
                             if (!msg || typeof msg !== "object") {
                                 continue;
                             }
                             const msgObj = msg;
                             const role = msgObj.role;
-                            const captureAssistant = config.captureAssistant === true;
-                            if (role !== "user" &&
-                                !(captureAssistant && role === "assistant")) {
+                            const isEligibleRole = role === "user" || (captureAssistantEligible && role === "assistant");
+                            const isContextOnlyRole = captureAssistantAsContext && role === "assistant";
+                            if (!isEligibleRole && !isContextOnlyRole) {
                                 continue;
                             }
+                            const targetTexts = isEligibleRole ? eligibleTexts : assistantContextTexts;
                             const content = msgObj.content;
                             if (typeof content === "string") {
                                 const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
@@ -2843,7 +2850,7 @@ const memoryLanceDBProPlugin = {
                                     skippedAutoCaptureTexts++;
                                 }
                                 else {
-                                    eligibleTexts.push(normalized);
+                                    targetTexts.push(normalized);
                                 }
                                 continue;
                             }
@@ -2861,7 +2868,7 @@ const memoryLanceDBProPlugin = {
                                             skippedAutoCaptureTexts++;
                                         }
                                         else {
-                                            eligibleTexts.push(normalized);
+                                            targetTexts.push(normalized);
                                         }
                                     }
                                 }
@@ -2897,6 +2904,13 @@ const memoryLanceDBProPlugin = {
                             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        }
+                        const priorAssistantContextTexts = autoCaptureRecentAssistantTexts.get(sessionKey) || [];
+                        let assistantContextForRun = priorAssistantContextTexts;
+                        if (assistantContextTexts.length > 0) {
+                            assistantContextForRun = [...priorAssistantContextTexts, ...assistantContextTexts].slice(-6);
+                            autoCaptureRecentAssistantTexts.set(sessionKey, assistantContextForRun);
+                            pruneMapIfOver(autoCaptureRecentAssistantTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
                         const minMessages = config.extractMinMessages ?? 4;
                         if (skippedAutoCaptureTexts > 0) {
@@ -2957,7 +2971,7 @@ const memoryLanceDBProPlugin = {
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
@@ -2969,6 +2983,7 @@ const memoryLanceDBProPlugin = {
                                     api.logger.info(`memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`);
                                     // issue #417 Fix #5: reset counter after successful extraction
                                     autoCaptureSeenTextCount.set(sessionKey, 0);
+                                    autoCaptureRecentAssistantTexts.delete(sessionKey);
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
@@ -4591,7 +4606,7 @@ export function parsePluginConfig(value) {
             }
             return s;
         })(),
-        captureAssistant: cfg.captureAssistant === true,
+        captureAssistant: cfg.captureAssistant === "context" ? "context" : cfg.captureAssistant === true,
         retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null
             ? (() => {
                 const retrieval = { ...cfg.retrieval };
