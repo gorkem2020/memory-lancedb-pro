@@ -308,20 +308,11 @@ function cosineSimilarity(left, right) {
         return 0;
     return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 }
-function buildUtilityPrompt(candidate, conversationText) {
+function buildUtilityPrompt(candidate, conversationText, sourceKind = "conversation") {
     const excerpt = conversationText.length > 3000
         ? conversationText.slice(-3000)
         : conversationText;
-    return `Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
-
-Conversation excerpt:
-${excerpt}
-
-Candidate memory:
-- Category: ${candidate.category}
-- Abstract: ${candidate.abstract}
-- Overview: ${candidate.overview}
-- Content: ${candidate.content}
+    const system = `You are an admission judge. Evaluate whether a candidate memory is worth keeping for future cross-session interactions.
 
 Score future usefulness on a 0.0-1.0 scale.
 
@@ -333,6 +324,18 @@ Return JSON only:
   "utility": 0.0,
   "reason": "short explanation"
 }`;
+    const excerptHeading = sourceKind === "reflection"
+        ? "Source document (agent reflection):"
+        : "Conversation excerpt:";
+    const user = `${excerptHeading}
+${excerpt}
+
+Candidate memory:
+- Category: ${candidate.category}
+- Abstract: ${candidate.abstract}
+- Overview: ${candidate.overview}
+- Content: ${candidate.content}`;
+    return { system, user };
 }
 function buildReason(details) {
     const scoreText = details.score.toFixed(3);
@@ -407,13 +410,14 @@ export function scoreRecencyGap(now, matches, halfLifeDays) {
     const lambda = Math.LN2 / halfLifeDays;
     return clamp01(1 - Math.exp(-lambda * gapDays), 1);
 }
-async function scoreUtility(llm, mode, candidate, conversationText) {
+async function scoreUtility(llm, mode, candidate, conversationText, sourceKind = "conversation") {
     if (mode === "off") {
         return { score: 0.5, reason: "Utility scoring disabled" };
     }
     let response = null;
     try {
-        response = await llm.completeJson(buildUtilityPrompt(candidate, conversationText), "admission-utility");
+        const { system, user } = buildUtilityPrompt(candidate, conversationText, sourceKind);
+        response = await llm.completeJson(user, "admission-utility", system);
     }
     catch {
         return { score: 0.5, reason: "Utility scoring failed" };
@@ -454,7 +458,7 @@ export class AdmissionController {
     async evaluate(params) {
         const now = params.now ?? Date.now();
         const relevantMatches = await this.loadRelevantMatches(params.candidate, params.candidateVector, params.scopeFilter);
-        const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate, params.conversationText);
+        const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate, params.conversationText, params.sourceKind ?? "conversation");
         const confidence = scoreConfidenceSupport(params.candidate, params.conversationText);
         const novelty = scoreNoveltyFromMatches(params.candidateVector, relevantMatches);
         const recency = scoreRecencyGap(now, relevantMatches, this.config.recency.halfLifeDays);
