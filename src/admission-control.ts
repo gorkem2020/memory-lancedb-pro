@@ -43,6 +43,15 @@ export interface AdmissionControlConfig {
   auditMetadata: boolean;
   persistRejectedAudits: boolean;
   rejectedAuditFilePath?: string;
+  /** Absolute override: when set, every admission LLM call uses this model, regardless of lane. */
+  model?: string;
+  /**
+   * "global" (default): every admission call uses the plugin's global llm model.
+   * "lane": the reflection-mapped admission gate resolves the memoryReflection
+   * model instead, so the judge is never dumber than the author whose rows
+   * it audits; extraction and fallback admission stay on the global model.
+   */
+  modelAffinity: "global" | "lane";
 }
 
 export interface AdmissionFeatureScores {
@@ -134,6 +143,7 @@ export const ADMISSION_CONTROL_PRESETS: Record<AdmissionControlPreset, Admission
     preset: "balanced",
     enabled: false,
     utilityMode: "standalone",
+    modelAffinity: "global",
     weights: DEFAULT_WEIGHTS,
     rejectThreshold: 0.45,
     admitThreshold: 0.6,
@@ -150,6 +160,7 @@ export const ADMISSION_CONTROL_PRESETS: Record<AdmissionControlPreset, Admission
     preset: "conservative",
     enabled: false,
     utilityMode: "standalone",
+    modelAffinity: "global",
     weights: {
       utility: 0.16,
       confidence: 0.16,
@@ -179,6 +190,7 @@ export const ADMISSION_CONTROL_PRESETS: Record<AdmissionControlPreset, Admission
     preset: "high-recall",
     enabled: false,
     utilityMode: "standalone",
+    modelAffinity: "global",
     weights: {
       utility: 0.08,
       confidence: 0.1,
@@ -336,6 +348,11 @@ export function normalizeAdmissionControlConfig(raw: unknown): AdmissionControlC
       obj.rejectedAuditFilePath.trim().length > 0
         ? obj.rejectedAuditFilePath.trim()
         : undefined,
+    model:
+      typeof obj.model === "string" && obj.model.trim().length > 0
+        ? obj.model.trim()
+        : undefined,
+    modelAffinity: obj.modelAffinity === "lane" ? "lane" : "global",
   };
 }
 
@@ -485,6 +502,38 @@ Return JSON only:
   "utility": 0.0,
   "reason": "short explanation"
 }`;
+}
+
+/** Which admission call site is resolving a model. */
+export type AdmissionLane = "reflection" | "other";
+
+/**
+ * Resolves which LLM model an admission call should use, in order:
+ * 1. An explicit admissionControl.model override always wins, on every lane.
+ * 2. When modelAffinity is "lane", the reflection lane resolves the
+ *    memoryReflection model (falling back to the global model if none is
+ *    configured) — the judge is never dumber than the author whose rows it
+ *    audits. Every other lane stays on the global model.
+ * 3. Default ("global", or the knob absent): every lane uses the global
+ *    model — today's behavior, unchanged.
+ */
+export function resolveAdmissionModel(params: {
+  admissionControl: Pick<AdmissionControlConfig, "model" | "modelAffinity">;
+  lane: AdmissionLane;
+  globalModel: string;
+  reflectionModel?: string;
+}): string {
+  const explicit = params.admissionControl.model?.trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  if (params.admissionControl.modelAffinity === "lane" && params.lane === "reflection") {
+    const reflectionModel = params.reflectionModel?.trim();
+    return reflectionModel || params.globalModel;
+  }
+
+  return params.globalModel;
 }
 
 function buildReason(details: {
