@@ -358,11 +358,38 @@ export class SmartExtractor {
                 this.log(`memory-pro: smart-extractor: batch pre-embed failed, will embed individually: ${String(err)}`);
             }
         }
+        // When utilityMode is "batch", score admission utility for every
+        // non-profile candidate in this extraction up front, with one LLM call
+        // per chunk of up to 10 candidates, instead of one call per candidate
+        // inside the sequential processCandidate loop below. Profile candidates
+        // are excluded: they run their own admission check inside
+        // handleProfileMerge, unaffected by batching.
+        const precomputedAdmissions = new Map();
+        if (this.admissionController && this.config.admissionControl?.utilityMode === "batch") {
+            const batchable = processableCandidates.filter(({ candidate }) => !ALWAYS_MERGE_CATEGORIES.has(candidate.category));
+            if (batchable.length > 0) {
+                const batchItems = batchable.map(({ index, candidate }) => ({
+                    candidate,
+                    candidateVector: precomputedVectors.get(index) ?? [],
+                    conversationText,
+                    scopeFilter: scopeFilter ?? [targetScope],
+                }));
+                try {
+                    const evaluations = await this.admissionController.evaluateBatch(batchItems);
+                    batchable.forEach(({ index }, i) => {
+                        precomputedAdmissions.set(index, evaluations[i]);
+                    });
+                }
+                catch (err) {
+                    this.log(`memory-pro: smart-extractor: batch admission evaluation failed, falling back to per-candidate: ${String(err)}`);
+                }
+            }
+        }
         const createEntries = [];
         const pendingSupersedeInvalidations = [];
         for (const { index, candidate } of processableCandidates) {
             try {
-                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries, pendingSupersedeInvalidations, agentId);
+                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries, pendingSupersedeInvalidations, agentId, precomputedAdmissions.get(index));
             }
             catch (err) {
                 this.log(`memory-pro: smart-extractor: failed to process candidate [${candidate.category}]: ${String(err)}`);
@@ -686,8 +713,11 @@ export class SmartExtractor {
      * @param precomputedVector - Optional pre-embedded vector for the candidate.
      *   When provided (from batch pre-embedding), skips the per-candidate embed
      *   call to reduce API round-trips.
+     * @param precomputedAdmission - Optional pre-scored admission evaluation
+     *   (from batch utility mode). When provided, skips the per-candidate
+     *   admissionController.evaluate() call below.
      */
-    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries, pendingSupersedeInvalidations, agentId) {
+    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries, pendingSupersedeInvalidations, agentId, precomputedAdmission) {
         // Profile always merges (skip dedup — admission control still applies)
         if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
             const profileResult = await this.handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, undefined, createEntries, agentId);
@@ -711,15 +741,18 @@ export class SmartExtractor {
             stats.created++;
             return;
         }
-        // Admission control gate (before dedup)
-        const admission = this.admissionController
-            ? await this.admissionController.evaluate({
-                candidate,
-                candidateVector: vector,
-                conversationText,
-                scopeFilter: scopeFilter ?? [targetScope],
-            })
-            : undefined;
+        // Admission control gate (before dedup). Reuse the batch-mode evaluation
+        // computed up front for this candidate when available, instead of
+        // issuing another per-candidate call.
+        const admission = precomputedAdmission ??
+            (this.admissionController
+                ? await this.admissionController.evaluate({
+                    candidate,
+                    candidateVector: vector,
+                    conversationText,
+                    scopeFilter: scopeFilter ?? [targetScope],
+                })
+                : undefined);
         if (admission?.decision === "reject") {
             stats.rejected = (stats.rejected ?? 0) + 1;
             this.log(`memory-pro: smart-extractor: admission rejected [${candidate.category}] ${candidate.abstract.slice(0, 60)} — ${admission.audit.reason}`);
