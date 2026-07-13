@@ -1841,6 +1841,7 @@ function _initPluginState(api) {
                 oauthPath: llmOauthPath,
                 timeoutMs: llmTimeoutMs,
                 transport: config.llm?.transport,
+                reasoningEffort: config.llm?.reasoningEffort,
                 runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
@@ -2387,6 +2388,7 @@ const memoryLanceDBProPlugin = {
                         oauthPath: llmOauthPath,
                         timeoutMs: llmTimeoutMs,
                         transport: config.llm?.transport,
+                        reasoningEffort: config.llm?.reasoningEffort,
                         runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                         log: (msg) => api.logger.debug(msg),
                     });
