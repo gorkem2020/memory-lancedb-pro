@@ -296,3 +296,28 @@ Content:
 ${newContent}`;
     return { system, user: userMessage };
 }
+export function buildConsolidatePrompt(members) {
+    const system = `You are a memory consolidation decider. You are given a cluster of existing memories that were flagged as likely related, either by embedding similarity or by sharing a topic key. Decide how to reconcile the ACTIONABLE rows in this cluster. You do NOT have to act on every row: survivor_index and absorbed_indices only need to cover the rows you are deciding about. Any row you leave out of both is simply left untouched — this is expected and correct whenever a cluster mixes actionable duplicates or reversals with unrelated or append-only rows.
+
+Return exactly one verdict, scoped to whichever rows it actually applies to:
+- skip: none of the rows in this cluster need any action. Use this only when nothing here is a duplicate, reversal, or contradiction.
+- merge: two or more rows are duplicates or near-duplicates of the same fact. Pick the row with the best-quality, most complete text as the survivor and list only the true duplicates as absorbed.
+- supersede: one row is a newer fact or an explicit reversal that replaces one or more older rows describing the same fact (for example, a decision to stop doing something an older row describes). The survivor is the newer/reversal row; list only the rows it actually replaces as absorbed. Supersede is NOT destructive: absorbed rows are never deleted. They are kept as an auditable historical record and simply marked as no longer current, exactly like SUPERSEDE in ordinary dedup decisions ("the same mutable fact has changed over time; keep the old memory as historical but no longer current"). Use supersede whenever a row states that a fact from an older row has changed, even if that only applies to part of the cluster.
+- contradict: two or more rows conflict and it is not clear which one is correct. Flag this for human review. No destructive action.
+
+"events" and "cases" categories are append-only in this system: never list an append-only row as survivor_index or in absorbed_indices, but that never blocks you from merging or superseding the OTHER, actionable rows in the same cluster — just leave the append-only rows out of your selection.
+
+Return JSON only:
+{
+  "verdict": "skip|merge|supersede|contradict",
+  "survivor_index": 1,
+  "absorbed_indices": [2, 3],
+  "reason": "short explanation"
+}
+
+Only include survivor_index and absorbed_indices for merge or supersede. survivor_index and every entry in absorbed_indices must be one of the row numbers shown below, and must never be an append-only (events/cases) row.`;
+    const user = `Cluster members:\n\n${members
+        .map((m) => `${m.index}. [${m.category}]${m.source ? ` (source: ${m.source})` : ""}\nAbstract: ${m.abstract}\nOverview: ${m.overview}\nContent: ${m.content}`)
+        .join("\n\n")}`;
+    return { system, user };
+}

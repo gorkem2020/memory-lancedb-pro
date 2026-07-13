@@ -131,6 +131,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/admission-lane-model-affinity.test.mjs", args: ["--test"] },
 // CLI subcommand attachment structural test
   { group: "core-regression", runner: "node", file: "test/cli-subcommand-attachment.test.mjs", args: ["--test"] },
+// D2: cross-lane memory consolidation
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
