@@ -1494,6 +1494,10 @@ async function runAssistantContextModeScenario() {
 
     const sessionKey = "agent:main:discord:dm:user456";
 
+    // History-carrying flow (no message_received calls): each turn delivers
+    // the whole session so far, matching how fix/autocapture-watermark-reset
+    // and fix/autocapture-fallback-gating's deferred-turn rollback expect
+    // agent_end to behave when pendingIngressTexts is empty.
     await runAgentEndHook(
       api,
       {
@@ -1511,6 +1515,8 @@ async function runAssistantContextModeScenario() {
       {
         success: true,
         messages: [
+          { role: "user", content: "我的名字是小明" },
+          { role: "assistant", content: "很高兴认识你，小明！你喜欢什么运动？" },
           { role: "user", content: "我喜歡游泳" },
           { role: "assistant", content: "游泳是很好的运动！" },
         ],
