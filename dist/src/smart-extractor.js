@@ -191,6 +191,18 @@ const VALID_DECISIONS = new Set([
     "contradict",
     "supersede",
 ]);
+export const ASSISTANT_CONTEXT_LABEL = "Assistant (context only — do not extract from these lines)";
+/**
+ * Format assistant-authored lines as clearly marked, non-extractable context
+ * appended after the real conversation text. Returns an empty string when
+ * there is nothing to add, so callers can always concatenate the result.
+ */
+export function formatAssistantContextBlock(texts) {
+    if (!texts || texts.length === 0)
+        return "";
+    const lines = texts.map((text) => `${ASSISTANT_CONTEXT_LABEL}: ${text}`).join("\n");
+    return `\n\n## Assistant Context (for disambiguation only)\n${lines}`;
+}
 export class SmartExtractor {
     store;
     embedder;
@@ -274,7 +286,7 @@ export class SmartExtractor {
             return stats;
         }
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText, policyMode);
+        const extraction = await this.extractCandidates(conversationText, policyMode, options.assistantContextTexts);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
@@ -543,8 +555,11 @@ export class SmartExtractor {
     // --------------------------------------------------------------------------
     /**
      * Call LLM to extract candidate memories from conversation text.
+     * `assistantContextTexts`, when present, are appended as clearly marked
+     * context lines the extractor may read but must never source candidates
+     * from directly.
      */
-    async extractCandidates(conversationText, policyMode = "full") {
+    async extractCandidates(conversationText, policyMode = "full", assistantContextTexts) {
         const maxChars = this.config.extractMaxChars ?? 8000;
         const truncated = conversationText.length > maxChars
             ? conversationText.slice(-maxChars)
@@ -553,8 +568,9 @@ export class SmartExtractor {
         // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
         // These pollute extraction if treated as conversation content.
         const cleaned = stripEnvelopeMetadata(truncated);
+        const withAssistantContext = `${cleaned}${formatAssistantContextBlock(assistantContextTexts)}`;
         const user = this.config.user ?? "User";
-        const { system, user: userPrompt } = buildExtractionPrompt(cleaned, user);
+        const { system, user: userPrompt } = buildExtractionPrompt(withAssistantContext, user);
         const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");
