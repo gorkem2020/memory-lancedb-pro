@@ -1510,7 +1510,14 @@ async function runAssistantContextModeScenario() {
       api,
       {
         success: true,
+        // Full accumulated history, not a per-turn delta: this scenario has
+        // no message_received calls, and the fallback-gating rollback for
+        // below-threshold turns assumes any such session is history-carrying
+        // (it re-reads the whole history next turn) -- sending a delta here
+        // would trip that rollback and understate the cumulative count.
         messages: [
+          { role: "user", content: "我的名字是小明" },
+          { role: "assistant", content: "很高兴认识你，小明！你喜欢什么运动？" },
           { role: "user", content: "我喜歡游泳" },
           { role: "assistant", content: "游泳是很好的运动！" },
         ],

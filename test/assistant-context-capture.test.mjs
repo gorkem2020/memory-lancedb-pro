@@ -128,9 +128,9 @@ describe("SmartExtractor assistant-context marking", () => {
   });
 
   it("buildExtractionPrompt documents the assistant-context rule (structural check)", () => {
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
-    assert.match(prompt, /Assistant \(context only — do not extract from these lines\)/);
-    assert.match(prompt, /grounded in a user-authored line/i);
+    const { system } = buildExtractionPrompt("some conversation", "test-user");
+    assert.match(system, /Assistant \(context only — do not extract from these lines\)/);
+    assert.match(system, /grounded in a user-authored line/i);
   });
 });
 
