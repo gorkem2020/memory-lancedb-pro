@@ -105,6 +105,12 @@ export const CI_TEST_MANIFEST = [
   // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
   { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/reflection-mapped-rows-admission.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/register-scope-dedup.test.mjs", args: ["--test"] },
+  // D3: admission model resolution and lane affinity
+  { group: "core-regression", runner: "node", file: "test/admission-model-resolution.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-controller-standalone.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-admission-controller-injection.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-lane-model-affinity.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
