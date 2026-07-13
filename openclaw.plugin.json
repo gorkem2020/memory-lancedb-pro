@@ -1569,6 +1569,15 @@
             "type": "integer",
             "minimum": 500,
             "default": 30000
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "host"
+            ],
+            "default": "direct",
+            "description": "Completion transport for the LLM lane. direct posts straight to llm.baseURL via the bundled OpenAI-compatible client (default; works standalone and in the CLI). host routes through OpenClaw's host-managed runtime LLM catalog so provider routing, auth profiles, and app attribution apply automatically; falls back to direct with a warning when the host runtime does not expose that surface."
           }
         }
       },
