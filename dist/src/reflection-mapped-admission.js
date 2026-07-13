@@ -32,8 +32,11 @@ export function mapReflectionMappedCategoryToSmartRegister(category) {
 /**
  * Gate one mapped reflection row through admission control.
  *
- * - No controller (admission disabled or smart extraction off): passthrough,
- *   identical to the historical behavior.
+ * - No controller (admission control itself disabled): passthrough, identical
+ *   to the historical behavior. The controller is constructed independently
+ *   of smart extraction (see createAdmissionController), so it is available
+ *   here whenever admissionControl.enabled is true, regardless of whether
+ *   smart extraction is also on.
  * - Controller reject: the row is dropped; the caller logs the reason.
  * - Controller pass: the row proceeds; when `attachAudit` is set the audit
  *   record (tagged with provenance "memory-reflection-mapped") is returned
