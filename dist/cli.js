@@ -11,6 +11,7 @@ import { loadLanceDB } from "./src/store.js";
 import { parseSmartMetadata, buildSmartMetadata, stringifySmartMetadata, } from "./src/smart-metadata.js";
 import { createRetriever } from "./src/retriever.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
+import { runConsolidate } from "./src/consolidate.js";
 import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSupported, listOAuthProviders, normalizeOauthModel, normalizeOAuthProviderId, performOAuthLogin, } from "./src/llm-oauth.js";
 // ============================================================================
 // Utility Functions
@@ -1836,6 +1837,81 @@ export function registerMemoryCLI(program, context) {
         }
         catch (error) {
             console.error("repair-summaries failed:", error);
+            process.exit(1);
+        }
+    });
+    // consolidate: reconcile duplicate/contradictory rows already in the store
+    program
+        .command("consolidate")
+        .description("Reconcile duplicate or contradictory memories already in the store across write lanes (dry-run by default)")
+        .requiredOption("--scope <scope>", "Scope to consolidate")
+        .option("--category <category>", "Limit to one smart category (profile|preferences|entities|events|cases|patterns)")
+        .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
+        .option("--apply", "Apply the consolidation plan (default is a dry-run preview)", false)
+        .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
+        .action(async (options) => {
+        try {
+            if (!context.llmClient) {
+                console.error("consolidate: no LLM client configured, cannot make consolidation decisions");
+                process.exit(1);
+            }
+            if (!context.embedder) {
+                console.error("consolidate: no embedder configured, cannot re-embed merged rows");
+                process.exit(1);
+            }
+            const llmClient = context.llmClient;
+            const embedder = context.embedder;
+            let sinceMs;
+            if (options.since) {
+                const parsed = Date.parse(options.since);
+                if (Number.isNaN(parsed)) {
+                    console.error(`consolidate: invalid --since timestamp "${options.since}"`);
+                    process.exit(1);
+                }
+                sinceMs = parsed;
+            }
+            const mdMirror = context.mdMirror;
+            const result = await runConsolidate({
+                fetchRows: (scopeFilter, maxTimestamp, limit) => context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit),
+                update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
+                delete: (id, scopeFilter) => context.store.delete(id, scopeFilter),
+                embed: (text) => embedder.embedPassage(text),
+                completeJson: (prompt, label) => llmClient.completeJson(prompt, label),
+                log: (message) => console.warn(message),
+                onAudit: mdMirror
+                    ? async (audit) => {
+                        const summary = `${audit.action} survivor=${audit.survivorId.slice(0, 8)} absorbed=${audit.absorbedIds.map((id) => id.slice(0, 8)).join(",")} reason="${audit.reason}"`;
+                        await mdMirror({ text: summary, category: "consolidation", scope: audit.scope, timestamp: Date.now() }, { source: `memory-consolidate:${audit.action}` });
+                    }
+                    : undefined,
+            }, {
+                scope: options.scope,
+                category: options.category,
+                sinceMs,
+                includeReflectionSlices: options.includeReflectionSlices,
+                apply: options.apply === true,
+            });
+            console.log(`Scanned ${result.scanned} row(s), ${result.eligible} eligible for consolidation.`);
+            console.log(`Found ${result.clusters.length} cluster(s).\n`);
+            for (const cluster of result.clusters) {
+                if (cluster.malformed) {
+                    console.log(`  [skipped: malformed verdict] ${cluster.memberIds.length} rows`);
+                    for (const text of cluster.memberTexts)
+                        console.log(`    - "${text}"`);
+                    continue;
+                }
+                console.log(`  [${cluster.verdict.verdict}] ${cluster.memberIds.length} rows — ${cluster.verdict.reason}`);
+                for (const text of cluster.memberTexts)
+                    console.log(`    - "${text}"`);
+            }
+            if (!result.apply) {
+                console.log(`\nDry run complete. Re-run with --apply to execute this plan.`);
+                return;
+            }
+            console.log(`\nApplied ${result.applied.length} action(s); ${result.skippedMalformed} cluster(s) skipped due to malformed verdicts.`);
+        }
+        catch (error) {
+            console.error("consolidate failed:", error);
             process.exit(1);
         }
     });
