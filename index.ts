@@ -78,6 +78,7 @@ import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extract
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
 import { createLlmClient } from "./src/llm-client.js";
+import type { RuntimeLlmCompleteFn } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
@@ -262,6 +263,7 @@ interface PluginConfig {
     oauthProvider?: string;
     oauthPath?: string;
     timeoutMs?: number;
+    transport?: "direct" | "host";
   };
   extractMinMessages?: number;
   extractMaxChars?: number;
@@ -1186,6 +1188,18 @@ export function inferProviderFromBaseURL(baseURL: string | undefined): string | 
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Feature-detect the OpenClaw host-managed runtime LLM completion surface
+ * (api.runtime.llm.complete). Returns undefined on older hosts that do not
+ * expose it yet, so callers can fall back to the direct/oauth transport.
+ */
+export function resolveRuntimeLlmComplete(api: OpenClawPluginApi): RuntimeLlmCompleteFn | undefined {
+  const runtimeLlm = (api as unknown as { runtime?: { llm?: { complete?: unknown } } }).runtime?.llm;
+  return typeof runtimeLlm?.complete === "function"
+    ? (runtimeLlm.complete.bind(runtimeLlm) as RuntimeLlmCompleteFn)
+    : undefined;
 }
 
 function asNonEmptyString(value: unknown): string | undefined {
@@ -2495,6 +2509,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         oauthProvider: llmOauthProvider,
         oauthPath: llmOauthPath,
         timeoutMs: llmTimeoutMs,
+        transport: config.llm?.transport,
+        runtimeLlmComplete: resolveRuntimeLlmComplete(api),
         log: (msg: string) => api.logger.debug(msg),
         warnLog: (msg: string) => api.logger.warn(msg),
       });
@@ -3226,6 +3242,8 @@ const memoryLanceDBProPlugin = {
               oauthProvider: llmOauthProvider,
               oauthPath: llmOauthPath,
               timeoutMs: llmTimeoutMs,
+              transport: config.llm?.transport,
+              runtimeLlmComplete: resolveRuntimeLlmComplete(api),
               log: (msg: string) => api.logger.debug(msg),
             });
           } catch { return undefined; }
