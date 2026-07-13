@@ -58,6 +58,7 @@ export async function gateMappedReflectionEntry(params) {
             candidateVector: params.vector,
             conversationText: params.reflectionText,
             scopeFilter: params.scopeFilter,
+            sourceKind: "reflection",
         });
     }
     catch (err) {
