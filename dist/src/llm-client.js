@@ -25,6 +25,16 @@ export function normalizeDirectModelRef(modelRef) {
 }
 const DEFAULT_SYSTEM_PROMPT = "You are a memory extraction assistant. Always respond with valid JSON only.";
 /**
+ * Default reasoning effort sent on the host transport when llm.reasoningEffort
+ * is not configured. "medium" is a universally-supported effort level across
+ * the model families OpenClaw's core reasoning-effort normalization knows
+ * about, and it never disables reasoning outright the way an omitted field
+ * has been observed to (core's own "adaptive" shorthand maps to this same
+ * value). Chosen over leaving the field unset, which is what caused the
+ * incident this constant documents.
+ */
+const DEFAULT_HOST_REASONING_EFFORT = "medium";
+/**
  * Extract JSON from an LLM response that may be wrapped in markdown fences
  * or contain surrounding text.
  */
@@ -230,6 +240,7 @@ function createHostClient(config, runtimeLlmComplete, log, warnLog) {
                     model: config.model,
                     temperature: 0.1,
                     purpose: `memory-lancedb-pro:${label}`,
+                    reasoning: config.reasoningEffort?.trim() || DEFAULT_HOST_REASONING_EFFORT,
                 }), config.timeoutMs);
                 const raw = result?.text;
                 if (!raw || typeof raw !== "string") {
