@@ -53,7 +53,7 @@ import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, toLifecycleMemory, } from "./src/smart-metadata.js";
 import { computeTier1Patch, isSuppressed as isTier1Suppressed, TIER1_DEFAULT_BAD_RECALL_DECAY_MS, TIER1_DEFAULT_SUPPRESSION_DURATION_MS, } from "./src/auto-recall-tier1.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./src/workspace-boundary.js";
-import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
+import { normalizeAdmissionControlConfig, createAdmissionController, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
@@ -1820,7 +1820,8 @@ function _initPluginState(api) {
     // callback below closes over it.
     const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
-    if (config.smartExtraction !== false) {
+    let admissionController = null;
+    if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
             const llmApiKey = llmAuth === "oauth"
@@ -1852,30 +1853,42 @@ function _initPluginState(api) {
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
             });
-            const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
-            noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
-            const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
-            smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-                user: "User",
-                extractMinMessages: config.extractMinMessages ?? 4,
-                extractMaxChars: config.extractMaxChars ?? 8000,
-                defaultScope: config.scopes?.default ?? "global",
-                workspaceBoundary: config.workspaceBoundary,
-                admissionControl: config.admissionControl,
-                onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-                onPersisted: mdMirror ?? undefined,
-                log: (msg) => api.logger.info(msg),
-                debugLog: (msg) => api.logger.debug(msg),
-                noiseBank,
-            });
-            (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
-                + llmModel
-                + ", timeoutMs: "
-                + llmTimeoutMs
-                + ", noise bank: ON)");
+            // Constructed independently of SmartExtractor so admission gating is
+            // available to other write paths (e.g. reflection-mapped rows, the
+            // regex fallback) even when smart extraction itself is disabled.
+            admissionController = createAdmissionController(store, llmClient, config.admissionControl, (msg) => api.logger.debug(msg));
+            if (config.smartExtraction !== false) {
+                const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
+                noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
+                const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
+                smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+                    user: "User",
+                    extractMinMessages: config.extractMinMessages ?? 4,
+                    extractMaxChars: config.extractMaxChars ?? 8000,
+                    defaultScope: config.scopes?.default ?? "global",
+                    workspaceBoundary: config.workspaceBoundary,
+                    admissionControl: config.admissionControl,
+                    admissionController,
+                    onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+                    onPersisted: mdMirror ?? undefined,
+                    log: (msg) => api.logger.info(msg),
+                    debugLog: (msg) => api.logger.debug(msg),
+                    noiseBank,
+                });
+                (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
+                    + llmModel
+                    + ", timeoutMs: "
+                    + llmTimeoutMs
+                    + ", noise bank: ON)");
+            }
         }
         catch (err) {
-            api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            if (config.smartExtraction !== false) {
+                api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            }
+            else {
+                api.logger.warn(`memory-lancedb-pro: standalone admission control init failed, admission gating unavailable: ${String(err)}`);
+            }
         }
     }
     const extractionRateLimiter = createExtractionRateLimiter({
@@ -1907,6 +1920,7 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        admissionController,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
@@ -2027,7 +2041,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentAssistantTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentAssistantTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2261,7 +2275,7 @@ const memoryLanceDBProPlugin = {
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
         if (isFirstRegistration) {
-            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`);
+            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'}, admissionControl: ${admissionController ? 'ON' : 'OFF'})`);
             logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
         }
         // Dual-memory model warning: help users understand the two-layer architecture
