@@ -30,6 +30,36 @@ export interface ConsolidateCandidate {
   source?: string;
 }
 
+const REVERSAL_SIGNAL_PATTERN =
+  /\b(no longer|not anymore|any ?more|stopped|quit|used to|former|discontinued|doesn'?t|don'?t|isn'?t|wasn'?t)\b/i;
+
+const TOPIC_TOKEN_STOPWORDS = new Set([
+  "user", "users", "prefer", "prefers", "preferred", "preference", "preferences",
+  "favorite", "favourite", "likes", "liked", "like", "dislikes", "dislike",
+  "drinking", "drinks", "drink", "drank", "still", "always", "anymore", "any",
+  "more", "longer", "stopped", "quit", "used", "no", "not", "the", "a", "an",
+  "of", "to", "and", "with", "their", "they", "was", "is", "are", "were",
+  "has", "have", "had", "will", "would", "their", "for", "at", "in", "on",
+]);
+
+function looksLikeReversal(text: string): boolean {
+  return REVERSAL_SIGNAL_PATTERN.test(text);
+}
+
+function extractTopicTokens(text: string): Set<string> {
+  const words = text.toLowerCase().match(/[a-z0-9][a-z0-9'-]{2,}/g) || [];
+  return new Set(words.filter((w) => !TOPIC_TOKEN_STOPWORDS.has(w)));
+}
+
+function shareSignificantTopicToken(a: string, b: string): boolean {
+  const tokensA = extractTopicTokens(a);
+  const tokensB = extractTopicTokens(b);
+  for (const token of tokensA) {
+    if (tokensB.has(token)) return true;
+  }
+  return false;
+}
+
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length === 0 || b.length === 0 || a.length !== b.length) return 0;
   let dot = 0;
@@ -96,6 +126,19 @@ export function clusterConsolidateCandidates(
         linked = true;
       }
       if (!linked && candidates[i].factKey && candidates[i].factKey === candidates[j].factKey) {
+        linked = true;
+      }
+      // Reflection-mapped rows carry no stored fact_key, and a naturally
+      // phrased reversal rarely follows the "[Merge key]: text" convention
+      // that deriveFactKey needs to align across lanes, so its derived key
+      // is effectively unique. Gate a topic-word-overlap fallback to rows
+      // that look like a reversal, so it only widens linking for the exact
+      // case cosine + fact_key miss, not for arbitrary unrelated rows.
+      if (
+        !linked &&
+        (looksLikeReversal(candidates[i].abstract) || looksLikeReversal(candidates[j].abstract)) &&
+        shareSignificantTopicToken(candidates[i].abstract, candidates[j].abstract)
+      ) {
         linked = true;
       }
       if (linked) union(i, j);
