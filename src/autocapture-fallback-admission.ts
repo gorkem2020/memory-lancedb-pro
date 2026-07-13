@@ -32,9 +32,11 @@ export interface FallbackGateResult {
 /**
  * Gate one regex-fallback capture through admission control.
  *
- * - No controller (admission disabled, or smart extraction off so no
- *   controller instance exists to borrow): passthrough, identical to the
- *   historical behavior.
+ * - No controller (admission control itself disabled): passthrough, identical
+ *   to the historical behavior. The controller is constructed independently
+ *   of smart extraction (see createAdmissionController), so it is available
+ *   here whenever admissionControl.enabled is true, regardless of whether
+ *   smart extraction is also on.
  * - Controller reject: the capture is dropped; the caller logs the reason.
  * - Controller pass: the capture proceeds; when `attachAudit` is set the
  *   audit record (tagged with provenance "auto-capture-regex-fallback") is

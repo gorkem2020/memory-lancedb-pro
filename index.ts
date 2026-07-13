@@ -100,9 +100,11 @@ import {
 } from "./src/workspace-boundary.js";
 import {
   normalizeAdmissionControlConfig,
+  createAdmissionController,
   resolveRejectedAuditFilePath,
   type AdmissionControlConfig,
   type AdmissionRejectionAuditEntry,
+  type AdmissionController,
 } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
@@ -2336,6 +2338,7 @@ interface PluginSingletonState {
   scopeManager: ReturnType<typeof createScopeManager>;
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
+  admissionController: AdmissionController | null;
   mdMirror: MdMirrorWriter | null;
   extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
   // Session Maps — persist across scope refreshes instead of being recreated
@@ -2469,7 +2472,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const mdMirror = createMdMirrorWriter(api, config);
 
   let smartExtractor: SmartExtractor | null = null;
-  if (config.smartExtraction !== false) {
+  let admissionController: AdmissionController | null = null;
+  if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
     try {
       const llmAuth = config.llm?.auth || "api-key";
       const llmApiKey = llmAuth === "oauth"
@@ -2501,36 +2505,53 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         warnLog: (msg: string) => api.logger.warn(msg),
       });
 
-      const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
-      noiseBank.init(embedder).catch((err) =>
-        api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+      // Constructed independently of SmartExtractor so admission gating is
+      // available to other write paths (e.g. reflection-mapped rows, the
+      // regex fallback) even when smart extraction itself is disabled.
+      admissionController = createAdmissionController(
+        store,
+        llmClient,
+        config.admissionControl,
+        (msg: string) => api.logger.debug(msg),
       );
 
-      const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
+      if (config.smartExtraction !== false) {
+        const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
+        noiseBank.init(embedder).catch((err) =>
+          api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+        );
 
-      smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-        user: "User",
-        extractMinMessages: config.extractMinMessages ?? 4,
-        extractMaxChars: config.extractMaxChars ?? 8000,
-        defaultScope: config.scopes?.default ?? "global",
-        workspaceBoundary: config.workspaceBoundary,
-        admissionControl: config.admissionControl,
-        onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-        onPersisted: mdMirror ?? undefined,
-        log: (msg: string) => api.logger.info(msg),
-        debugLog: (msg: string) => api.logger.debug(msg),
-        noiseBank,
-      });
+        const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
 
-      (isCliMode() ? api.logger.debug : api.logger.info)(
-        "memory-lancedb-pro: smart extraction enabled (LLM model: "
-        + llmModel
-        + ", timeoutMs: "
-        + llmTimeoutMs
-        + ", noise bank: ON)",
-      );
+        smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+          user: "User",
+          extractMinMessages: config.extractMinMessages ?? 4,
+          extractMaxChars: config.extractMaxChars ?? 8000,
+          defaultScope: config.scopes?.default ?? "global",
+          workspaceBoundary: config.workspaceBoundary,
+          admissionControl: config.admissionControl,
+          admissionController,
+          onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+          onPersisted: mdMirror ?? undefined,
+          log: (msg: string) => api.logger.info(msg),
+          debugLog: (msg: string) => api.logger.debug(msg),
+          noiseBank,
+        });
+
+        (isCliMode() ? api.logger.debug : api.logger.info)(
+          "memory-lancedb-pro: smart extraction enabled (LLM model: "
+          + llmModel
+          + ", timeoutMs: "
+          + llmTimeoutMs
+          + ", noise bank: ON)",
+        );
+      }
     } catch (err) {
-      api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+      if (config.smartExtraction !== false) {
+        api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+      } else {
+        api.logger.warn(`memory-lancedb-pro: standalone admission control init failed, admission gating unavailable: ${String(err)}`);
+      }
     }
   }
 
@@ -2565,6 +2586,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     scopeManager,
     migrator,
     smartExtractor,
+    admissionController,
     mdMirror,
     extractionRateLimiter,
     reflectionErrorStateBySession,
@@ -2716,6 +2738,7 @@ const memoryLanceDBProPlugin = {
       scopeManager,
       migrator,
       smartExtractor,
+      admissionController,
       mdMirror,
       decayEngine,
       tierManager,
@@ -3023,7 +3046,7 @@ const memoryLanceDBProPlugin = {
     const logReg = isCliMode() ? api.logger.debug : api.logger.info;
     if (isFirstRegistration) {
       logReg(
-        `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
+        `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'}, admissionControl: ${admissionController ? 'ON' : 'OFF'})`
       );
       logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
     }
@@ -4124,12 +4147,13 @@ const memoryLanceDBProPlugin = {
             }
 
             // Fallback captures go through the same admission gate as
-            // extraction candidates when admission control is active;
-            // passthrough when it is disabled (or when smart extraction is
-            // off, in which case no controller instance exists to borrow).
+            // extraction candidates whenever admission control is active,
+            // independent of whether smart extraction is on (the controller
+            // is constructed from admissionControl.enabled alone); pure
+            // passthrough only when admission control itself is disabled.
             const fallbackGate = await gateRegexFallbackCapture({
-              admissionController: smartExtractor?.getAdmissionController() ?? null,
-              attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+              admissionController,
+              attachAudit: config.admissionControl.enabled && config.admissionControl.auditMetadata !== false,
               text,
               storeCategory: category,
               vector,
@@ -5054,11 +5078,12 @@ const memoryLanceDBProPlugin = {
 
             // Writer-1 admission routing: mapped rows previously bypassed
             // admission control entirely. Gate each row through the same
-            // AdmissionController as extraction candidates; passthrough when
-            // admission control (or smart extraction) is disabled.
+            // AdmissionController as extraction candidates, independent of
+            // whether smart extraction is on; passthrough only when
+            // admission control itself is disabled.
             const mappedGate = await gateMappedReflectionEntry({
-              admissionController: smartExtractor?.getAdmissionController() ?? null,
-              attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+              admissionController,
+              attachAudit: config.admissionControl.enabled && config.admissionControl.auditMetadata !== false,
               text: mapped.text,
               category: mapped.category,
               heading: mapped.heading,
