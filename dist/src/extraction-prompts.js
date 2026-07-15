@@ -299,20 +299,6 @@ Content:
 ${newContent}`;
     return { system, user: userMessage };
 }
-export const CONSOLIDATE_MERGE_SYSTEM_PROMPT = `You are a memory consolidation merge writer. Merge two versions of the same memory into a single coherent record with all three levels (abstract, overview, content).
-
-Requirements:
-- Remove duplicate information
-- Keep the most up-to-date details
-- Maintain a coherent narrative
-- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
-
-Return JSON only:
-{
-  "abstract": "Merged one-line abstract",
-  "overview": "Merged structured Markdown overview",
-  "content": "Merged full content"
-}`;
 // mapped/manual/legacy rows without a real overview/content commonly fall
 // back to the raw abstract text in all three tiers (see
 // src/smart-metadata.ts's parseSmartMetadata: l2_content falls back to raw

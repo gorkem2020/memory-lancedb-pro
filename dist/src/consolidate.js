@@ -1,6 +1,6 @@
 import { parseSmartMetadata, buildSmartMetadata, stringifySmartMetadata, appendRelation, deriveFactKey, isMemoryActiveAt, } from "./smart-metadata.js";
 import { APPEND_ONLY_CATEGORIES } from "./memory-categories.js";
-import { buildMergePrompt, buildConsolidatePrompt, CONSOLIDATE_MERGE_SYSTEM_PROMPT } from "./extraction-prompts.js";
+import { buildMergePrompt, buildConsolidatePrompt } from "./extraction-prompts.js";
 const REVERSAL_SIGNAL_PATTERN = /\b(no longer|not anymore|any ?more|stopped|quit|used to|former|discontinued|doesn'?t|don'?t|isn'?t|wasn'?t)\b/i;
 const TOPIC_TOKEN_STOPWORDS = new Set([
     "user", "users", "prefer", "prefers", "preferred", "preference", "preferences",
@@ -189,8 +189,8 @@ async function applyMergeVerdict(deps, members, verdict, scopeFilter, now) {
     const absorbedIds = [];
     for (const idx of verdict.absorbedIndices) {
         const absorbed = members[idx - 1];
-        const prompt = buildMergePrompt(abstract, overview, content, absorbed.abstract, absorbed.overview, absorbed.content, survivor.memoryCategory || "preferences");
-        const merged = await deps.completeJson(prompt, "consolidate-merge", CONSOLIDATE_MERGE_SYSTEM_PROMPT);
+        const mergePrompt = buildMergePrompt(abstract, overview, content, absorbed.abstract, absorbed.overview, absorbed.content, survivor.memoryCategory || "preferences");
+        const merged = await deps.completeJson(mergePrompt.user, "consolidate-merge", mergePrompt.system);
         if (merged) {
             abstract = merged.abstract;
             overview = merged.overview;
