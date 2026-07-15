@@ -1045,6 +1045,7 @@ export function registerMemoryCLI(program, context) {
         .option("--limit <n>", "Maximum number of results", "20")
         .option("--offset <n>", "Number of results to skip", "0")
         .option("--json", "Output as JSON")
+        .option("--include-invalidated", "Include invalidated/superseded rows (excluded by default)", false)
         .action(async (options) => {
         try {
             const limit = parseInt(options.limit) || 20;
@@ -1053,7 +1054,7 @@ export function registerMemoryCLI(program, context) {
             if (options.scope) {
                 scopeFilter = [options.scope];
             }
-            const memories = await context.store.list(scopeFilter, options.category, limit, offset);
+            const memories = await context.store.list(scopeFilter, options.category, limit, offset, { excludeInactive: !options.includeInvalidated });
             if (options.json) {
                 writeJson(memories);
             }
@@ -1267,8 +1268,11 @@ export function registerMemoryCLI(program, context) {
             if (options.scope) {
                 scopeFilter = [options.scope];
             }
-            const memories = await context.store.list(scopeFilter, options.category, 1000 // Large limit for export
-            );
+            // excludeInactive:false -- export is a backup/forensic view and must
+            // keep full-dump semantics, including invalidated/superseded rows
+            // (item 6, PR #946).
+            const memories = await context.store.list(scopeFilter, options.category, 1000, // Large limit for export
+            0, { excludeInactive: false });
             const exportData = {
                 version: "1.0",
                 exportedAt: new Date().toISOString(),
@@ -1308,11 +1312,12 @@ export function registerMemoryCLI(program, context) {
         .option("--category <category>", "Export specific category")
         .option("--limit <number>", "Maximum memories to export", "1000")
         .option("--dry-run", "Show what would be written without creating files")
+        .option("--include-invalidated", "Include invalidated/superseded rows (excluded by default)", false)
         .action(async (options) => {
         try {
             const limit = clampInt(Number(options.limit), 1, 10000);
             const scopeFilter = options.scope ? [String(options.scope)] : undefined;
-            const memories = await context.store.list(scopeFilter, options.category, limit);
+            const memories = await context.store.list(scopeFilter, options.category, limit, 0, { excludeInactive: !options.includeInvalidated });
             const vault = path.resolve(String(options.vault));
             const root = path.join(vault, "00-AI-Memory");
             let created = 0;
