@@ -388,28 +388,35 @@ Candidates:
 ${candidateBlocks}`;
     return { system, user };
 }
+/** Reason used for a batch row whose response entry is missing or malformed. */
+const MALFORMED_BATCH_ENTRY_REASON = "Malformed batch entry: no usable response for this candidate";
 /**
- * Validates a batch-utility response and maps it back to per-candidate
- * scores in input order. Returns null (triggering standalone fallback) on
- * any malformed shape: non-array results, wrong count, or a missing/invalid
- * index — this must never silently admit or reject the whole batch.
+ * Maps a batch-utility response back to per-candidate scores in input order,
+ * always returning exactly `expectedCount` entries — one per candidate,
+ * never null. A response that is missing entirely, isn't shaped as
+ * `{results: [...]}`, or omits/duplicates/misindexes a given candidate's
+ * entry degrades that ROW ONLY, defaulting it to a neutral 0.5 utility
+ * (mirroring scoreUtility's own failure default); every other row still
+ * uses its real parsed score. This keeps the batch call count exactly
+ * ceil(N/BATCH_UTILITY_MAX_SIZE) even when part of a response comes back
+ * malformed — a single bad entry must never fan back out into one
+ * standalone LLM call per candidate in the chunk.
  */
 function parseBatchUtilityResponse(response, expectedCount) {
-    if (!response || !Array.isArray(response.results))
-        return null;
-    if (response.results.length !== expectedCount)
-        return null;
+    const results = response && Array.isArray(response.results) ? response.results : [];
     const byIndex = new Map();
-    for (const entry of response.results) {
+    for (const entry of results) {
         if (!entry || typeof entry.index !== "number")
-            return null;
+            continue;
         byIndex.set(entry.index, entry);
     }
     const out = [];
     for (let i = 1; i <= expectedCount; i++) {
         const entry = byIndex.get(i);
-        if (!entry)
-            return null;
+        if (!entry) {
+            out.push({ score: 0.5, reason: MALFORMED_BATCH_ENTRY_REASON });
+            continue;
+        }
         out.push({
             score: clamp01(entry.utility, 0.5),
             reason: typeof entry.reason === "string" ? entry.reason.trim() : undefined,
@@ -601,15 +608,24 @@ export class AdmissionController {
     }
     /**
      * Evaluate a batch of candidates that share one conversation/source
-     * excerpt, scoring utility with a single LLM call per chunk of up to
-     * BATCH_UTILITY_MAX_SIZE candidates (chunking larger batches). Every other
-     * feature (confidence/novelty/recency/typePrior) and the decision/audit
-     * logic remain fully per-candidate, unchanged from evaluate().
+     * excerpt, scoring utility with exactly one LLM call per chunk of up to
+     * BATCH_UTILITY_MAX_SIZE candidates (chunking larger batches) — this call
+     * count holds regardless of caller (extraction lane today; any other lane,
+     * e.g. reflection-mapped rows, that constructs its own AdmissionController
+     * and calls evaluateBatch composes into the same guarantee with no further
+     * changes here). Every other feature (confidence/novelty/recency/
+     * typePrior) and the decision/audit logic remain fully per-candidate,
+     * unchanged from evaluate().
      *
-     * When utilityMode isn't "batch", or a chunk's batch response comes back
-     * malformed, falls back to one standalone evaluate() call per candidate in
-     * that chunk — this never fails the batch open or closed, it just costs
-     * more calls for that chunk.
+     * When utilityMode isn't "batch", falls back to one standalone evaluate()
+     * call per candidate in that chunk. When utilityMode is "batch" but the
+     * completeJson call itself throws, the same per-candidate standalone
+     * fallback applies for that chunk. A response that comes back but is
+     * partially malformed (missing/misindexed entries for specific
+     * candidates) never fans out into extra calls: parseBatchUtilityResponse
+     * degrades only the affected rows to a neutral default, so a malformed
+     * entry drops only that row's utility score, not the whole chunk's call
+     * budget.
      */
     async evaluateBatch(items) {
         if (items.length === 0)
@@ -639,28 +655,29 @@ export class AdmissionController {
         }
         return out;
     }
+    /**
+     * Scores utility for one chunk with a single LLM call. Only a call-level
+     * failure (the completeJson call itself throwing, e.g. a network error)
+     * falls back to one standalone evaluate() per candidate — a genuinely
+     * empty response for the whole chunk. A response that comes back but is
+     * partially malformed (missing/misindexed entries) never triggers that
+     * fallback: parseBatchUtilityResponse degrades only the affected rows, so
+     * the call count for this chunk is always exactly one either way.
+     */
     async scoreUtilityBatch(candidates, conversationText) {
-        const fallbackToStandalone = async () => {
-            const out = [];
-            for (const candidate of candidates) {
-                out.push(await scoreUtility(this.llm, "standalone", candidate, conversationText));
-            }
-            return out;
-        };
         const { system, user } = buildBatchUtilityPrompt(candidates, conversationText);
         let response = null;
         try {
             response = await this.llm.completeJson(`${system}\n\n${user}`, "admission-utility-batch");
         }
         catch {
-            this.debugLog("memory-lancedb-pro: admission-control: batch utility scoring failed, falling back to standalone");
-            return fallbackToStandalone();
+            this.debugLog("memory-lancedb-pro: admission-control: batch utility call failed, falling back to standalone");
+            const out = [];
+            for (const candidate of candidates) {
+                out.push(await scoreUtility(this.llm, "standalone", candidate, conversationText));
+            }
+            return out;
         }
-        const parsed = parseBatchUtilityResponse(response, candidates.length);
-        if (!parsed) {
-            this.debugLog("memory-lancedb-pro: admission-control: malformed batch utility response, falling back to standalone");
-            return fallbackToStandalone();
-        }
-        return parsed;
+        return parseBatchUtilityResponse(response, candidates.length);
     }
 }
