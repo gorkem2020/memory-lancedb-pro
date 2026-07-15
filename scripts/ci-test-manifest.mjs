@@ -114,6 +114,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/reflection-mapped-rows-admission.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-watermark-reset.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-fallback-gating.test.mjs", args: ["--test"] },
+  // Consolidation command: cross-lane dedup/supersede reconciliation for existing rows
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

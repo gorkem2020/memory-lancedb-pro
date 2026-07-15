@@ -329,3 +329,81 @@ ${newContent}`;
 
   return { system, user: userMessage };
 }
+
+export interface SplitPrompt {
+  system: string;
+  user: string;
+}
+
+export interface ConsolidateMember {
+  index: number;
+  category: string;
+  abstract: string;
+  overview: string;
+  content: string;
+  source?: string;
+  timestamp?: number;
+  validFrom?: number;
+}
+
+// mapped/manual/legacy rows without a real overview/content commonly fall
+// back to the raw abstract text in all three tiers (see
+// src/smart-metadata.ts's parseSmartMetadata: l2_content falls back to raw
+// text, l1_overview falls back to `- ${abstract}`). Printing that fact three
+// times per member wastes cluster-listing space for no signal.
+function hasThinTiers(m: ConsolidateMember): boolean {
+  const overviewIsDefault = m.overview === "" || m.overview === `- ${m.abstract}` || m.overview === m.abstract;
+  const contentIsDefault = m.content === m.abstract;
+  return overviewIsDefault && contentIsDefault;
+}
+
+function formatMemberHeader(m: ConsolidateMember): string {
+  const parts = [`${m.index}. [${m.category}]`];
+  if (m.source) parts.push(` (source: ${m.source})`);
+  if (m.timestamp !== undefined) {
+    parts.push(`, timestamp: ${new Date(m.timestamp).toISOString()}`);
+    if (m.validFrom !== undefined && m.validFrom !== m.timestamp) {
+      parts.push(`, valid_from: ${new Date(m.validFrom).toISOString()}`);
+    }
+  }
+  return parts.join("");
+}
+
+function formatMemberTiers(m: ConsolidateMember): string {
+  if (hasThinTiers(m)) {
+    return `Fact: ${m.abstract}`;
+  }
+  return `Abstract: ${m.abstract}\nOverview: ${m.overview}\nContent: ${m.content}`;
+}
+
+export function buildConsolidatePrompt(members: ConsolidateMember[]): SplitPrompt {
+  const system = `You are a memory consolidation decider. You are given a cluster of existing memories that were flagged as likely related, either by embedding similarity or by sharing a topic key. Decide how to reconcile the ACTIONABLE rows in this cluster. You do NOT have to act on every row: survivor_index and absorbed_indices only need to cover the rows you are deciding about. Any row you leave out of both is simply left untouched — this is expected and correct whenever a cluster mixes actionable duplicates or reversals with unrelated or append-only rows.
+
+Return exactly one verdict, scoped to whichever rows it actually applies to:
+- skip: none of the rows in this cluster need any action. Use this only when nothing here is a duplicate, reversal, or contradiction.
+- merge: two or more rows are duplicates or near-duplicates of the same fact. Pick the row with the best-quality, most complete text as the survivor and list only the true duplicates as absorbed.
+- supersede: one row is a newer fact or an explicit reversal that replaces one or more older rows describing the same fact (for example, a decision to stop doing something an older row describes). The survivor is the newer/reversal row; list only the rows it actually replaces as absorbed. Supersede is NOT destructive: absorbed rows are never deleted. They are kept as an auditable historical record and simply marked as no longer current, exactly like SUPERSEDE in ordinary dedup decisions ("the same mutable fact has changed over time; keep the old memory as historical but no longer current"). Use supersede whenever a row states that a fact from an older row has changed, even if that only applies to part of the cluster.
+- contradict: two or more rows conflict and it is not clear which one is correct. Flag this for human review. No destructive action.
+
+"events" and "cases" categories are append-only in this system: never list an append-only row as survivor_index or in absorbed_indices, but that never blocks you from merging or superseding the OTHER, actionable rows in the same cluster — just leave the append-only rows out of your selection.
+
+Source legend: legacy = pre-smart-format rows, manual = operator memory_store saves, auto-capture = extraction lane, reflection* = mirror lanes; manual rows are operator-authored and strong survivor candidates.
+
+Each member below also shows its timestamp (and valid_from when it differs) — use these to judge supersede recency explicitly rather than inferring it from wording alone.
+
+Return JSON only:
+{
+  "verdict": "skip|merge|supersede|contradict",
+  "survivor_index": 1,
+  "absorbed_indices": [2, 3],
+  "reason": "short explanation"
+}
+
+Only include survivor_index and absorbed_indices for merge or supersede. survivor_index and every entry in absorbed_indices must be one of the row numbers shown below, and must never be an append-only (events/cases) row.`;
+
+  const user = `Cluster members:\n\n${members
+    .map((m) => `${formatMemberHeader(m)}\n${formatMemberTiers(m)}`)
+    .join("\n\n")}`;
+
+  return { system, user };
+}
