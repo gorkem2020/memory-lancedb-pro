@@ -304,3 +304,95 @@ describe("AdmissionController.evaluateBatch", () => {
     assert.match(capturedPrompt, /--- END EXAMPLE ---/);
   });
 });
+
+// Rider 2: cost-preview parity. evaluateBatch has exactly one real
+// call-site today (SmartExtractor's extraction lane), but a reflection-lane
+// caller composing its own AdmissionController at assembly (per item 3)
+// would produce a second one. A flow-accounting audit reconstructing call
+// volume from logs needs every batch-mode INFO line — success or fallback
+// — to carry the candidate count, consistently, so counts from different
+// call-sites can be tallied the same way. Lane attribution itself is
+// already free: debugLog is a constructor-injected callback (like `llm`),
+// so each lane's own construction site can prefix it distinctly — proven
+// generically by the "keeps evaluateBatch calls isolated per controller
+// instance" test above, which covers the identical composition shape for
+// the `llm` field.
+describe("AdmissionController.evaluateBatch: cost-preview call accounting", () => {
+  it("logs a per-chunk candidate count on a successful batch call", async () => {
+    const debugLines = [];
+    const llm = {
+      async completeJson(_prompt, label) {
+        if (label === "admission-utility-batch") {
+          return {
+            results: [
+              { index: 1, utility: 0.5, reason: "r1" },
+              { index: 2, utility: 0.5, reason: "r2" },
+              { index: 3, utility: 0.5, reason: "r3" },
+            ],
+          };
+        }
+        return null;
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const controller = new AdmissionController(makeStore(), llm, config, (msg) => debugLines.push(msg));
+
+    await controller.evaluateBatch(makeBatchItems(3));
+
+    const infoLine = debugLines.find((l) => /admission-control/.test(l) && /3 candidates/.test(l));
+    assert.ok(
+      infoLine,
+      `expected a debugLog line reporting the 3-candidate batch call, got: ${JSON.stringify(debugLines)}`,
+    );
+  });
+
+  it("logs the same candidate count on the call-failure fallback path, for consistent accounting", async () => {
+    const debugLines = [];
+    const llm = {
+      async completeJson(_prompt, label) {
+        if (label === "admission-utility-batch") {
+          throw new Error("simulated network failure");
+        }
+        return { utility: 0.5, reason: "standalone" };
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const controller = new AdmissionController(makeStore(), llm, config, (msg) => debugLines.push(msg));
+
+    await controller.evaluateBatch(makeBatchItems(3));
+
+    const infoLine = debugLines.find((l) => /admission-control/.test(l) && /3 candidates/.test(l));
+    assert.ok(
+      infoLine,
+      `expected the fallback debugLog line to also report the 3-candidate count, got: ${JSON.stringify(debugLines)}`,
+    );
+  });
+
+  it("logs one line per chunk, each with that chunk's own count, not the whole batch's total", async () => {
+    const debugLines = [];
+    let batchCallCount = 0;
+    const chunkSizes = [10, 2];
+    const llm = {
+      async completeJson(_prompt, label) {
+        if (label !== "admission-utility-batch") return null;
+        const count = chunkSizes[batchCallCount];
+        batchCallCount++;
+        return {
+          results: Array.from({ length: count }, (_, i) => ({ index: i + 1, utility: 0.5, reason: "r" })),
+        };
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const controller = new AdmissionController(makeStore(), llm, config, (msg) => debugLines.push(msg));
+
+    await controller.evaluateBatch(makeBatchItems(12));
+
+    const tenLine = debugLines.find((l) => /10 candidates/.test(l));
+    const twoLine = debugLines.find((l) => /\b2 candidates/.test(l));
+    assert.ok(tenLine, `expected a per-chunk line for the 10-candidate chunk, got: ${JSON.stringify(debugLines)}`);
+    assert.ok(twoLine, `expected a per-chunk line for the 2-candidate chunk, got: ${JSON.stringify(debugLines)}`);
+  });
+});

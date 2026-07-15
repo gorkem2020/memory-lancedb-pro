@@ -972,8 +972,14 @@ export class AdmissionController {
         "admission-utility-batch",
       );
     } catch {
+      // Candidate count is included on both this line and the success line
+      // below so a flow-accounting audit reading logs can tally batch-call
+      // volume the same way regardless of outcome, and so a second
+      // evaluateBatch call-site (e.g. a future reflection-lane controller,
+      // composed at assembly per item 3) attributes cleanly through
+      // whatever debugLog prefix that lane's own construction site injects.
       this.debugLog(
-        "memory-lancedb-pro: admission-control: batch utility call failed, falling back to standalone",
+        `memory-lancedb-pro: admission-control: batch utility call failed for ${candidates.length} candidates, falling back to standalone`,
       );
       const out: Array<{ score: number; reason?: string }> = [];
       for (const candidate of candidates) {
@@ -982,6 +988,9 @@ export class AdmissionController {
       return out;
     }
 
+    this.debugLog(
+      `memory-lancedb-pro: admission-control: batch utility call scored ${candidates.length} candidates in one call`,
+    );
     return parseBatchUtilityResponse(response, candidates.length);
   }
 }
