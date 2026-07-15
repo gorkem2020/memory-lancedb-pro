@@ -311,6 +311,9 @@ function createApiKeyClient(config, log, warnLog) {
                         { role: "user", content: prompt },
                     ],
                     temperature: 0.1,
+                    ...(config.reasoningEffort?.trim()
+                        ? { reasoning: { effort: config.reasoningEffort.trim() } }
+                        : {}),
                     ...(shouldDisableReasoningForJson(config.model)
                         ? { chat_template_kwargs: { enable_thinking: false } }
                         : {}),
@@ -516,6 +519,28 @@ function createOauthClient(config, log, warnLog) {
         },
     };
 }
+/** OpenRouter's direct API base URL, used as the host->direct fallback's default when llm.baseURL is not configured. */
+const OPENROUTER_DIRECT_BASE_URL = "https://openrouter.ai/api/v1";
+/**
+ * Resolves the baseURL for a host->direct fallback client: an explicitly
+ * configured llm.baseURL passes through unchanged, otherwise the fallback
+ * defaults to OpenRouter rather than inheriting whatever baseURL happened
+ * to be on the config (which, for a host-transport setup, should not be
+ * the embedding lane's baseURL -- see the credential-hygiene fix at the
+ * createLlmClient callsite).
+ */
+export function resolveDirectFallbackBaseURL(configuredBaseURL) {
+    return configuredBaseURL?.trim() || OPENROUTER_DIRECT_BASE_URL;
+}
+// Module-level (not per-client) so the "runtime surface unavailable"
+// warning is emitted once per process even though createLlmClient is
+// called once per lane (extraction, admission, CLI) and each call would
+// otherwise re-detect and re-warn about the same missing host surface.
+let hostTransportFallbackWarned = false;
+/** Test-only: resets the process-level fallback-warn dedupe flag. */
+export function resetHostTransportFallbackWarnForTests() {
+    hostTransportFallbackWarned = false;
+}
 export function createLlmClient(config) {
     const log = config.log ?? (() => { });
     const warnLog = config.warnLog;
@@ -523,13 +548,24 @@ export function createLlmClient(config) {
         if (typeof config.runtimeLlmComplete === "function") {
             return createHostClient(config, config.runtimeLlmComplete, log, warnLog);
         }
-        (warnLog ?? log)("memory-lancedb-pro: llm-client transport \"host\" is configured but the OpenClaw runtime.llm.complete surface is unavailable on this host; falling back to the direct transport");
+        if (!hostTransportFallbackWarned) {
+            hostTransportFallbackWarned = true;
+            (warnLog ?? log)("memory-lancedb-pro: llm-client transport \"host\" is configured but the OpenClaw runtime.llm.complete surface is unavailable on this host; falling back to the direct transport");
+        }
+        if (!config.apiKey) {
+            throw new Error("memory-lancedb-pro: llm-client transport \"host\" fell back to the direct transport, but no llm.apiKey is configured. " +
+                "The direct fallback does not inherit embedding.apiKey when transport is \"host\" -- set llm.apiKey explicitly.");
+        }
         // The configured model may be a core-style catalog reference (e.g.
         // "openrouter/anthropic/claude-...") that only the host-managed runtime
         // resolves; the direct transport needs the bare provider-stripped id.
         // Only this fallback path normalizes -- an explicitly configured direct
         // transport keeps sending whatever model string it was given, unchanged.
-        config = { ...config, model: normalizeDirectModelRef(config.model) };
+        config = {
+            ...config,
+            model: normalizeDirectModelRef(config.model),
+            baseURL: resolveDirectFallbackBaseURL(config.baseURL),
+        };
     }
     if (config.auth === "oauth") {
         return createOauthClient(config, log, warnLog);

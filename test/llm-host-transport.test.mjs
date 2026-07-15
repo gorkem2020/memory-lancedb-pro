@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import http from "node:http";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
@@ -244,6 +244,86 @@ describe("LLM host transport", () => {
     );
   });
 
+  it("sends an explicit reasoning effort on a plain direct-transport request when llm.reasoningEffort is configured", async () => {
+    let requestBody;
+    server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      requestBody = JSON.parse(body);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "{\"memories\":[]}" } }] }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "anthropic/claude-opus-4-8",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+      reasoningEffort: "high",
+    });
+
+    await llm.completeJson("hello", "direct-reasoning-probe");
+
+    assert.deepEqual(requestBody.reasoning, { effort: "high" });
+  });
+
+  it("omits the reasoning field on a direct-transport request when llm.reasoningEffort is not configured (unchanged default)", async () => {
+    let requestBody;
+    server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      requestBody = JSON.parse(body);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "{\"memories\":[]}" } }] }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "anthropic/claude-opus-4-8",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+    });
+
+    await llm.completeJson("hello", "direct-no-reasoning-probe");
+
+    assert.equal(
+      "reasoning" in requestBody,
+      false,
+      "an unconfigured reasoningEffort must not send a reasoning field, letting the provider's own default apply"
+    );
+  });
+
+  it("sends an explicit reasoning effort on the host->direct fallback path too", async () => {
+    let requestBody;
+    server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      requestBody = JSON.parse(body);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "{\"memories\":[]}" } }] }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = server.address().port;
+
+    const llm = createLlmClient({
+      transport: "host",
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "gpt-4o-mini",
+      baseURL: `http://127.0.0.1:${port}/v1`,
+      reasoningEffort: "low",
+      warnLog: () => {},
+    });
+
+    await llm.completeJson("hello", "fallback-reasoning-probe");
+
+    assert.deepEqual(requestBody.reasoning, { effort: "low" });
+  });
+
   it("returns null and records lastError on a malformed host transport response", async () => {
     const runtimeLlmComplete = async () => ({ text: "this is not json at all" });
 
@@ -296,5 +376,62 @@ describe("LLM host transport", () => {
     assert.equal(result, null);
     assert.ok(elapsed < 2000, `expected the timeout guard to bound the call, took ${elapsed}ms`);
     assert.ok(llm.getLastError()?.includes("timed out"));
+  });
+});
+
+describe("LLM host->direct fallback: warn dedupe and credential hygiene", () => {
+  beforeEach(() => {
+    const { resetHostTransportFallbackWarnForTests } = jiti("../src/llm-client.ts");
+    resetHostTransportFallbackWarnForTests();
+  });
+
+  it("warns about the host->direct fallback only once per process, even across multiple client constructions", () => {
+    const warnLogs = [];
+
+    createLlmClient({
+      transport: "host",
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "gpt-4o-mini",
+      warnLog: (msg) => warnLogs.push(msg),
+    });
+    createLlmClient({
+      transport: "host",
+      auth: "api-key",
+      apiKey: "test-api-key",
+      model: "gpt-4o-mini",
+      warnLog: (msg) => warnLogs.push(msg),
+    });
+
+    const fallbackWarnings = warnLogs.filter((msg) => msg.includes("falling back to the direct transport"));
+    assert.equal(
+      fallbackWarnings.length,
+      1,
+      `expected exactly one fallback warning across two client constructions, got: ${JSON.stringify(warnLogs)}`
+    );
+  });
+
+  it("throws a clear error naming the missing key when the fallback has no llm.apiKey configured, instead of a generic message implying embedding.apiKey would work", () => {
+    assert.throws(
+      () =>
+        createLlmClient({
+          transport: "host",
+          model: "anthropic/claude-opus-4-8",
+          warnLog: () => {},
+        }),
+      (err) => {
+        assert.match(err.message, /llm\.apiKey/);
+        assert.match(err.message, /does not inherit embedding\.apiKey|not inherit.*embedding/i);
+        return true;
+      }
+    );
+  });
+
+  it("resolveDirectFallbackBaseURL defaults to the OpenRouter API when unset, and passes an explicit baseURL through unchanged", () => {
+    const { resolveDirectFallbackBaseURL } = jiti("../src/llm-client.ts");
+    assert.equal(resolveDirectFallbackBaseURL(undefined), "https://openrouter.ai/api/v1");
+    assert.equal(resolveDirectFallbackBaseURL(""), "https://openrouter.ai/api/v1");
+    assert.equal(resolveDirectFallbackBaseURL("   "), "https://openrouter.ai/api/v1");
+    assert.equal(resolveDirectFallbackBaseURL("http://127.0.0.1:9999/v1"), "http://127.0.0.1:9999/v1");
   });
 });
