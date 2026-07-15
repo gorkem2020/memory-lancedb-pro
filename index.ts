@@ -3942,7 +3942,10 @@ const memoryLanceDBProPlugin = {
                 // successful extraction for watermark purposes -- reset the
                 // same way (issue #417 Fix #5), or the next turn re-fires on
                 // just one new message instead of waiting for a fresh window.
-                autoCaptureSeenTextCount.set(sessionKey, 0);
+                autoCaptureSeenTextCount.set(
+                  sessionKey,
+                  pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
+                );
                 return;
               }
 

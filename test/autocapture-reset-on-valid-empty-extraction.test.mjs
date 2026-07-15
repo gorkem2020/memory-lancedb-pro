@@ -263,3 +263,83 @@ describe("auto-capture watermark reset after a valid-empty extraction (ingress f
     );
   });
 });
+
+describe("auto-capture watermark reset after a valid-empty extraction (history flow)", () => {
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+
+  beforeEach(async () => {
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "autocapture-empty-history-"));
+    extractionPrompts = [];
+    embeddingServer = createEmbeddingServer();
+    llmServer = createLlmServerEmptyThenPopulated(extractionPrompts);
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+    resetRegistration();
+  });
+
+  afterEach(async () => {
+    resetRegistration();
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  it("does not re-read already-considered history after a valid-empty result (counter must record the consumed length, same as a successful extraction)", async () => {
+    const embeddingPort = embeddingServer.address().port;
+    const llmPort = llmServer.address().port;
+    const api = createMockApi(
+      path.join(workspaceDir, "db"),
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${llmPort}`,
+    );
+    memoryLanceDBProPlugin.register(api);
+    const ctx = { sessionKey: "agent:dave:main", agentId: "dave" };
+
+    const TURN_1_TEXTS = [
+      "I keep my synthetic dotfiles in a bare repository named quartz.",
+      "My preferred terminal font is a synthetic monospace called Duckspace.",
+    ];
+    const TURN_2_TEXTS = [
+      "For synthetic backups I rotate three encrypted drives weekly.",
+      "My synthetic editor theme of choice is called Marmalade Night.",
+    ];
+
+    // Turn 1: agent_end delivers the whole history so far (2 texts).
+    // cumulative=2 < minMessages(2)? No -- extractMinMessages defaults to 2
+    // in createMockApi, so cumulative=2 >= 2 fires immediately. The LLM
+    // genuinely finds nothing (valid-empty), not a failure.
+    await runAgentEndHook(
+      api,
+      { success: true, messages: TURN_1_TEXTS.map((content) => ({ role: "user", content })) },
+      ctx,
+    );
+    assert.equal(extractionPrompts.length, 1, "turn 1 must extract (valid-empty result)");
+
+    // Turn 2: agent_end again delivers the FULL history (turn 1 + turn 2
+    // texts). A successful extraction would have recorded the consumed
+    // length (2) as the slice cursor, so this turn sees only the 2 new
+    // texts. The valid-empty result must behave identically -- not reset to
+    // 0, which would re-include the already-considered turn 1 texts.
+    await runAgentEndHook(
+      api,
+      { success: true, messages: [...TURN_1_TEXTS, ...TURN_2_TEXTS].map((content) => ({ role: "user", content })) },
+      ctx,
+    );
+    assert.equal(extractionPrompts.length, 2, "turn 2 must fire on the delta");
+
+    const secondPrompt = extractionPrompts[1];
+    assert.ok(
+      secondPrompt.includes(TURN_2_TEXTS[0]) && secondPrompt.includes(TURN_2_TEXTS[1]),
+      "turn 2 extraction must see the new texts",
+    );
+    for (const alreadyConsidered of TURN_1_TEXTS) {
+      assert.ok(
+        !secondPrompt.includes(alreadyConsidered),
+        `turn 2 extraction must not re-read already-considered history: ${alreadyConsidered.slice(0, 40)}`,
+      );
+    }
+  });
+});
