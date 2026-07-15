@@ -610,9 +610,11 @@ export class SmartExtractor {
             else if (profileResult === "created") {
                 stats.created++;
             }
-            else {
+            else if (profileResult === "merged") {
                 stats.merged++;
             }
+            // "llm-failed": nothing was persisted (handleMerge already logged
+            // it) — don't count it as either a merge or a create.
             return;
         }
         // Use pre-computed vector if available (batch embed optimization),
@@ -652,8 +654,15 @@ export class SmartExtractor {
             case "merge":
                 if (dedupResult.matchId &&
                     MERGE_SUPPORTED_CATEGORIES.has(candidate.category)) {
-                    await this.handleMerge(candidate, dedupResult.matchId, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
-                    stats.merged++;
+                    const mergeOutcome = await this.handleMerge(candidate, dedupResult.matchId, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
+                    if (mergeOutcome === "merged") {
+                        stats.merged++;
+                    }
+                    else if (mergeOutcome === "created") {
+                        stats.created++;
+                    }
+                    // "llm-failed": nothing was persisted (handleMerge already logged
+                    // it) — don't count it as either a merge or a create.
                 }
                 else {
                     // Category doesn't support merge → create instead
@@ -849,8 +858,8 @@ export class SmartExtractor {
             }
         });
         if (profileMatch) {
-            await this.handleMerge(candidate, profileMatch.entry.id, targetScope, scopeFilter, undefined, admissionAudit, createEntries, agentId);
-            return "merged";
+            const mergeOutcome = await this.handleMerge(candidate, profileMatch.entry.id, targetScope, scopeFilter, undefined, admissionAudit, createEntries, agentId);
+            return mergeOutcome;
         }
         else {
             // No existing profile — create new
@@ -860,6 +869,16 @@ export class SmartExtractor {
     }
     /**
      * Merge a candidate into an existing memory using LLM.
+     */
+    /**
+     * Attempts to merge `candidate` into the existing memory at `matchId`.
+     * Returns which outcome actually happened so the caller can account for
+     * it truthfully:
+     * - "merged": store.update() persisted the merged content.
+     * - "created": the existing row couldn't be read, so the candidate was
+     *   queued as a new entry instead — a create, not a merge.
+     * - "llm-failed": the merge-memory completion came back null/unparseable;
+     *   nothing was persisted and the existing row is untouched.
      */
     async handleMerge(candidate, matchId, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries, agentId) {
         let existingAbstract = "";
@@ -879,14 +898,14 @@ export class SmartExtractor {
             this.log(`memory-pro: smart-extractor: could not read existing memory ${matchId}, storing as new`);
             const vector = await this.embedder.embed(`${candidate.abstract} ${candidate.content}`);
             createEntries?.push(this.buildStoreEntry(candidate, vector || [], "merge-fallback", targetScope));
-            return;
+            return "created";
         }
         // Call LLM to merge
         const prompt = buildMergePrompt(existingAbstract, existingOverview, existingContent, candidate.abstract, candidate.overview, candidate.content, candidate.category);
         const merged = await this.llm.completeJson(prompt, "merge-memory");
         if (!merged) {
             this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
-            return;
+            return "llm-failed";
         }
         // Re-embed the merged content
         const mergedText = `${merged.abstract} ${merged.content}`;
@@ -927,6 +946,7 @@ export class SmartExtractor {
             // Non-critical: merge succeeded, support stats update is best-effort
         }
         this.log(`memory-pro: smart-extractor: merged [${candidate.category}]${contextLabel ? ` [${contextLabel}]` : ""} into ${matchId.slice(0, 8)}`);
+        return "merged";
     }
     /**
      * Handle SUPERSEDE: preserve the old record as historical but mark it as no

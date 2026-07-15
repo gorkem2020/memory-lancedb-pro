@@ -909,9 +909,11 @@ export class SmartExtractor {
         stats.rejected = (stats.rejected ?? 0) + 1;
       } else if (profileResult === "created") {
         stats.created++;
-      } else {
+      } else if (profileResult === "merged") {
         stats.merged++;
       }
+      // "llm-failed": nothing was persisted (handleMerge already logged
+      // it) — don't count it as either a merge or a create.
       return;
     }
 
@@ -969,7 +971,7 @@ export class SmartExtractor {
           dedupResult.matchId &&
           MERGE_SUPPORTED_CATEGORIES.has(candidate.category)
         ) {
-          await this.handleMerge(
+          const mergeOutcome = await this.handleMerge(
             candidate,
             dedupResult.matchId,
             targetScope,
@@ -979,7 +981,13 @@ export class SmartExtractor {
             createEntries,
             agentId,
           );
-          stats.merged++;
+          if (mergeOutcome === "merged") {
+            stats.merged++;
+          } else if (mergeOutcome === "created") {
+            stats.created++;
+          }
+          // "llm-failed": nothing was persisted (handleMerge already logged
+          // it) — don't count it as either a merge or a create.
         } else {
           // Category doesn't support merge → create instead
           createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
@@ -1220,7 +1228,7 @@ export class SmartExtractor {
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
     agentId?: string,
-  ): Promise<"merged" | "created" | "rejected"> {
+  ): Promise<"merged" | "created" | "rejected" | "llm-failed"> {
     // Find existing profile memory by category
     const embeddingText = `${candidate.abstract} ${candidate.content}`;
     const vector = await this.embedder.embed(embeddingText);
@@ -1260,7 +1268,7 @@ export class SmartExtractor {
     });
 
     if (profileMatch) {
-      await this.handleMerge(
+      const mergeOutcome = await this.handleMerge(
         candidate,
         profileMatch.entry.id,
         targetScope,
@@ -1270,7 +1278,7 @@ export class SmartExtractor {
         createEntries,
         agentId,
       );
-      return "merged";
+      return mergeOutcome;
     } else {
       // No existing profile — create new
       createEntries?.push(this.buildStoreEntry(candidate, vector || [], sessionKey, targetScope, admissionAudit));
@@ -1281,6 +1289,16 @@ export class SmartExtractor {
   /**
    * Merge a candidate into an existing memory using LLM.
    */
+  /**
+   * Attempts to merge `candidate` into the existing memory at `matchId`.
+   * Returns which outcome actually happened so the caller can account for
+   * it truthfully:
+   * - "merged": store.update() persisted the merged content.
+   * - "created": the existing row couldn't be read, so the candidate was
+   *   queued as a new entry instead — a create, not a merge.
+   * - "llm-failed": the merge-memory completion came back null/unparseable;
+   *   nothing was persisted and the existing row is untouched.
+   */
   private async handleMerge(
     candidate: CandidateMemory,
     matchId: string,
@@ -1290,7 +1308,7 @@ export class SmartExtractor {
     admissionAudit?: AdmissionAuditRecord,
     createEntries?: StoreEntry[],
     agentId?: string,
-  ): Promise<void> {
+  ): Promise<"merged" | "created" | "llm-failed"> {
     let existingAbstract = "";
     let existingOverview = "";
     let existingContent = "";
@@ -1317,7 +1335,7 @@ export class SmartExtractor {
         "merge-fallback",
         targetScope,
       ));
-      return;
+      return "created";
     }
 
     // Call LLM to merge
@@ -1339,7 +1357,7 @@ export class SmartExtractor {
 
     if (!merged) {
       this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
-      return;
+      return "llm-failed";
     }
 
     // Re-embed the merged content
@@ -1400,6 +1418,7 @@ export class SmartExtractor {
     this.log(
       `memory-pro: smart-extractor: merged [${candidate.category}]${contextLabel ? ` [${contextLabel}]` : ""} into ${matchId.slice(0, 8)}`,
     );
+    return "merged";
   }
 
   /**
