@@ -96,6 +96,30 @@ assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthProvider"),
   "configSchema should declare llm.oauthProvider",
 );
+assert.ok(
+  manifest.configSchema.properties.llm.properties.transport.enum.includes("host"),
+  "llm.transport schema should declare the host transport option",
+);
+assert.equal(
+  manifest.configSchema.properties.llm.properties.transport.default,
+  "direct",
+  "llm.transport schema default should remain direct (host routing is opt-in)",
+);
+assert.doesNotMatch(
+  manifest.configSchema.properties.llm.properties.reasoningEffort.description,
+  /reasoning effort requested on the host transport only/i,
+  "reasoningEffort description must no longer claim it's host-only now that the direct transport also sends it"
+);
+assert.match(
+  manifest.configSchema.properties.llm.properties.reasoningEffort.description,
+  /host.*always sent.*default.*medium/i,
+  "reasoningEffort description should document the host transport always sending a default"
+);
+assert.match(
+  manifest.configSchema.properties.llm.properties.reasoningEffort.description,
+  /direct.*sent only when explicitly configured/i,
+  "reasoningEffort description should document the direct transport only sending it when configured"
+);
 
 assert.equal(
   manifest.configSchema.properties.autoRecallMinRepeated.default,
