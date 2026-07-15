@@ -34,7 +34,11 @@ function makeRow({
   invalidatedAt,
   supersededBy,
 }) {
-  const id = `row-${nextId++}`;
+  // Zero-padded so lexicographic (string) sort matches insertion order --
+  // item 3 sorts consolidate candidates by row id for determinism, and this
+  // keeps every existing fixture's insertion-order-based index assumptions
+  // (e.g. "row 4 is the reversal") valid under that sort.
+  const id = `row-${String(nextId++).padStart(6, "0")}`;
   const metadata = {
     l0_abstract: abstract,
     l1_overview: overview,
@@ -497,6 +501,122 @@ describe("memory consolidate: batch verdict parsing", () => {
   });
 });
 
+describe("memory consolidate: batch prompt rubric tightening", () => {
+  it("states explicit decision criteria for each verdict, not just a one-line description", () => {
+    const prompt = buildConsolidateBatchPrompt([
+      { clusterIndex: 1, members: [{ index: 1, category: "preferences", abstract: "a", overview: "", content: "a", source: "manual" }] },
+    ]);
+    assert.match(prompt.system, /decision criteria/i);
+  });
+
+  it("tells the decider to prefer supersede over merge when the choice is ambiguous", () => {
+    const prompt = buildConsolidateBatchPrompt([
+      { clusterIndex: 1, members: [{ index: 1, category: "preferences", abstract: "a", overview: "", content: "a", source: "manual" }] },
+    ]);
+    assert.match(prompt.system, /ambiguous/i);
+    assert.match(prompt.system, /prefer supersede/i);
+  });
+});
+
+describe("memory consolidate: deterministic verdicts", () => {
+  it("passes temperature 0 for the batched consolidate-decide call", async () => {
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ abstract: "Coffee order: oat milk latte", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
+      makeRow({ abstract: "Coffee order: oat milk latte, extra hot", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1 }),
+    ];
+    const store = makeFakeStore(rows);
+    let capturedTemperature;
+    const completeJson = async (_prompt, label, _system, temperature) => {
+      if (label === "consolidate-decide") {
+        capturedTemperature = temperature;
+        return { verdicts: [{ cluster_index: 1, verdict: "skip", reason: "no action" }] };
+      }
+      return null;
+    };
+
+    await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 1000 });
+
+    assert.equal(capturedTemperature, 0, "the consolidate-decide call must request temperature 0");
+  });
+
+  it("produces byte-identical prompt text for the same candidate set regardless of fetch order", async () => {
+    const ts = 1_700_000_000_000;
+    const rowsInOrder = [
+      makeRow({ abstract: "Coffee order: oat milk latte", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
+      makeRow({ abstract: "Coffee order: oat milk latte, extra hot", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1 }),
+      makeRow({ abstract: "Tea order: chamomile", factKey: "preferences:tea order", vector: [0, 1], timestamp: ts + 2 }),
+      makeRow({ abstract: "Tea order: chamomile, no sugar", factKey: "preferences:tea order", vector: [0, 1], timestamp: ts + 3 }),
+    ];
+    const rowsShuffled = [rowsInOrder[3], rowsInOrder[1], rowsInOrder[0], rowsInOrder[2]];
+
+    const capturedPrompts = [];
+    const completeJson = async (prompt, label) => {
+      if (label === "consolidate-decide") {
+        capturedPrompts.push(prompt);
+        return {
+          verdicts: [
+            { cluster_index: 1, verdict: "skip", reason: "n/a" },
+            { cluster_index: 2, verdict: "skip", reason: "n/a" },
+          ],
+        };
+      }
+      return null;
+    };
+
+    await runConsolidate(
+      { ...makeFakeStore(rowsInOrder), completeJson },
+      { scope: "global", apply: false, now: ts + 1000 }
+    );
+    await runConsolidate(
+      { ...makeFakeStore(rowsShuffled), completeJson },
+      { scope: "global", apply: false, now: ts + 1000 }
+    );
+
+    assert.equal(capturedPrompts.length, 2);
+    assert.equal(
+      capturedPrompts[0],
+      capturedPrompts[1],
+      "prompt text must be byte-identical regardless of the order fetchRows returns the same candidate set in"
+    );
+  });
+
+  it("acceptance: 3 consecutive dry-runs on an unchanged store produce byte-identical verdict sets", async () => {
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ abstract: "Coffee order: oat milk latte", content: "x", factKey: "preferences:coffee order", vector: [1, 0, 0], timestamp: ts }),
+      makeRow({ abstract: "Coffee order: oat milk latte, extra hot", content: "y", factKey: "preferences:coffee order", vector: [1, 0, 0], timestamp: ts + 1 }),
+      makeRow({ abstract: "Desk setup: standing desk", content: "z", factKey: "preferences:desk setup", vector: [0, 1, 0], timestamp: ts + 2 }),
+      makeRow({ abstract: "Desk setup: standing desk, oak top", content: "w", factKey: "preferences:desk setup", vector: [0, 1, 0], timestamp: ts + 3 }),
+    ];
+
+    // A deterministic stand-in for a temperature-0 LLM: a pure function of
+    // the prompt text itself, so if the prompt is byte-identical across
+    // runs (guaranteed by the sort-before-build fix) the "model" output is
+    // byte-identical too -- this isolates OUR code's contribution to
+    // determinism from real model non-determinism, which a unit test can't
+    // exercise directly.
+    const completeJson = async (prompt, label) => {
+      if (label !== "consolidate-decide") return null;
+      const clusterCount = (prompt.match(/^Cluster \d+ members:/gm) || []).length;
+      const verdicts = [];
+      for (let i = 1; i <= clusterCount; i++) {
+        verdicts.push({ cluster_index: i, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: `deterministic-${i}` });
+      }
+      return { verdicts };
+    };
+
+    const results = [];
+    for (let i = 0; i < 3; i++) {
+      const store = makeFakeStore(rows);
+      results.push(await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 100_000 }));
+    }
+
+    assert.deepEqual(results[0].clusters, results[1].clusters, "run 1 vs run 2 verdict sets must be byte-identical");
+    assert.deepEqual(results[1].clusters, results[2].clusters, "run 2 vs run 3 verdict sets must be byte-identical");
+  });
+});
+
 describe("memory consolidate: orchestration", () => {
   function buildFixtureRows() {
     const fk = "preferences:evening drink preference";
@@ -860,8 +980,8 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
       migrator: {},
       embedder: { embedPassage: async () => [1, 0] },
       llmClient: {
-        completeJson: async (prompt, label, system) => {
-          calls.push({ label, system });
+        completeJson: async (prompt, label, system, temperature) => {
+          calls.push({ label, system, temperature });
           if (label === "consolidate-decide") {
             return {
               verdicts: [
@@ -885,6 +1005,7 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
     assert.ok(decide, "expected a consolidate-decide completeJson call");
     assert.ok(decide.system, "the CLI adapter dropped the decider's system prompt");
     assert.match(decide.system, /consolidation decider/i);
+    assert.equal(decide.temperature, 0, "the CLI adapter dropped the decider's temperature override");
 
     const merge = calls.find((c) => c.label === "consolidate-merge");
     assert.ok(merge, "expected a consolidate-merge completeJson call");
