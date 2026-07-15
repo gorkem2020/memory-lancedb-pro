@@ -355,14 +355,16 @@ Score each candidate's future usefulness independently on a 0.0-1.0 scale. Score
 Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
 Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
 
+--- EXAMPLE (not your current batch) ---
 Example of absolute scoring across a mixed-quality batch:
 Candidates:
 1. Category: preferences — "User's preferred name is Alex"
 2. Category: events — "User said hello"
 3. Category: entities — "The project uses PostgreSQL as its primary datastore"
-Expected response:
+Example response:
 {"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}
 Candidate 2 scores low even though candidates 1 and 3 score high in the same batch: each item is judged on its own merit, never curved against its neighbors.
+--- END EXAMPLE ---
 
 Return JSON only, with exactly one entry per candidate, in this shape:
 {

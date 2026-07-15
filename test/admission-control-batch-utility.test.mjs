@@ -115,4 +115,34 @@ describe("AdmissionController.evaluateBatch", () => {
     assert.equal(results.length, 15);
     assert.equal(batchCallCount, 2, "expected 15 candidates to chunk into exactly 2 batch calls");
   });
+
+  it("fences the batch few-shot example so it cannot be misread as an instruction for the live batch", async () => {
+    let capturedPrompt;
+    const llm = {
+      async completeJson(prompt, label) {
+        if (label === "admission-utility-batch") {
+          capturedPrompt = prompt;
+          return {
+            results: [{ index: 1, utility: 0.5, reason: "r" }],
+          };
+        }
+        return null;
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const controller = new AdmissionController(makeStore(), llm, config);
+
+    await controller.evaluateBatch(makeBatchItems(1));
+
+    assert.ok(capturedPrompt, "expected a batch-utility call");
+    assert.doesNotMatch(
+      capturedPrompt,
+      /Expected response:/,
+      "the few-shot label must not read as an instruction the model is expected to follow literally"
+    );
+    assert.match(capturedPrompt, /Example response:/);
+    assert.match(capturedPrompt, /--- EXAMPLE \(not your current batch\) ---/);
+    assert.match(capturedPrompt, /--- END EXAMPLE ---/);
+  });
 });
