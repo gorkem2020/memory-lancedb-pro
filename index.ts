@@ -2666,6 +2666,13 @@ export function isAgentOrSessionExcluded(
 
 const _channelPluginDiagnosticWarnings = new Set<string>();
 
+export function resolveMappedRowAdmissionController(
+  reflectionLane: AdmissionController | null,
+  extractionLane: AdmissionController | null,
+): AdmissionController | null {
+  return reflectionLane ?? extractionLane;
+}
+
 function readRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -4990,7 +4997,10 @@ const memoryLanceDBProPlugin = {
             // AdmissionController as extraction candidates; passthrough when
             // admission control (or smart extraction) is disabled.
             const mappedGate = await gateMappedReflectionEntry({
-              admissionController: smartExtractor?.getAdmissionController() ?? null,
+              admissionController: resolveMappedRowAdmissionController(
+                admissionControllerReflectionLane,
+                smartExtractor?.getAdmissionController() ?? null,
+              ),
               attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
               text: mapped.text,
               category: mapped.category,

@@ -1973,6 +1973,9 @@ export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
     return false;
 }
 const _channelPluginDiagnosticWarnings = new Set();
+export function resolveMappedRowAdmissionController(reflectionLane, extractionLane) {
+    return reflectionLane ?? extractionLane;
+}
 function readRecord(value) {
     return value && typeof value === "object" && !Array.isArray(value)
         ? value
@@ -3894,7 +3897,7 @@ const memoryLanceDBProPlugin = {
                         // AdmissionController as extraction candidates; passthrough when
                         // admission control (or smart extraction) is disabled.
                         const mappedGate = await gateMappedReflectionEntry({
-                            admissionController: smartExtractor?.getAdmissionController() ?? null,
+                            admissionController: resolveMappedRowAdmissionController(admissionControllerReflectionLane, smartExtractor?.getAdmissionController() ?? null),
                             attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
                             text: mapped.text,
                             category: mapped.category,
