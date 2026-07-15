@@ -1259,6 +1259,20 @@ function pruneMapIfOver<K, V>(map: Map<K, V>, maxEntries: number): void {
   }
 }
 
+/**
+ * Prune a Set to stay within the given maximum number of entries.
+ * Deletes the oldest (earliest-inserted) values when over the limit.
+ */
+function pruneSetIfOver<T>(set: Set<T>, maxEntries: number): void {
+  if (set.size <= maxEntries) return;
+  const excess = set.size - maxEntries;
+  const iter = set.values();
+  for (let i = 0; i < excess; i++) {
+    const value = iter.next().value;
+    if (value !== undefined) set.delete(value);
+  }
+}
+
 function isExplicitRememberCommand(text: string): boolean {
   return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
 }
@@ -2344,6 +2358,7 @@ interface PluginSingletonState {
   autoCaptureSeenTextCount: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
   autoCaptureRecentTexts: Map<string, string[]>;
+  autoCapturePayloadShapeLoggedSessions: Set<string>;
 }
 
 interface DreamingSchedulerState {
@@ -2543,6 +2558,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
+  const autoCapturePayloadShapeLoggedSessions = new Set<string>();
 
   return {
     config,
@@ -2570,6 +2586,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureSeenTextCount,
     autoCapturePendingIngressTexts,
     autoCaptureRecentTexts,
+    autoCapturePayloadShapeLoggedSessions,
   };
 }
 
@@ -2722,6 +2739,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
       autoCaptureRecentTexts,
+      autoCapturePayloadShapeLoggedSessions,
     } = singleton;
 
     // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
@@ -3823,6 +3841,20 @@ const memoryLanceDBProPlugin = {
           // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
           const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newTexts.length);
           await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
+
+          // Once per session per process (not persisted, not per turn): a
+          // restart re-emits this, which is exactly when you want to
+          // re-confirm the payload shape in the new process. This single
+          // INFO line answers the delta-only-vs-history-carrying question
+          // and the gate's fire/skip decision without reconstructing them
+          // from DEBUG-only evidence across unrelated log lines.
+          if (!autoCapturePayloadShapeLoggedSessions.has(sessionKey)) {
+            autoCapturePayloadShapeLoggedSessions.add(sessionKey);
+            pruneSetIfOver(autoCapturePayloadShapeLoggedSessions, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            api.logger.info(
+              `memory-lancedb-pro: auto-capture payload shape for agent ${agentId} (sessionKey=${sessionKey}): messages=${event.messages.length}, eligible=${eligibleTexts.length}, previousSeen=${previousSeenCount}, cumulative=${cumulativeCount}, fired=${cumulativeCount >= minMessages ? "yes" : "no"}`,
+            );
+          }
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
