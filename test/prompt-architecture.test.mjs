@@ -19,14 +19,24 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import jitiFactory from "jiti";
 
-const jiti = jitiFactory(import.meta.url, { interopDefault: true });
+const testDir = dirname(fileURLToPath(import.meta.url));
+const pluginSdkStubPath = resolve(testDir, "helpers", "openclaw-plugin-sdk-stub.mjs");
+const jiti = jitiFactory(import.meta.url, {
+  interopDefault: true,
+  alias: {
+    "openclaw/plugin-sdk": pluginSdkStubPath,
+  },
+});
 const { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt } = jiti(
   "../src/extraction-prompts.ts",
 );
 const { createLlmClient } = jiti("../src/llm-client.ts");
 const { formatExistingMemoryForDedupPrompt } = jiti("../src/smart-extractor.ts");
+const { buildReflectionPrompt } = jiti("../index.ts");
 
 // ============================================================================
 // buildExtractionPrompt — system/user split
@@ -466,5 +476,57 @@ describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
       endIndex < contractIndex,
       "the fenced example must close before the live output-format contract"
     );
+  });
+});
+
+// ============================================================================
+// buildReflectionPrompt — system/user split (reflection distiller, JR-186)
+// ============================================================================
+
+describe("buildReflectionPrompt system/user split (reflection distiller)", () => {
+  it("returns a {system, user} shape", () => {
+    const result = buildReflectionPrompt("user: hello\nassistant: hi", 1000, []);
+    assert.equal(typeof result.system, "string");
+    assert.equal(typeof result.user, "string");
+  });
+
+  it("system carries the distiller identity and every heading/rule/template instruction", () => {
+    const { system } = buildReflectionPrompt("user: hello\nassistant: hi", 1000, []);
+    assert.match(system, /You are a memory reflection distiller/i);
+    assert.match(system, /## Context \(session background\)/);
+    assert.match(system, /## Derived/);
+    assert.match(system, /Hard rules:/);
+    assert.match(system, /Section rules:/);
+    assert.match(system, /Governance section rules:/);
+    assert.match(system, /OUTPUT TEMPLATE \(copy this structure exactly\):/);
+  });
+
+  it("user carries only the per-call payload (tool error signals + the conversation input), no identity or instruction duplication", () => {
+    const { user } = buildReflectionPrompt("user: hello\nassistant: hi", 1000, []);
+    assert.doesNotMatch(user, /You are a memory reflection distiller/i);
+    assert.doesNotMatch(user, /Hard rules:/);
+    assert.doesNotMatch(user, /OUTPUT TEMPLATE/);
+    assert.match(user, /Recent tool error signals:/);
+    assert.match(user, /INPUT:/);
+    assert.match(user, /user: hello\nassistant: hi/);
+  });
+
+  it("does not leak this call's tool error signals or conversation input into system", () => {
+    const { system } = buildReflectionPrompt(
+      "a very specific unique conversation marker XYZZY",
+      1000,
+      [{ toolName: "bash", summary: "unique tool failure marker QWERTY", signatureHash: "abcd1234" }],
+    );
+    assert.doesNotMatch(system, /XYZZY/);
+    assert.doesNotMatch(system, /QWERTY/);
+  });
+
+  it("joining system and user with a blank line reproduces the exact prior single-string prompt", () => {
+    const { system, user } = buildReflectionPrompt("user: hello\nassistant: hi", 1000, [
+      { toolName: "bash", summary: "flaky retry", signatureHash: "deadbeef" },
+    ]);
+    const joined = `${system}\n\n${user}`;
+    assert.match(joined, /- This run showed \.\.\.\n\nRecent tool error signals:\n1\. \[bash\] flaky retry/);
+    assert.match(joined, /INPUT:\n```\nuser: hello\nassistant: hi\n```$/);
   });
 });
