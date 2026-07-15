@@ -70,6 +70,7 @@ import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
@@ -2551,7 +2552,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const reflectionByAgentCacheGeneration = { count: 0 };
   const recallHistory = new Map<string, Map<string, number>>();
   const turnCounter = new Map<string, number>();
-  const autoCaptureSeenTextCount = new Map<string, number>();
+  const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
 
@@ -2736,6 +2737,16 @@ const memoryLanceDBProPlugin = {
       autoCapturePendingIngressTexts,
       autoCaptureRecentTexts,
     } = singleton;
+
+    // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
+    // must also go through here so the on-disk watermark never drifts from the
+    // in-memory Map -- a process restart rehydrates from exactly what was last
+    // written here (see loadAutoCaptureWatermarks at construction, above).
+    const persistAutoCaptureWatermark = async (key: string, value: number): Promise<void> => {
+      autoCaptureSeenTextCount.set(key, value);
+      pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+      await saveAutoCaptureWatermarks(resolvedDbPath, autoCaptureSeenTextCount, (message) => api.logger.debug(message));
+    };
 
     warnForDisabledChannelPlugin(
       (api as OpenClawPluginApi & { config?: unknown }).config,
@@ -3875,8 +3886,7 @@ const memoryLanceDBProPlugin = {
           }
           // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
           const cumulativeCount = previousSeenCount + newTexts.length;
-          autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
-          pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
@@ -4000,7 +4010,7 @@ const memoryLanceDBProPlugin = {
                 // turn re-read and re-extract the entire history. Record the
                 // consumed history length there instead, so the next turn
                 // only sees the delta.
-                autoCaptureSeenTextCount.set(
+                await persistAutoCaptureWatermark(
                   sessionKey,
                   pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
                 );
@@ -4025,6 +4035,19 @@ const memoryLanceDBProPlugin = {
               api.logger.debug(
                 `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
+              // For history-carrying sessions, roll the cursor back so the
+              // next turn's slice re-includes these texts in the extraction
+              // input -- otherwise a run of below-threshold turns would each
+              // tentatively advance the cursor and the eventual firing turn
+              // would only see its own last slice, silently forfeiting every
+              // earlier deferred turn's content. Ingress-fed sessions keep
+              // their accumulator advance: their per-turn text is not
+              // recoverable on the next turn by design (the ingress queue
+              // was already drained), and rolling back would keep the count
+              // below the threshold forever.
+              if (pendingIngressTexts.length === 0) {
+                await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
+              }
             }
           }
 
