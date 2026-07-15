@@ -13,10 +13,11 @@ const {
   clusterConsolidateCandidates,
   chunkCluster,
   parseConsolidateVerdict,
+  parseConsolidateBatchVerdicts,
   runConsolidate,
 } = jiti(path.join(testDir, "..", "src", "consolidate.ts"));
 
-const { buildConsolidatePrompt } = jiti(path.join(testDir, "..", "src", "extraction-prompts.ts"));
+const { buildConsolidatePrompt, buildConsolidateBatchPrompt } = jiti(path.join(testDir, "..", "src", "extraction-prompts.ts"));
 
 let nextId = 1;
 function makeRow({
@@ -382,6 +383,120 @@ describe("memory consolidate: prompt shape", () => {
   });
 });
 
+describe("memory consolidate: batch prompt shape", () => {
+  function member(index, abstract) {
+    return { index, category: "preferences", abstract, overview: "", content: abstract, source: "manual" };
+  }
+
+  it("returns a {system, user} split prompt asking for a JSON array of verdicts tagged with cluster_index", () => {
+    const prompt = buildConsolidateBatchPrompt([
+      { clusterIndex: 1, members: [member(1, "a"), member(2, "b")] },
+      { clusterIndex: 2, members: [member(1, "c"), member(2, "d")] },
+    ]);
+    assert.equal(typeof prompt.system, "string");
+    assert.equal(typeof prompt.user, "string");
+    assert.match(prompt.system, /you are a memory consolidation decider/i);
+    assert.match(prompt.system, /verdicts/i);
+    assert.match(prompt.system, /cluster_index/i);
+    for (const verb of ["skip", "merge", "supersede", "contradict"]) {
+      assert.match(prompt.system, new RegExp(verb, "i"));
+    }
+  });
+
+  it("lists every cluster in the user prompt, each with its own 1-based member numbering", () => {
+    const prompt = buildConsolidateBatchPrompt([
+      { clusterIndex: 1, members: [member(1, "first cluster row one"), member(2, "first cluster row two")] },
+      { clusterIndex: 2, members: [member(1, "second cluster row one")] },
+    ]);
+    assert.match(prompt.user, /cluster 1/i);
+    assert.match(prompt.user, /cluster 2/i);
+    assert.ok(prompt.user.includes("first cluster row one"));
+    assert.ok(prompt.user.includes("first cluster row two"));
+    assert.ok(prompt.user.includes("second cluster row one"));
+  });
+
+  it("still tells the decider that supersede is non-destructive and clusters may be decided as a subset", () => {
+    const prompt = buildConsolidateBatchPrompt([{ clusterIndex: 1, members: [member(1, "a")] }]);
+    assert.match(prompt.system, /not.{0,60}destructive/i);
+    assert.match(prompt.system, /never (be )?delet/i);
+    assert.match(prompt.system, /historical/i);
+    assert.match(prompt.system, /append-only/i);
+  });
+
+  it("still includes the source legend and per-member timestamps", () => {
+    const ts = 1_700_000_000_000;
+    const prompt = buildConsolidateBatchPrompt([
+      { clusterIndex: 1, members: [{ ...member(1, "a"), timestamp: ts }] },
+    ]);
+    assert.match(prompt.system, /legacy\s*=\s*pre-smart-format rows/i);
+    assert.ok(prompt.user.includes(`timestamp: ${new Date(ts).toISOString()}`));
+  });
+});
+
+describe("memory consolidate: batch verdict parsing", () => {
+  it("parses multiple well-formed verdicts keyed by cluster_index", () => {
+    const raw = {
+      verdicts: [
+        { cluster_index: 1, verdict: "skip", reason: "distinct" },
+        { cluster_index: 2, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" },
+      ],
+    };
+    const units = [
+      { clusterIndex: 1, memberCount: 2 },
+      { clusterIndex: 2, memberCount: 2 },
+    ];
+    const map = parseConsolidateBatchVerdicts(raw, units);
+    assert.equal(map.size, 2);
+    assert.deepEqual(map.get(1), { verdict: "skip", reason: "distinct" });
+    assert.deepEqual(map.get(2), { verdict: "merge", survivorIndex: 1, absorbedIndices: [2], reason: "dup" });
+  });
+
+  it("fails closed per-cluster: a malformed entry for one cluster does not affect other clusters' valid verdicts", () => {
+    const raw = {
+      verdicts: [
+        { cluster_index: 1, verdict: "bogus_verdict" },
+        { cluster_index: 2, verdict: "skip", reason: "fine" },
+      ],
+    };
+    const units = [
+      { clusterIndex: 1, memberCount: 2 },
+      { clusterIndex: 2, memberCount: 2 },
+    ];
+    const map = parseConsolidateBatchVerdicts(raw, units);
+    assert.equal(map.has(1), false, "malformed entry must not produce a verdict for cluster 1");
+    assert.equal(map.has(2), true, "cluster 2's valid verdict must still parse");
+    assert.equal(map.get(2).verdict, "skip");
+  });
+
+  it("ignores an entry whose cluster_index does not match any known unit", () => {
+    const raw = { verdicts: [{ cluster_index: 99, verdict: "skip", reason: "orphan" }] };
+    const units = [{ clusterIndex: 1, memberCount: 2 }];
+    const map = parseConsolidateBatchVerdicts(raw, units);
+    assert.equal(map.size, 0);
+  });
+
+  it("keeps the first entry and ignores later duplicates for the same cluster_index", () => {
+    const raw = {
+      verdicts: [
+        { cluster_index: 1, verdict: "skip", reason: "first" },
+        { cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "second" },
+      ],
+    };
+    const units = [{ clusterIndex: 1, memberCount: 2 }];
+    const map = parseConsolidateBatchVerdicts(raw, units);
+    assert.equal(map.size, 1);
+    assert.equal(map.get(1).verdict, "skip");
+    assert.equal(map.get(1).reason, "first");
+  });
+
+  it("returns an empty map when the whole response is not a {verdicts: [...]} shape", () => {
+    const units = [{ clusterIndex: 1, memberCount: 2 }];
+    assert.equal(parseConsolidateBatchVerdicts(null, units).size, 0);
+    assert.equal(parseConsolidateBatchVerdicts({ nonsense: true }, units).size, 0);
+    assert.equal(parseConsolidateBatchVerdicts({ verdicts: "not-an-array" }, units).size, 0);
+  });
+});
+
 describe("memory consolidate: orchestration", () => {
   function buildFixtureRows() {
     const fk = "preferences:evening drink preference";
@@ -398,10 +513,15 @@ describe("memory consolidate: orchestration", () => {
   it("dry-run clusters the four related rows and reports a supersede verdict, leaving the control row untouched", async () => {
     const store = makeFakeStore(buildFixtureRows());
     const completeJson = async () => ({
-      verdict: "supersede",
-      survivor_index: 4,
-      absorbed_indices: [1, 2, 3],
-      reason: "the reversal row supersedes the three duplicate rows",
+      verdicts: [
+        {
+          cluster_index: 1,
+          verdict: "supersede",
+          survivor_index: 4,
+          absorbed_indices: [1, 2, 3],
+          reason: "the reversal row supersedes the three duplicate rows",
+        },
+      ],
     });
 
     const result = await runConsolidate(
@@ -425,10 +545,15 @@ describe("memory consolidate: orchestration", () => {
     const store = makeFakeStore(fixture);
     const audits = [];
     const completeJson = async () => ({
-      verdict: "supersede",
-      survivor_index: 4,
-      absorbed_indices: [1, 2, 3],
-      reason: "the reversal row supersedes the three duplicate rows",
+      verdicts: [
+        {
+          cluster_index: 1,
+          verdict: "supersede",
+          survivor_index: 4,
+          absorbed_indices: [1, 2, 3],
+          reason: "the reversal row supersedes the three duplicate rows",
+        },
+      ],
     });
 
     const result = await runConsolidate(
@@ -459,10 +584,15 @@ describe("memory consolidate: orchestration", () => {
   it("is idempotent: a second apply run over the same store makes zero further changes", async () => {
     const store = makeFakeStore(buildFixtureRows());
     const completeJson = async () => ({
-      verdict: "supersede",
-      survivor_index: 4,
-      absorbed_indices: [1, 2, 3],
-      reason: "reversal supersedes duplicates",
+      verdicts: [
+        {
+          cluster_index: 1,
+          verdict: "supersede",
+          survivor_index: 4,
+          absorbed_indices: [1, 2, 3],
+          reason: "reversal supersedes duplicates",
+        },
+      ],
     });
 
     await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: 1_700_100_000_000 });
@@ -480,7 +610,11 @@ describe("memory consolidate: orchestration", () => {
     const store = makeFakeStore(rows);
     const completeJson = async (_prompt, label) => {
       if (label === "consolidate-decide") {
-        return { verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "same fact, second row adds detail" };
+        return {
+          verdicts: [
+            { cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "same fact, second row adds detail" },
+          ],
+        };
       }
       return { abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "User orders an oat milk latte, extra hot." };
     };
@@ -517,7 +651,9 @@ describe("memory consolidate: orchestration", () => {
       makeRow({ category: "reflection", memoryCategory: "patterns", abstract: "Reflection slice: always verify output twice", factKey: undefined, vector: [1, 0], timestamp: ts + 1 }),
     ];
     const store = makeFakeStore(rows);
-    const completeJson = async () => ({ verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" });
+    const completeJson = async () => ({
+      verdicts: [{ cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" }],
+    });
 
     const excluded = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 100 });
     assert.equal(excluded.eligible, 0, "reflection rows excluded by default");
@@ -538,10 +674,15 @@ describe("memory consolidate: orchestration", () => {
     const store = makeFakeStore(rows);
     const logs = [];
     const completeJson = async () => ({
-      verdict: "merge",
-      survivor_index: 1,
-      absorbed_indices: [2],
-      reason: "an unsafe LLM verdict that must be rejected",
+      verdicts: [
+        {
+          cluster_index: 1,
+          verdict: "merge",
+          survivor_index: 1,
+          absorbed_indices: [2],
+          reason: "an unsafe LLM verdict that must be rejected",
+        },
+      ],
     });
 
     const result = await runConsolidate(
@@ -567,10 +708,15 @@ describe("memory consolidate: orchestration", () => {
     ];
     const store = makeFakeStore(rows);
     const completeJson = async () => ({
-      verdict: "merge",
-      survivor_index: 1,
-      absorbed_indices: [3],
-      reason: "rows 1 and 3 are the same lamp preference; row 2 is an append-only decision left untouched",
+      verdicts: [
+        {
+          cluster_index: 1,
+          verdict: "merge",
+          survivor_index: 1,
+          absorbed_indices: [3],
+          reason: "rows 1 and 3 are the same lamp preference; row 2 is an append-only decision left untouched",
+        },
+      ],
     });
 
     const result = await runConsolidate(
@@ -588,6 +734,42 @@ describe("memory consolidate: orchestration", () => {
     );
   });
 
+  it("decides multiple independent clusters with exactly ONE completeJson call, not one call per cluster", async () => {
+    const ts = 1_700_000_000_000;
+    const rows = [
+      // Cluster A: coffee order duplicates
+      makeRow({ abstract: "Coffee order: oat milk latte", factKey: "preferences:coffee order", vector: [1, 0, 0, 0], timestamp: ts }),
+      makeRow({ abstract: "Coffee order: oat milk latte, extra hot", factKey: "preferences:coffee order", vector: [1, 0, 0, 0], timestamp: ts + 1 }),
+      // Cluster B: unrelated tea duplicates
+      makeRow({ abstract: "Tea order: chamomile", factKey: "preferences:tea order", vector: [0, 1, 0, 0], timestamp: ts + 2 }),
+      makeRow({ abstract: "Tea order: chamomile, no sugar", factKey: "preferences:tea order", vector: [0, 1, 0, 0], timestamp: ts + 3 }),
+      // Cluster C: unrelated desk duplicates
+      makeRow({ abstract: "Desk setup: standing desk", factKey: "preferences:desk setup", vector: [0, 0, 1, 0], timestamp: ts + 4 }),
+      makeRow({ abstract: "Desk setup: standing desk, oak top", factKey: "preferences:desk setup", vector: [0, 0, 1, 0], timestamp: ts + 5 }),
+    ];
+    const store = makeFakeStore(rows);
+    let decideCallCount = 0;
+    const completeJson = async (_prompt, label) => {
+      if (label !== "consolidate-decide") {
+        return { abstract: "merged", overview: "", content: "merged" };
+      }
+      decideCallCount += 1;
+      return {
+        verdicts: [
+          { cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "coffee dup" },
+          { cluster_index: 2, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "tea dup" },
+          { cluster_index: 3, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "desk dup" },
+        ],
+      };
+    };
+
+    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: ts + 100_000 });
+
+    assert.equal(decideCallCount, 1, "all 3 clusters must be decided in a single completeJson call");
+    assert.equal(result.clusters.length, 3, "all 3 clusters must be reported");
+    assert.equal(result.applied.length, 3, "all 3 clusters' merge verdicts must be applied");
+  });
+
   it("never touches rows outside the requested scope", async () => {
     const ts = 1_700_000_000_000;
     const rows = [
@@ -595,7 +777,9 @@ describe("memory consolidate: orchestration", () => {
       makeRow({ scope: "other-scope", abstract: "Different scope fact", factKey: "preferences:x", vector: [1, 0], timestamp: ts }),
     ];
     const store = makeFakeStore(rows);
-    const completeJson = async () => ({ verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" });
+    const completeJson = async () => ({
+      verdicts: [{ cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "dup" }],
+    });
 
     const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 100 });
     assert.equal(result.scanned, 1, "fetchRows must only see the requested scope");
@@ -679,7 +863,11 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
         completeJson: async (prompt, label, system) => {
           calls.push({ label, system });
           if (label === "consolidate-decide") {
-            return { verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "same fact, second row adds detail" };
+            return {
+              verdicts: [
+                { cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "same fact, second row adds detail" },
+              ],
+            };
           }
           return { abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "merged content" };
         },

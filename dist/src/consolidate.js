@@ -1,6 +1,6 @@
 import { parseSmartMetadata, buildSmartMetadata, stringifySmartMetadata, appendRelation, deriveFactKey, isMemoryActiveAt, } from "./smart-metadata.js";
 import { APPEND_ONLY_CATEGORIES } from "./memory-categories.js";
-import { buildMergePrompt, buildConsolidatePrompt, CONSOLIDATE_MERGE_SYSTEM_PROMPT } from "./extraction-prompts.js";
+import { buildMergePrompt, buildConsolidateBatchPrompt, CONSOLIDATE_MERGE_SYSTEM_PROMPT, } from "./extraction-prompts.js";
 const REVERSAL_SIGNAL_PATTERN = /\b(no longer|not anymore|any ?more|stopped|quit|used to|former|discontinued|doesn'?t|don'?t|isn'?t|wasn'?t)\b/i;
 const TOPIC_TOKEN_STOPWORDS = new Set([
     "user", "users", "prefer", "prefers", "preferred", "preference", "preferences",
@@ -181,6 +181,35 @@ export function parseConsolidateVerdict(raw, memberCount) {
     }
     return { verdict, reason, survivorIndex, absorbedIndices };
 }
+// Parses the batched decider's `{ verdicts: [...] }` response into a
+// clusterIndex -> verdict map. Fails closed PER CLUSTER: an entry with an
+// unrecognized/duplicate cluster_index, or a malformed verdict shape for its
+// own member count, is simply dropped rather than discarding the whole
+// batch -- callers treat a missing clusterIndex as "skip this cluster" the
+// same way a single malformed per-cluster response was already handled.
+export function parseConsolidateBatchVerdicts(raw, units) {
+    const result = new Map();
+    if (!raw || typeof raw !== "object")
+        return result;
+    const verdictsRaw = raw.verdicts;
+    if (!Array.isArray(verdictsRaw))
+        return result;
+    const memberCountByCluster = new Map(units.map((u) => [u.clusterIndex, u.memberCount]));
+    for (const entry of verdictsRaw) {
+        if (!entry || typeof entry !== "object")
+            continue;
+        const clusterIndex = Number(entry.cluster_index);
+        if (!Number.isInteger(clusterIndex) || !memberCountByCluster.has(clusterIndex))
+            continue;
+        if (result.has(clusterIndex))
+            continue;
+        const verdict = parseConsolidateVerdict(entry, memberCountByCluster.get(clusterIndex));
+        if (!verdict)
+            continue;
+        result.set(clusterIndex, verdict);
+    }
+    return result;
+}
 async function applyMergeVerdict(deps, members, verdict, scopeFilter, now) {
     const survivor = members[verdict.survivorIndex - 1];
     let abstract = survivor.abstract;
@@ -271,13 +300,23 @@ export async function runConsolidate(deps, options) {
     const clusters = [];
     const applied = [];
     let skippedMalformed = 0;
+    // Flatten every cluster (and any cluster chunked past clusterCap) into a
+    // single ordered list of decision units first, so the decider can be
+    // asked about all of them in ONE completeJson call instead of one call
+    // per cluster.
+    const units = [];
     for (const group of clusterIndexGroups) {
         const chunks = chunkCluster(group, clusterCap);
         for (const chunkIndices of chunks) {
             if (chunkIndices.length < 2)
                 continue;
-            const members = chunkIndices.map((i) => candidates[i]);
-            const prompt = buildConsolidatePrompt(members.map((m, i) => ({
+            units.push({ clusterIndex: units.length + 1, members: chunkIndices.map((i) => candidates[i]) });
+        }
+    }
+    if (units.length > 0) {
+        const batchClusters = units.map((unit) => ({
+            clusterIndex: unit.clusterIndex,
+            members: unit.members.map((m, i) => ({
                 index: i + 1,
                 category: m.memoryCategory || "preferences",
                 abstract: m.abstract,
@@ -286,9 +325,16 @@ export async function runConsolidate(deps, options) {
                 source: m.source,
                 timestamp: m.entry.timestamp,
                 validFrom: m.validFrom,
-            })));
-            const raw = await deps.completeJson(prompt.user, "consolidate-decide", prompt.system);
-            const verdict = raw ? parseConsolidateVerdict(raw, members.length) : null;
+            })),
+        }));
+        const prompt = buildConsolidateBatchPrompt(batchClusters);
+        const raw = await deps.completeJson(prompt.user, "consolidate-decide", prompt.system);
+        const verdictMap = raw
+            ? parseConsolidateBatchVerdicts(raw, units.map((u) => ({ clusterIndex: u.clusterIndex, memberCount: u.members.length })))
+            : new Map();
+        for (const unit of units) {
+            const members = unit.members;
+            const verdict = verdictMap.get(unit.clusterIndex) ?? null;
             if (!verdict) {
                 skippedMalformed += 1;
                 deps.log?.(`memory-consolidate: missing or malformed verdict for a cluster of ${members.length} rows, skipping`);
