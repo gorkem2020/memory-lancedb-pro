@@ -1164,6 +1164,7 @@ export function registerMemoryCLI(program, context) {
             }
             else {
                 console.log(`Memory Statistics:`);
+                console.log(`• Live memories: ${stats.liveCount}`);
                 console.log(`• Total memories: ${stats.totalCount}`);
                 console.log(`• Available scopes: ${scopeStats.totalScopes}`);
                 console.log(`• Retrieval mode: ${retrievalConfig.mode}`);

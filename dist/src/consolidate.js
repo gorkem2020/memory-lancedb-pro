@@ -556,11 +556,21 @@ export async function runConsolidate(deps, options) {
                 continue;
             }
             const actedUponIndices = [verdict.survivorIndex, ...verdict.absorbedIndices];
-            if (actedUponIndices.some((idx) => {
-                const category = members[idx - 1].memoryCategory;
-                return category && APPEND_ONLY_CATEGORIES.has(category);
-            })) {
-                deps.log?.(`memory-consolidate: refusing to ${verdict.verdict} an append-only row (events/cases); skipping this verdict`);
+            const actedUponCategories = actedUponIndices.map((idx) => members[idx - 1].memoryCategory);
+            const touchesAppendOnly = actedUponCategories.some((category) => category && APPEND_ONLY_CATEGORIES.has(category));
+            // Append-only means invalidation-protection, not merge-immunity: even a
+            // perfectly-categorized events/cases row can be a true duplicate of
+            // another row in the same category. Allow merge only when every
+            // acted-upon row shares the identical append-only category (a genuine
+            // same-category duplicate) -- supersede/contradict still invalidate the
+            // absorbed row's currency, so they stay blocked unconditionally, and a
+            // merge that would mix an append-only row with a non-append-only row or
+            // with a different append-only category stays blocked too.
+            const isSameCategoryAppendOnlyMerge = touchesAppendOnly &&
+                verdict.verdict === "merge" &&
+                actedUponCategories.every((category) => category === actedUponCategories[0]);
+            if (touchesAppendOnly && !isSameCategoryAppendOnlyMerge) {
+                deps.log?.(`memory-consolidate: refusing to ${verdict.verdict} an append-only row (events/cases) outside a same-category duplicate merge; skipping this verdict`);
                 clusters.push({
                     clusterIndex: unit.clusterIndex,
                     memberIds: members.map((m) => m.entry.id),
