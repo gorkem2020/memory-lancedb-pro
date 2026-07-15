@@ -1880,7 +1880,7 @@ export function registerMemoryCLI(program, context) {
                 update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
                 delete: (id, scopeFilter) => context.store.delete(id, scopeFilter),
                 embed: (text) => embedder.embedPassage(text),
-                completeJson: (prompt, label) => llmClient.completeJson(prompt, label),
+                completeJson: (prompt, label, system) => llmClient.completeJson(prompt, label, system),
                 log: (message) => console.warn(message),
                 onAudit: mdMirror
                     ? async (audit) => {

@@ -308,6 +308,78 @@ describe("memory consolidate: prompt shape", () => {
     assert.match(prompt.system, /not.{0,40}(need|have) to (act on|cover) every row|leave.{0,40}(out|untouched)/i);
     assert.match(prompt.system, /append-only/i);
   });
+
+  it("adds a one-line source legend to the decider system prompt so provenance informs survivor choice", () => {
+    const prompt = buildConsolidatePrompt([
+      { index: 1, category: "preferences", abstract: "a", overview: "", content: "a", source: "manual" },
+    ]);
+    assert.match(prompt.system, /legacy\s*=\s*pre-smart-format rows/i);
+    assert.match(prompt.system, /manual\s*=\s*operator memory_store saves/i);
+    assert.match(prompt.system, /auto-capture\s*=\s*extraction lane/i);
+    assert.match(prompt.system, /reflection\*\s*=\s*mirror lanes/i);
+    assert.match(prompt.system, /manual rows are operator-authored and strong survivor candidates/i);
+  });
+
+  it("includes each member's timestamp, and valid_from only when it differs, so supersede recency is explicit rather than inferred from text", () => {
+    const ts1 = 1_700_000_000_000;
+    const ts2 = 1_700_100_000_000;
+    const vf2 = 1_699_000_000_000;
+    const prompt = buildConsolidatePrompt([
+      { index: 1, category: "preferences", abstract: "a", overview: "", content: "a", source: "manual", timestamp: ts1, validFrom: ts1 },
+      { index: 2, category: "preferences", abstract: "b", overview: "", content: "b", source: "auto-capture", timestamp: ts2, validFrom: vf2 },
+    ]);
+    assert.ok(
+      prompt.user.includes(`timestamp: ${new Date(ts1).toISOString()}`),
+      "member 1's timestamp must appear in the listing"
+    );
+    assert.ok(
+      prompt.user.includes(`timestamp: ${new Date(ts2).toISOString()}`),
+      "member 2's timestamp must appear in the listing"
+    );
+    assert.ok(
+      prompt.user.includes(`valid_from: ${new Date(vf2).toISOString()}`),
+      "member 2's valid_from differs from its timestamp and must be shown explicitly"
+    );
+    assert.ok(
+      !prompt.user.includes(`valid_from: ${new Date(ts1).toISOString()}`),
+      "member 1's valid_from equals its timestamp and must not be printed redundantly"
+    );
+  });
+
+  it("renders identical L0/L1/L2 tiers once per member instead of repeating the same raw fallback text three times", () => {
+    // mapped/manual/legacy rows without real overview/content commonly fall
+    // back to the raw abstract text in all three tiers (see
+    // src/smart-metadata.ts's parseSmartMetadata: l2_content falls back to
+    // raw text, l1_overview falls back to `- ${abstract}`) -- printing that
+    // fact three times per member wastes cluster-listing space for no signal.
+    const thin = {
+      index: 1,
+      category: "preferences",
+      abstract: "Likes tea",
+      overview: "- Likes tea",
+      content: "Likes tea",
+      source: "legacy",
+    };
+    const rich = {
+      index: 2,
+      category: "preferences",
+      abstract: "Coffee order: oat milk latte",
+      overview: "## Preference\n- oat milk latte",
+      content: "User always orders an oat milk latte with extra foam.",
+      source: "manual",
+    };
+    const prompt = buildConsolidatePrompt([thin, rich]);
+
+    assert.ok(prompt.user.includes("Fact: Likes tea"), "thin member collapses to a single Fact: line");
+    assert.ok(!/Abstract: Likes tea/.test(prompt.user), "thin member must not repeat the abstract label");
+    assert.ok(!/Overview: - Likes tea/.test(prompt.user), "thin member must not repeat the overview label");
+
+    assert.ok(
+      prompt.user.includes("Abstract: Coffee order: oat milk latte"),
+      "rich member with genuinely distinct tiers keeps the full Abstract/Overview/Content rendering"
+    );
+    assert.ok(prompt.user.includes("User always orders an oat milk latte with extra foam."));
+  });
 });
 
 describe("memory consolidate: orchestration", () => {
@@ -557,5 +629,78 @@ describe("memory consolidate: CLI attachment", () => {
       !rootNames.includes("consolidate"),
       `"consolidate" must not be reachable as a root-level command, root has: ${rootNames.join(", ")}`
     );
+  });
+});
+
+describe("memory consolidate: CLI system-prompt wiring", () => {
+  it("forwards buildConsolidatePrompt's system prompt through the CLI's completeJson adapter for both the decide and merge calls", async () => {
+    // Root cause (live-proven): the CLI's deps adapter used to be a 2-param
+    // lambda `(prompt, label) => llmClient.completeJson(prompt, label)`, so
+    // the decider's system prompt never reached the model -- every call ran
+    // under the generic "memory extraction assistant" system message and the
+    // model returned extraction-shaped JSON instead of a verdict. This test
+    // drives the real command action (not runConsolidate directly) so it
+    // actually exercises the adapter closure in cli.ts, not just consolidate.ts.
+    const { createMemoryCLI } = jiti(path.join(testDir, "..", "cli.ts"));
+
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({
+        abstract: "Coffee order: oat milk latte",
+        content: "User orders an oat milk latte.",
+        factKey: "preferences:coffee order",
+        vector: [1, 0],
+        timestamp: ts,
+      }),
+      makeRow({
+        abstract: "Coffee order: oat milk latte, extra hot",
+        content: "User specified extra hot as well.",
+        factKey: "preferences:coffee order",
+        vector: [1, 0],
+        timestamp: ts + 1000,
+      }),
+    ];
+
+    const calls = [];
+    const context = {
+      store: {
+        fetchForCompaction: async (maxTimestamp, scopeFilter, limit) =>
+          rows
+            .filter((r) => (!scopeFilter || scopeFilter.includes(r.scope)) && r.timestamp <= maxTimestamp)
+            .slice(0, limit ?? rows.length),
+        update: async () => ({}),
+        delete: async () => true,
+      },
+      retriever: {},
+      scopeManager: {},
+      migrator: {},
+      embedder: { embedPassage: async () => [1, 0] },
+      llmClient: {
+        completeJson: async (prompt, label, system) => {
+          calls.push({ label, system });
+          if (label === "consolidate-decide") {
+            return { verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "same fact, second row adds detail" };
+          }
+          return { abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "merged content" };
+        },
+        getLastError: () => null,
+      },
+    };
+
+    const program = new Command();
+    program.exitOverride();
+    createMemoryCLI(context)({ program });
+
+    await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply"]);
+
+    const decide = calls.find((c) => c.label === "consolidate-decide");
+    assert.ok(decide, "expected a consolidate-decide completeJson call");
+    assert.ok(decide.system, "the CLI adapter dropped the decider's system prompt");
+    assert.match(decide.system, /consolidation decider/i);
+
+    const merge = calls.find((c) => c.label === "consolidate-merge");
+    assert.ok(merge, "expected a consolidate-merge completeJson call");
+    assert.ok(merge.system, "the CLI adapter dropped the merge writer's system prompt");
+    assert.match(merge.system, /merge writer/i);
   });
 });
