@@ -11,7 +11,7 @@ import { loadLanceDB } from "./src/store.js";
 import { parseSmartMetadata, buildSmartMetadata, stringifySmartMetadata, } from "./src/smart-metadata.js";
 import { createRetriever } from "./src/retriever.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
-import { runConsolidate } from "./src/consolidate.js";
+import { runConsolidate, formatConsolidateCostPreview } from "./src/consolidate.js";
 import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSupported, listOAuthProviders, normalizeOauthModel, normalizeOAuthProviderId, performOAuthLogin, } from "./src/llm-oauth.js";
 // ============================================================================
 // Utility Functions
@@ -1850,13 +1850,63 @@ export function registerMemoryCLI(program, context) {
         }
     });
     // consolidate: reconcile duplicate/contradictory rows already in the store
+    registerConsolidateCommand(memory, context);
+}
+/**
+ * Item 7: the real confirm implementation wired to a real CLI invocation.
+ * Fails closed -- non-interactive (either stream not a TTY) resolves false
+ * without ever reading anything, so a scripted/piped invocation without
+ * --yes aborts cleanly instead of hanging on stdin or silently proceeding.
+ * Streams are injectable so tests can drive both branches deterministically.
+ */
+export function createConsolidateConfirm(streams) {
+    const stdin = streams?.stdin ?? process.stdin;
+    const stdout = streams?.stdout ?? process.stdout;
+    return async (promptText) => {
+        if (!stdin.isTTY || !stdout.isTTY) {
+            return false;
+        }
+        const rl = readline.createInterface({ input: stdin, output: stdout });
+        try {
+            const answer = await new Promise((resolve) => rl.question(promptText, resolve));
+            return answer.trim() === "YES";
+        }
+        finally {
+            rl.close();
+        }
+    };
+}
+/** Item 8: renders the full plan (verdict, member ids, survivor, exact merge content) for user review before the apply prompt. */
+export function formatConsolidatePlanForDisplay(clusters) {
+    const actionable = clusters.filter((c) => c.action);
+    if (actionable.length === 0) {
+        return "No actionable clusters in this plan.";
+    }
+    const lines = [`Plan (${actionable.length} cluster(s)):`];
+    for (const cluster of actionable) {
+        lines.push(`  [${cluster.action}] cluster ${cluster.clusterIndex} — ${cluster.verdict.reason}`);
+        lines.push(`    members: ${cluster.memberIds.join(", ")}`);
+        lines.push(`    survivor: ${cluster.survivorId}`);
+        if (cluster.absorbedIds?.length) {
+            lines.push(`    absorbed: ${cluster.absorbedIds.join(", ")}`);
+        }
+        if (cluster.action === "merge" && cluster.mergedContent) {
+            lines.push(`    merged abstract: ${cluster.mergedContent.abstract}`);
+            lines.push(`    merged overview: ${cluster.mergedContent.overview}`);
+            lines.push(`    merged content: ${cluster.mergedContent.content}`);
+        }
+    }
+    return lines.join("\n");
+}
+function registerConsolidateCommand(memory, context) {
     memory
         .command("consolidate")
         .description("Reconcile duplicate or contradictory memories already in the store across write lanes (dry-run by default)")
         .requiredOption("--scope <scope>", "Scope to consolidate")
         .option("--category <category>", "Limit to one smart category (profile|preferences|entities|events|cases|patterns)")
         .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
-        .option("--apply", "Apply the consolidation plan (default is a dry-run preview)", false)
+        .option("--apply", "Apply the consolidation plan immediately (default is a dry-run preview with an interactive apply prompt)", false)
+        .option("--yes", "Skip the LLM-cost confirmation prompt (required for non-interactive/automated runs)", false)
         .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
         .option("--agent <agentId>", "Agent identity to route journal-mirror writes to (omit to use the fallback mirror directory)")
         .action(async (options) => {
@@ -1881,12 +1931,23 @@ export function registerMemoryCLI(program, context) {
                 sinceMs = parsed;
             }
             const mdMirror = context.mdMirror;
+            const confirm = createConsolidateConfirm();
             const result = await runConsolidate({
                 fetchRows: (scopeFilter, maxTimestamp, limit) => context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit),
                 update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
+                getById: (id, scopeFilter) => context.store.getById(id, scopeFilter),
                 embed: (text) => embedder.embedPassage(text),
                 completeJson: (prompt, label, system, temperature) => llmClient.completeJson(prompt, label, system, temperature),
                 log: (message) => console.warn(message),
+                confirmCost: async (message) => {
+                    console.log(`\n${message}`);
+                    return confirm("Proceed with these LLM calls? Type YES to continue: ");
+                },
+                confirmApply: async (message, clusters) => {
+                    console.log(`\n${formatConsolidatePlanForDisplay(clusters)}`);
+                    console.log(`\n${message}`);
+                    return confirm("Type YES to apply: ");
+                },
                 onAudit: mdMirror
                     ? async (audit) => {
                         const summary = `${audit.action} survivor=${audit.survivorId.slice(0, 8)} absorbed=${audit.absorbedIds.map((id) => id.slice(0, 8)).join(",")} reason="${audit.reason}"`;
@@ -1899,7 +1960,16 @@ export function registerMemoryCLI(program, context) {
                 sinceMs,
                 includeReflectionSlices: options.includeReflectionSlices,
                 apply: options.apply === true,
+                autoConfirm: options.yes === true,
             });
+            if (result.status === "aborted") {
+                console.error(`consolidate: aborted -- ${result.abortReason}`);
+                if (result.costPreview) {
+                    console.error(formatConsolidateCostPreview(result.costPreview));
+                }
+                console.error(`Pass --yes to skip this prompt (e.g. for automation), or re-run interactively and type YES.`);
+                process.exit(1);
+            }
             console.log(`Scanned ${result.scanned} row(s), ${result.eligible} eligible for consolidation.`);
             console.log(`Found ${result.clusters.length} cluster(s).\n`);
             for (const cluster of result.clusters) {
@@ -1913,8 +1983,13 @@ export function registerMemoryCLI(program, context) {
                 for (const text of cluster.memberTexts)
                     console.log(`    - "${text}"`);
             }
-            if (!result.apply) {
-                console.log(`\nDry run complete. Re-run with --apply to execute this plan.`);
+            if (result.staleSkipped.length > 0) {
+                console.log(`\n${result.staleSkipped.length} cluster(s) skipped: changed since the plan was built (stale).`);
+            }
+            if (!result.executed) {
+                if (!options.apply) {
+                    console.log(`\nNo changes applied.`);
+                }
                 return;
             }
             console.log(`\nApplied ${result.applied.length} action(s); ${result.skippedMalformed} cluster(s) skipped due to malformed verdicts.`);
