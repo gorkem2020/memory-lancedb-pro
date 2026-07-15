@@ -133,6 +133,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-admission.test.mjs", args: ["--test"] },
   // CLI subcommand attachment: pins every command under the memory-pro group, root program stays clean
   { group: "core-regression", runner: "node", file: "test/cli-subcommand-attachment.test.mjs", args: ["--test"] },
+  // Valid-empty extraction must reset the auto-capture watermark the same way a successful extraction does
+  { group: "core-regression", runner: "node", file: "test/autocapture-reset-on-valid-empty-extraction.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
