@@ -18,6 +18,7 @@ import {
   AdmissionController,
   type AdmissionAuditRecord,
   type AdmissionControlConfig,
+  type AdmissionEvaluation,
   type AdmissionRejectionAuditEntry,
 } from "./admission-control.js";
 import {
@@ -569,6 +570,37 @@ export class SmartExtractor {
       }
     }
 
+    // When utilityMode is "batch", score admission utility for every
+    // non-profile candidate in this extraction up front, with one LLM call
+    // per chunk of up to 10 candidates, instead of one call per candidate
+    // inside the sequential processCandidate loop below. Profile candidates
+    // are excluded: they run their own admission check inside
+    // handleProfileMerge, unaffected by batching.
+    const precomputedAdmissions = new Map<number, AdmissionEvaluation>();
+    if (this.admissionController && this.config.admissionControl?.utilityMode === "batch") {
+      const batchable = processableCandidates.filter(
+        ({ candidate }) => !ALWAYS_MERGE_CATEGORIES.has(candidate.category),
+      );
+      if (batchable.length > 0) {
+        const batchItems = batchable.map(({ index, candidate }) => ({
+          candidate,
+          candidateVector: precomputedVectors.get(index) ?? [],
+          conversationText,
+          scopeFilter: scopeFilter ?? [targetScope],
+        }));
+        try {
+          const evaluations = await this.admissionController.evaluateBatch(batchItems);
+          batchable.forEach(({ index }, i) => {
+            precomputedAdmissions.set(index, evaluations[i]);
+          });
+        } catch (err) {
+          this.log(
+            `memory-pro: smart-extractor: batch admission evaluation failed, falling back to per-candidate: ${String(err)}`,
+          );
+        }
+      }
+    }
+
     const createEntries: StoreEntry[] = [];
     const pendingSupersedeInvalidations: PendingSupersedeInvalidation[] = [];
 
@@ -585,6 +617,7 @@ export class SmartExtractor {
           createEntries,
           pendingSupersedeInvalidations,
           agentId,
+          precomputedAdmissions.get(index),
         );
       } catch (err) {
         this.log(
@@ -1030,6 +1063,9 @@ export class SmartExtractor {
    * @param precomputedVector - Optional pre-embedded vector for the candidate.
    *   When provided (from batch pre-embedding), skips the per-candidate embed
    *   call to reduce API round-trips.
+   * @param precomputedAdmission - Optional pre-scored admission evaluation
+   *   (from batch utility mode). When provided, skips the per-candidate
+   *   admissionController.evaluate() call below.
    */
   private async processCandidate(
     candidate: CandidateMemory,
@@ -1042,6 +1078,7 @@ export class SmartExtractor {
     createEntries?: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">[],
     pendingSupersedeInvalidations?: PendingSupersedeInvalidation[],
     agentId?: string,
+    precomputedAdmission?: AdmissionEvaluation,
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -1075,15 +1112,19 @@ export class SmartExtractor {
       return;
     }
 
-    // Admission control gate (before dedup)
-    const admission = this.admissionController
-      ? await this.admissionController.evaluate({
-          candidate,
-          candidateVector: vector,
-          conversationText,
-          scopeFilter: scopeFilter ?? [targetScope],
-        })
-      : undefined;
+    // Admission control gate (before dedup). Reuse the batch-mode evaluation
+    // computed up front for this candidate when available, instead of
+    // issuing another per-candidate call.
+    const admission =
+      precomputedAdmission ??
+      (this.admissionController
+        ? await this.admissionController.evaluate({
+            candidate,
+            candidateVector: vector,
+            conversationText,
+            scopeFilter: scopeFilter ?? [targetScope],
+          })
+        : undefined);
 
     if (admission?.decision === "reject") {
       stats.rejected = (stats.rejected ?? 0) + 1;

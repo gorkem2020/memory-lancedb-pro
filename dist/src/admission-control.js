@@ -188,7 +188,9 @@ export function normalizeAdmissionControlConfig(raw) {
             ? "off"
             : obj.utilityMode === "standalone"
                 ? "standalone"
-                : base.utilityMode,
+                : obj.utilityMode === "batch"
+                    ? "batch"
+                    : base.utilityMode,
         weights: normalizeWeights(obj.weights, base.weights),
         rejectThreshold,
         admitThreshold: normalizedAdmit,
@@ -399,6 +401,82 @@ export function resolveAdmissionModel(params) {
     }
     return normalizeAdmissionModelRef(params.globalModel);
 }
+/** Max candidates scored in a single batch-utility LLM call; larger batches are chunked. */
+const BATCH_UTILITY_MAX_SIZE = 10;
+/** Builds the batch-utility prompt as {system, user}. */
+function buildBatchUtilityPrompt(candidates, conversationText) {
+    const excerpt = conversationText.length > 3000
+        ? conversationText.slice(-3000)
+        : conversationText;
+    const system = `You are an admission judge. Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
+
+Score each candidate's future usefulness independently on a 0.0-1.0 scale. Score every item on its own absolute merit — do not rank or curve candidates relative to each other within this batch; a batch of entirely weak candidates should all score low, and a batch of entirely strong candidates should all score high.
+
+Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
+Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
+
+--- EXAMPLE (not your current batch) ---
+Example of absolute scoring across a mixed-quality batch:
+Candidates:
+1. Category: preferences — "User's preferred name is Alex"
+2. Category: events — "User said hello"
+3. Category: entities — "The project uses PostgreSQL as its primary datastore"
+Example response:
+{"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}
+Candidate 2 scores low even though candidates 1 and 3 score high in the same batch: each item is judged on its own merit, never curved against its neighbors.
+--- END EXAMPLE ---
+
+Return JSON only, with exactly one entry per candidate, in this shape:
+{
+  "results": [
+    { "index": 1, "utility": 0.0, "reason": "short explanation" }
+  ]
+}`;
+    const candidateBlocks = candidates
+        .map((candidate, i) => {
+        const n = i + 1;
+        return `${n}. Category: ${candidate.category}
+   Abstract: ${candidate.abstract}
+   Overview: ${candidate.overview}
+   Content: ${candidate.content}`;
+    })
+        .join("\n");
+    const user = `Conversation excerpt:
+${excerpt}
+
+Candidates:
+${candidateBlocks}`;
+    return { system, user };
+}
+/**
+ * Validates a batch-utility response and maps it back to per-candidate
+ * scores in input order. Returns null (triggering standalone fallback) on
+ * any malformed shape: non-array results, wrong count, or a missing/invalid
+ * index — this must never silently admit or reject the whole batch.
+ */
+function parseBatchUtilityResponse(response, expectedCount) {
+    if (!response || !Array.isArray(response.results))
+        return null;
+    if (response.results.length !== expectedCount)
+        return null;
+    const byIndex = new Map();
+    for (const entry of response.results) {
+        if (!entry || typeof entry.index !== "number")
+            return null;
+        byIndex.set(entry.index, entry);
+    }
+    const out = [];
+    for (let i = 1; i <= expectedCount; i++) {
+        const entry = byIndex.get(i);
+        if (!entry)
+            return null;
+        out.push({
+            score: clamp01(entry.utility, 0.5),
+            reason: typeof entry.reason === "string" ? entry.reason.trim() : undefined,
+        });
+    }
+    return out;
+}
 function buildReason(details) {
     const scoreText = details.score.toFixed(3);
     const similarityText = details.maxSimilarity.toFixed(3);
@@ -575,6 +653,24 @@ export class AdmissionController {
         return sameCategoryMatches.length > 0 ? sameCategoryMatches : rawMatches;
     }
     async evaluate(params) {
+        // Deterministic pre-admission short-circuit, checked here (before the
+        // utility LLM call, not just inside evaluateWithUtility) so a candidate
+        // tagged "constructed" in a durable category never spends an LLM call.
+        if (params.candidate.grounding === "constructed" &&
+            DURABLE_CATEGORIES.has(params.candidate.category)) {
+            return this.rejectConstructedDurable(params.candidate, params.now ?? Date.now());
+        }
+        const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate, params.conversationText, params.sourceKind ?? "conversation");
+        return this.evaluateWithUtility(params, utility);
+    }
+    /**
+     * Evaluate a single candidate given an already-scored utility feature.
+     * Shared by evaluate() (per-candidate utility scoring) and evaluateBatch()
+     * (utility scored once for the whole batch) — every other feature
+     * (confidence/novelty/recency/typePrior) and the decision/audit logic stay
+     * identical between the two paths.
+     */
+    async evaluateWithUtility(params, utility) {
         const now = params.now ?? Date.now();
         // Deterministic pre-admission short-circuit: a candidate tagged
         // "constructed" must never occupy a durable register, no matter how any
@@ -586,7 +682,6 @@ export class AdmissionController {
             return this.rejectConstructedDurable(params.candidate, now);
         }
         const relevantMatches = await this.loadRelevantMatches(params.candidate, params.candidateVector, params.scopeFilter);
-        const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate, params.conversationText, params.sourceKind ?? "conversation");
         const confidence = scoreConfidenceSupport(params.candidate, params.conversationText);
         const novelty = scoreNoveltyFromMatches(params.candidateVector, relevantMatches);
         const recency = scoreRecencyGap(now, relevantMatches, this.config.recency.halfLifeDays);
@@ -639,5 +734,69 @@ export class AdmissionController {
         };
         this.debugLog(`memory-lancedb-pro: admission-control: decision=${audit.decision} hint=${audit.hint ?? "n/a"} score=${audit.score.toFixed(3)} candidate=${JSON.stringify(params.candidate.abstract.slice(0, 80))}`);
         return { decision, hint, audit };
+    }
+    /**
+     * Evaluate a batch of candidates that share one conversation/source
+     * excerpt, scoring utility with a single LLM call per chunk of up to
+     * BATCH_UTILITY_MAX_SIZE candidates (chunking larger batches). Every other
+     * feature (confidence/novelty/recency/typePrior) and the decision/audit
+     * logic remain fully per-candidate, unchanged from evaluate().
+     *
+     * When utilityMode isn't "batch", or a chunk's batch response comes back
+     * malformed, falls back to one standalone evaluate() call per candidate in
+     * that chunk — this never fails the batch open or closed, it just costs
+     * more calls for that chunk.
+     */
+    async evaluateBatch(items) {
+        if (items.length === 0)
+            return [];
+        const chunks = [];
+        for (let i = 0; i < items.length; i += BATCH_UTILITY_MAX_SIZE) {
+            chunks.push(items.slice(i, i + BATCH_UTILITY_MAX_SIZE));
+        }
+        const results = [];
+        for (const chunk of chunks) {
+            results.push(...(await this.evaluateChunk(chunk)));
+        }
+        return results;
+    }
+    async evaluateChunk(chunk) {
+        if (this.config.utilityMode !== "batch") {
+            const out = [];
+            for (const item of chunk) {
+                out.push(await this.evaluate(item));
+            }
+            return out;
+        }
+        const utilities = await this.scoreUtilityBatch(chunk.map((item) => item.candidate), chunk[0].conversationText);
+        const out = [];
+        for (let i = 0; i < chunk.length; i++) {
+            out.push(await this.evaluateWithUtility(chunk[i], utilities[i]));
+        }
+        return out;
+    }
+    async scoreUtilityBatch(candidates, conversationText) {
+        const fallbackToStandalone = async () => {
+            const out = [];
+            for (const candidate of candidates) {
+                out.push(await scoreUtility(this.llm, "standalone", candidate, conversationText));
+            }
+            return out;
+        };
+        const { system, user } = buildBatchUtilityPrompt(candidates, conversationText);
+        let response = null;
+        try {
+            response = await this.llm.completeJson(user, "admission-utility-batch", system);
+        }
+        catch {
+            this.debugLog("memory-lancedb-pro: admission-control: batch utility scoring failed, falling back to standalone");
+            return fallbackToStandalone();
+        }
+        const parsed = parseBatchUtilityResponse(response, candidates.length);
+        if (!parsed) {
+            this.debugLog("memory-lancedb-pro: admission-control: malformed batch utility response, falling back to standalone");
+            return fallbackToStandalone();
+        }
+        return parsed;
     }
 }

@@ -126,6 +126,9 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/admission-lane-model-affinity.test.mjs", args: ["--test"] },
   // D1: standalone admission controller decoupled from SmartExtractor
   { group: "core-regression", runner: "node", file: "test/admission-without-smart-extraction.test.mjs", args: ["--test"] },
+  // D2: batch admission utility scoring mode
+  { group: "core-regression", runner: "node", file: "test/admission-control-batch-utility.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-admission.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
