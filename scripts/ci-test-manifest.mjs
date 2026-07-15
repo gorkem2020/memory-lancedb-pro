@@ -104,7 +104,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/register-scope-dedup.test.mjs", args: ["--test"] },
   // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
   { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
-  // Batch E: reflection-mapped write-time/read-time memory_category layering (E1-E3)
+  // Category layering for reflection-mapped rows: write-time stamping, legacy read-time fallback, and opt-in backfill
   { group: "storage-and-schema", runner: "node", file: "test/reverse-map-legacy-category.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/reflection-mapped-category-stamping.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/memory-upgrader-category-normalization.test.mjs", args: ["--test"] },
