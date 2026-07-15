@@ -1825,16 +1825,27 @@ function _initPluginState(api) {
     if (config.smartExtraction !== false) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
+            // A host-transport setup should never silently fall back to the
+            // embedding lane's credentials if the runtime.llm.complete surface
+            // turns out to be unavailable and createLlmClient falls back to a
+            // direct client -- that talks to the wrong provider with the wrong
+            // key on a split-provider setup. Leave apiKey/baseURL unset in that
+            // case; createLlmClient throws a clear error / defaults the baseURL.
+            const llmIsHostTransport = config.llm?.transport === "host";
             const llmApiKey = llmAuth === "oauth"
                 ? undefined
                 : config.llm?.apiKey
                     ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-                    : resolveFirstApiKey(api, config.embedding.apiKey);
+                    : llmIsHostTransport
+                        ? undefined
+                        : resolveFirstApiKey(api, config.embedding.apiKey);
             const llmBaseURL = llmAuth === "oauth"
                 ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                 : config.llm?.baseURL
                     ? resolveEnvVars(config.llm.baseURL)
-                    : config.embedding.baseURL;
+                    : llmIsHostTransport
+                        ? undefined
+                        : config.embedding.baseURL;
             const llmModel = config.llm?.model || "openai/gpt-oss-120b";
             const llmOauthPath = llmAuth === "oauth"
                 ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
@@ -2423,16 +2434,21 @@ const memoryLanceDBProPlugin = {
             llmClient: smartExtractor ? (() => {
                 try {
                     const llmAuth = config.llm?.auth || "api-key";
+                    const llmIsHostTransport = config.llm?.transport === "host";
                     const llmApiKey = llmAuth === "oauth"
                         ? undefined
                         : config.llm?.apiKey
                             ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-                            : resolveFirstApiKey(api, config.embedding.apiKey);
+                            : llmIsHostTransport
+                                ? undefined
+                                : resolveFirstApiKey(api, config.embedding.apiKey);
                     const llmBaseURL = llmAuth === "oauth"
                         ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                         : config.llm?.baseURL
                             ? resolveEnvVars(config.llm.baseURL)
-                            : config.embedding.baseURL;
+                            : llmIsHostTransport
+                                ? undefined
+                                : config.embedding.baseURL;
                     const llmOauthPath = llmAuth === "oauth"
                         ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
                         : undefined;
