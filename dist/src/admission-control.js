@@ -29,6 +29,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         preset: "balanced",
         enabled: false,
         utilityMode: "standalone",
+        modelAffinity: "global",
         weights: DEFAULT_WEIGHTS,
         rejectThreshold: 0.45,
         admitThreshold: 0.6,
@@ -45,6 +46,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         preset: "conservative",
         enabled: false,
         utilityMode: "standalone",
+        modelAffinity: "global",
         weights: {
             utility: 0.16,
             confidence: 0.16,
@@ -74,6 +76,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         preset: "high-recall",
         enabled: false,
         utilityMode: "standalone",
+        modelAffinity: "global",
         weights: {
             utility: 0.08,
             confidence: 0.1,
@@ -204,6 +207,10 @@ export function normalizeAdmissionControlConfig(raw) {
             obj.rejectedAuditFilePath.trim().length > 0
             ? obj.rejectedAuditFilePath.trim()
             : undefined,
+        model: typeof obj.model === "string" && obj.model.trim().length > 0
+            ? obj.model.trim()
+            : undefined,
+        modelAffinity: obj.modelAffinity === "lane" ? "lane" : "global",
     };
 }
 export function resolveRejectedAuditFilePath(dbPath, config) {
@@ -345,6 +352,53 @@ Candidate memory:
 - Conversation register: ${candidate.conversationRegister ?? "unknown (legacy payload)"}`;
     return { system, user };
 }
+/**
+ * The admission-control LLM client talks directly to OpenRouter, so it needs
+ * the bare "<vendor>/<model>" id OpenRouter's chat-completions API expects.
+ * Model refs sourced from memoryReflection.model (or an explicit override)
+ * may instead be in the core-style "openrouter/<vendor>/<model>" form the
+ * reflection distiller's own embedded runner accepts — that runner picks a
+ * backend from the leading segment, then forwards the rest as the model id.
+ * Strip that literal "openrouter/" prefix so both forms reach this plugin's
+ * direct client correctly; a bare "<vendor>/<model>" or an "@preset/<name>"
+ * alias already work against OpenRouter unchanged, so they pass through.
+ */
+export function normalizeAdmissionModelRef(modelRef) {
+    const trimmed = modelRef.trim();
+    const idx = trimmed.indexOf("/");
+    if (idx <= 0)
+        return trimmed;
+    const provider = trimmed.slice(0, idx).trim().toLowerCase();
+    if (provider !== "openrouter")
+        return trimmed;
+    const rest = trimmed.slice(idx + 1).trim();
+    return rest || trimmed;
+}
+/**
+ * Resolves which LLM model an admission call should use, in order:
+ * 1. An explicit admissionControl.model override always wins, on every lane.
+ * 2. When modelAffinity is "lane", the reflection lane resolves the
+ *    memoryReflection model (falling back to the global model if none is
+ *    configured) — the judge is never dumber than the author whose rows it
+ *    audits. Every other lane stays on the global model.
+ * 3. Default ("global", or the knob absent): every lane uses the global
+ *    model — today's behavior, unchanged.
+ * Every returned model passes through normalizeAdmissionModelRef so a
+ * core-style provider-prefixed string reaches this plugin's OpenRouter-direct
+ * client in the form it requires, regardless of which of the three paths
+ * above produced it.
+ */
+export function resolveAdmissionModel(params) {
+    const explicit = params.admissionControl.model?.trim();
+    if (explicit) {
+        return normalizeAdmissionModelRef(explicit);
+    }
+    if (params.admissionControl.modelAffinity === "lane" && params.lane === "reflection") {
+        const reflectionModel = params.reflectionModel?.trim();
+        return normalizeAdmissionModelRef(reflectionModel || params.globalModel);
+    }
+    return normalizeAdmissionModelRef(params.globalModel);
+}
 function buildReason(details) {
     const scoreText = details.score.toFixed(3);
     const similarityText = details.maxSimilarity.toFixed(3);
@@ -453,6 +507,17 @@ async function scoreUtility(llm, mode, candidate, conversationText, sourceKind =
         score: clamp01(response.utility, 0.5),
         reason: typeof response.reason === "string" ? response.reason.trim() : undefined,
     };
+}
+/**
+ * Construct an AdmissionController independently of any extraction engine.
+ * Availability depends only on the admission config's `enabled` flag, so
+ * callers that never build a SmartExtractor (e.g. smartExtraction: false)
+ * can still obtain a working controller to gate other write paths.
+ */
+export function createAdmissionController(store, llm, config, debugLog = () => { }) {
+    return config?.enabled === true
+        ? new AdmissionController(store, llm, config, debugLog)
+        : null;
 }
 export class AdmissionController {
     store;

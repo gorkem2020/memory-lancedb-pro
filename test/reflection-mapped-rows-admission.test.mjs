@@ -163,6 +163,45 @@ describe("gateMappedReflectionEntry", () => {
   });
 });
 
+describe("resolveMappedRowAdmissionController (index.ts wiring)", () => {
+  // Root cause (live-proven): the mapped-row gate callsite in index.ts was
+  // wired to `smartExtractor?.getAdmissionController() ?? null` only --
+  // `admissionControllerReflectionLane` (built for exactly this purpose when
+  // admissionControl.modelAffinity is "lane") was constructed and threaded
+  // into the runtime context but never actually consumed, so mapped rows
+  // always ran admission on the extraction-lane model regardless of lane
+  // affinity configuration.
+  it("prefers the reflection-lane admission controller over the extraction-lane one when both exist", () => {
+    const { resolveMappedRowAdmissionController } = jiti("../index.ts");
+    assert.equal(
+      typeof resolveMappedRowAdmissionController,
+      "function",
+      "resolveMappedRowAdmissionController must be exported for the mapped-row gate to be testable"
+    );
+    const reflectionLane = { tag: "reflection" };
+    const extractionLane = { tag: "extraction" };
+    const resolved = resolveMappedRowAdmissionController(reflectionLane, extractionLane);
+    assert.equal(
+      resolved,
+      reflectionLane,
+      "the mapped-row gate must use the reflection lane's own admission controller, not silently fall back to the extraction lane's"
+    );
+  });
+
+  it("falls back to the extraction-lane controller when no reflection-lane controller exists (e.g. modelAffinity is not 'lane')", () => {
+    const { resolveMappedRowAdmissionController } = jiti("../index.ts");
+    const extractionLane = { tag: "extraction" };
+    const resolved = resolveMappedRowAdmissionController(null, extractionLane);
+    assert.equal(resolved, extractionLane);
+  });
+
+  it("returns null when neither lane has a controller (admission control disabled)", () => {
+    const { resolveMappedRowAdmissionController } = jiti("../index.ts");
+    const resolved = resolveMappedRowAdmissionController(null, null);
+    assert.equal(resolved, null);
+  });
+});
+
 describe("buildReflectionPrompt grounding discipline", () => {
   it("instructs the distiller to keep in-fiction claims out of the mapped (durable) sections", () => {
     const { buildReflectionPrompt } = jiti("../index.ts");
