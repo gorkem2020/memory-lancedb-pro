@@ -233,6 +233,53 @@ export interface ConsolidateMember {
   overview: string;
   content: string;
   source?: string;
+  timestamp?: number;
+  validFrom?: number;
+}
+
+export const CONSOLIDATE_MERGE_SYSTEM_PROMPT = `You are a memory consolidation merge writer. Merge two versions of the same memory into a single coherent record with all three levels (abstract, overview, content).
+
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
+
+Return JSON only:
+{
+  "abstract": "Merged one-line abstract",
+  "overview": "Merged structured Markdown overview",
+  "content": "Merged full content"
+}`;
+
+// mapped/manual/legacy rows without a real overview/content commonly fall
+// back to the raw abstract text in all three tiers (see
+// src/smart-metadata.ts's parseSmartMetadata: l2_content falls back to raw
+// text, l1_overview falls back to `- ${abstract}`). Printing that fact three
+// times per member wastes cluster-listing space for no signal.
+function hasThinTiers(m: ConsolidateMember): boolean {
+  const overviewIsDefault = m.overview === "" || m.overview === `- ${m.abstract}` || m.overview === m.abstract;
+  const contentIsDefault = m.content === m.abstract;
+  return overviewIsDefault && contentIsDefault;
+}
+
+function formatMemberHeader(m: ConsolidateMember): string {
+  const parts = [`${m.index}. [${m.category}]`];
+  if (m.source) parts.push(` (source: ${m.source})`);
+  if (m.timestamp !== undefined) {
+    parts.push(`, timestamp: ${new Date(m.timestamp).toISOString()}`);
+    if (m.validFrom !== undefined && m.validFrom !== m.timestamp) {
+      parts.push(`, valid_from: ${new Date(m.validFrom).toISOString()}`);
+    }
+  }
+  return parts.join("");
+}
+
+function formatMemberTiers(m: ConsolidateMember): string {
+  if (hasThinTiers(m)) {
+    return `Fact: ${m.abstract}`;
+  }
+  return `Abstract: ${m.abstract}\nOverview: ${m.overview}\nContent: ${m.content}`;
 }
 
 export function buildConsolidatePrompt(members: ConsolidateMember[]): SplitPrompt {
@@ -246,6 +293,10 @@ Return exactly one verdict, scoped to whichever rows it actually applies to:
 
 "events" and "cases" categories are append-only in this system: never list an append-only row as survivor_index or in absorbed_indices, but that never blocks you from merging or superseding the OTHER, actionable rows in the same cluster — just leave the append-only rows out of your selection.
 
+Source legend: legacy = pre-smart-format rows, manual = operator memory_store saves, auto-capture = extraction lane, reflection* = mirror lanes; manual rows are operator-authored and strong survivor candidates.
+
+Each member below also shows its timestamp (and valid_from when it differs) — use these to judge supersede recency explicitly rather than inferring it from wording alone.
+
 Return JSON only:
 {
   "verdict": "skip|merge|supersede|contradict",
@@ -257,10 +308,7 @@ Return JSON only:
 Only include survivor_index and absorbed_indices for merge or supersede. survivor_index and every entry in absorbed_indices must be one of the row numbers shown below, and must never be an append-only (events/cases) row.`;
 
   const user = `Cluster members:\n\n${members
-    .map(
-      (m) =>
-        `${m.index}. [${m.category}]${m.source ? ` (source: ${m.source})` : ""}\nAbstract: ${m.abstract}\nOverview: ${m.overview}\nContent: ${m.content}`
-    )
+    .map((m) => `${formatMemberHeader(m)}\n${formatMemberTiers(m)}`)
     .join("\n\n")}`;
 
   return { system, user };
