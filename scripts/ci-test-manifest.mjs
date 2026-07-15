@@ -129,6 +129,8 @@ export const CI_TEST_MANIFEST = [
   // D2: batch admission utility scoring mode
   { group: "core-regression", runner: "node", file: "test/admission-control-batch-utility.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-admission.test.mjs", args: ["--test"] },
+  // CLI subcommand attachment: pins every command under the memory-pro group, root program stays clean
+  { group: "core-regression", runner: "node", file: "test/cli-subcommand-attachment.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
