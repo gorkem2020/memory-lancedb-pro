@@ -60,6 +60,31 @@ function shareSignificantTopicToken(a, b) {
     }
     return false;
 }
+// Fraction of the SMALLER topic-token set that matches the other set
+// (0 when either side has no topic tokens at all). Two short statements
+// about the same narrow fact typically share MOST of their significant
+// words even when phrased completely differently across write lanes
+// (e.g. "Favorite drink: cola" vs "Cola is what gets ordered most
+// evenings" both reduce to essentially {"cola"}); two short statements
+// about DIFFERENT facts rarely do, which is what keeps this fallback from
+// bridging unrelated rows the way a single-shared-token check would.
+function topicTokenOverlapRatio(a, b) {
+    const tokensA = extractTopicTokens(a);
+    const tokensB = extractTopicTokens(b);
+    if (tokensA.size === 0 || tokensB.size === 0)
+        return 0;
+    let matches = 0;
+    for (const tokenA of tokensA) {
+        for (const tokenB of tokensB) {
+            if (tokensMatch(tokenA, tokenB)) {
+                matches += 1;
+                break;
+            }
+        }
+    }
+    return matches / Math.min(tokensA.size, tokensB.size);
+}
+const NEAR_DUPLICATE_TOKEN_OVERLAP_RATIO = 0.6;
 function cosineSimilarity(a, b) {
     if (a.length === 0 || b.length === 0 || a.length !== b.length)
         return 0;
@@ -112,6 +137,22 @@ function isDirectlyLinked(a, b, similarityThreshold) {
         isEligibleForTopicLink(a.abstract) &&
         isEligibleForTopicLink(b.abstract) &&
         shareSignificantTopicToken(a.abstract, b.abstract)) {
+        return true;
+    }
+    // Cross-lane near-duplicate fallback: two short, same-category rows that
+    // are NOT reversal-shaped can still be the same fact stated by different
+    // write lanes (manual/auto-capture/reflection*), whose differing
+    // tokenization keeps cosine and fact_key from matching. Unlike the
+    // reversal fallback above (which only needs ONE shared token, since a
+    // reversal is inherently pointed at a specific fact), this case requires
+    // a MAJORITY of the smaller row's topic tokens to overlap, so two short
+    // but topically different statements don't bridge on a single
+    // incidental shared word.
+    if (a.memoryCategory &&
+        a.memoryCategory === b.memoryCategory &&
+        isEligibleForTopicLink(a.abstract) &&
+        isEligibleForTopicLink(b.abstract) &&
+        topicTokenOverlapRatio(a.abstract, b.abstract) >= NEAR_DUPLICATE_TOKEN_OVERLAP_RATIO) {
         return true;
     }
     return false;

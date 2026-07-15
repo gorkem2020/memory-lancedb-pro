@@ -228,6 +228,45 @@ describe("memory consolidate: clustering", () => {
       "the unrelated desk-move row must not be glued into the cola cluster through the long narrative row"
     );
   });
+
+  it("clusters 3 plain near-duplicate rows from different write lanes with their contradiction, even though none of the duplicates is reversal-shaped (item 4 motivating fixture)", () => {
+    // Synthetic, cross-lane favorite-drink family: three PLAIN statements of
+    // the same fact, phrased the way three different write lanes would
+    // phrase it (strict colon convention, free-text reflection-mapped
+    // prose, and a casual auto-capture paraphrase) -- none contains reversal
+    // wording, so the pre-item-4 reversal-gated topic-overlap fallback never
+    // links them to EACH OTHER (only ever to the reversal row, and only for
+    // whichever one becomes reachable first via seed order). Deliberately
+    // orthogonal vectors and mismatched fact_keys simulate real cross-lane
+    // embedding/tokenization drift, so cosine and fact_key both miss too.
+    const strictConvention = buildConsolidateCandidate(
+      makeRow({ abstract: "Favorite drink: cola", vector: [1, 0, 0, 0], factKey: "preferences:favorite drink", source: "manual" })
+    );
+    const freeTextMapped = buildConsolidateCandidate(
+      makeRow({ abstract: "The user really likes cola as their favorite drink", vector: [0, 1, 0, 0], factKey: undefined, source: "reflection" })
+    );
+    const casualParaphrase = buildConsolidateCandidate(
+      makeRow({ abstract: "Cola is what gets ordered most evenings", vector: [0, 0, 1, 0], factKey: undefined, source: "auto-capture" })
+    );
+    const contradiction = buildConsolidateCandidate(
+      makeRow({ abstract: "No longer drinks cola", vector: [0, 0, 0, 1], factKey: undefined, source: "manual" })
+    );
+    const unrelated = buildConsolidateCandidate(
+      makeRow({ abstract: "Prefers a standing desk for back comfort", vector: [1, 1, 0, 0], factKey: "preferences:desk setup", source: "manual" })
+    );
+
+    const clusters = clusterConsolidateCandidates(
+      [strictConvention, freeTextMapped, casualParaphrase, contradiction, unrelated],
+      0.86
+    );
+
+    assert.equal(clusters.length, 1, "exactly one cluster should form for the favorite-drink family");
+    assert.deepEqual(
+      clusters[0].slice().sort(),
+      [0, 1, 2, 3],
+      "all 3 cross-lane duplicates and the contradiction must land in the SAME cluster; the unrelated desk row must stay out"
+    );
+  });
 });
 
 describe("memory consolidate: cluster chunking", () => {
@@ -903,6 +942,34 @@ describe("memory consolidate: orchestration", () => {
 
     const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: false, now: ts + 100 });
     assert.equal(result.scanned, 1, "fetchRows must only see the requested scope");
+  });
+
+  it("end-to-end: the decider sees the cross-lane favorite-drink family as ONE cluster, not fragmented or missed (item 4 acceptance)", async () => {
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ abstract: "Favorite drink: cola", content: "x", factKey: "preferences:favorite drink", source: "manual", vector: [1, 0, 0, 0], timestamp: ts }),
+      makeRow({ abstract: "The user really likes cola as their favorite drink", content: "y", factKey: undefined, source: "reflection", vector: [0, 1, 0, 0], timestamp: ts + 1 }),
+      makeRow({ abstract: "Cola is what gets ordered most evenings", content: "z", factKey: undefined, source: "auto-capture", vector: [0, 0, 1, 0], timestamp: ts + 2 }),
+      makeRow({ abstract: "No longer drinks cola", content: "w", factKey: undefined, source: "manual", vector: [0, 0, 0, 1], timestamp: ts + 3 }),
+    ];
+    const store = makeFakeStore(rows);
+    let sawClusterMemberCount = null;
+    const completeJson = async (prompt, label) => {
+      if (label !== "consolidate-decide") return null;
+      sawClusterMemberCount = (prompt.match(/^\d+\. \[/gm) || []).length;
+      return {
+        verdicts: [
+          { cluster_index: 1, verdict: "supersede", survivor_index: 4, absorbed_indices: [1, 2, 3], reason: "reversal supersedes all 3 cross-lane duplicates" },
+        ],
+      };
+    };
+
+    const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, now: ts + 100_000 });
+
+    assert.equal(result.clusters.length, 1, "exactly one cluster must reach the decider");
+    assert.equal(sawClusterMemberCount, 4, "the decider's prompt must list all 4 rows together in that one cluster");
+    assert.equal(result.applied.length, 1);
+    assert.equal(result.applied[0].absorbedIds.length, 3, "all 3 cross-lane duplicates must be absorbed by the single supersede verdict");
   });
 });
 
