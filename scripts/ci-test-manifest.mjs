@@ -108,6 +108,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/autocapture-watermark-reset.test.mjs", args: ["--test"] },
   // Consolidation command: cross-lane dedup/supersede reconciliation for existing rows
   { group: "core-regression", runner: "node", file: "test/memory-consolidate.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate-cost-gate.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-consolidate-two-phase-apply.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/invalidated-rows-visibility.test.mjs", args: ["--test"] },
 ];
 
