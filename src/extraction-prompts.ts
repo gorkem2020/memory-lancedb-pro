@@ -313,3 +313,51 @@ Only include survivor_index and absorbed_indices for merge or supersede. survivo
 
   return { system, user };
 }
+
+export interface ConsolidateBatchCluster {
+  clusterIndex: number;
+  members: ConsolidateMember[];
+}
+
+// Same decider semantics as buildConsolidatePrompt, but scoped to decide
+// N independent clusters in a single call: one LLM round-trip per
+// consolidate run instead of one per cluster. Each cluster is decided
+// independently -- a verdict for one cluster must never be influenced by
+// another cluster's rows -- and the response is a JSON array with one
+// verdict object per cluster, tagged by cluster_index so a malformed entry
+// for one cluster can be dropped without discarding the others' verdicts.
+export function buildConsolidateBatchPrompt(clusters: ConsolidateBatchCluster[]): SplitPrompt {
+  const system = `You are a memory consolidation decider. You are given multiple independent clusters of existing memories, each flagged as likely related within itself, either by embedding similarity or by sharing a topic key. Decide how to reconcile the ACTIONABLE rows in EACH cluster independently -- a decision about one cluster must never be influenced by another cluster's rows. You do NOT have to act on every row in a cluster: survivor_index and absorbed_indices only need to cover the rows you are deciding about within that cluster. Any row you leave out of both is simply left untouched -- this is expected and correct whenever a cluster mixes actionable duplicates or reversals with unrelated or append-only rows.
+
+Return exactly one verdict per cluster, scoped to whichever rows it actually applies to:
+- skip: none of the rows in this cluster need any action. Use this only when nothing here is a duplicate, reversal, or contradiction.
+- merge: two or more rows are duplicates or near-duplicates of the same fact. Pick the row with the best-quality, most complete text as the survivor and list only the true duplicates as absorbed.
+- supersede: one row is a newer fact or an explicit reversal that replaces one or more older rows describing the same fact (for example, a decision to stop doing something an older row describes). The survivor is the newer/reversal row; list only the rows it actually replaces as absorbed. Supersede is NOT destructive: absorbed rows are never deleted. They are kept as an auditable historical record and simply marked as no longer current, exactly like SUPERSEDE in ordinary dedup decisions ("the same mutable fact has changed over time; keep the old memory as historical but no longer current"). Use supersede whenever a row states that a fact from an older row has changed, even if that only applies to part of the cluster.
+- contradict: two or more rows conflict and it is not clear which one is correct. Flag this for human review. No destructive action.
+
+"events" and "cases" categories are append-only in this system: never list an append-only row as survivor_index or in absorbed_indices, but that never blocks you from merging or superseding the OTHER, actionable rows in the same cluster -- just leave the append-only rows out of your selection.
+
+Source legend: legacy = pre-smart-format rows, manual = operator memory_store saves, auto-capture = extraction lane, reflection* = mirror lanes; manual rows are operator-authored and strong survivor candidates.
+
+Each member below also shows its timestamp (and valid_from when it differs) -- use these to judge supersede recency explicitly rather than inferring it from wording alone.
+
+Return JSON only:
+{
+  "verdicts": [
+    { "cluster_index": 1, "verdict": "skip|merge|supersede|contradict", "survivor_index": 1, "absorbed_indices": [2, 3], "reason": "short explanation" }
+  ]
+}
+
+Include exactly one verdict object per cluster listed below, each tagged with the matching cluster_index. Only include survivor_index and absorbed_indices for merge or supersede. survivor_index and every entry in absorbed_indices are row numbers scoped to that cluster's own member list, and must never be an append-only (events/cases) row.`;
+
+  const user = clusters
+    .map(
+      (c) =>
+        `Cluster ${c.clusterIndex} members:\n\n${c.members
+          .map((m) => `${formatMemberHeader(m)}\n${formatMemberTiers(m)}`)
+          .join("\n\n")}`
+    )
+    .join("\n\n===\n\n");
+
+  return { system, user };
+}
