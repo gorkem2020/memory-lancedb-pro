@@ -39,7 +39,7 @@ import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -2838,6 +2838,7 @@ const memoryLanceDBProPlugin = {
                         // Extract text content from messages
                         const eligibleTexts = [];
                         const assistantContextTexts = [];
+                        const conversationTurns = [];
                         let skippedAutoCaptureTexts = 0;
                         const captureAssistantValue = config.captureAssistant;
                         const captureAssistantEligible = captureAssistantValue === true;
@@ -2862,6 +2863,7 @@ const memoryLanceDBProPlugin = {
                                 }
                                 else {
                                     targetTexts.push(normalized);
+                                    conversationTurns.push({ role: role, text: normalized });
                                 }
                                 continue;
                             }
@@ -2880,6 +2882,7 @@ const memoryLanceDBProPlugin = {
                                         }
                                         else {
                                             targetTexts.push(normalized);
+                                            conversationTurns.push({ role: role, text: normalized });
                                         }
                                     }
                                 }
@@ -2979,10 +2982,17 @@ const memoryLanceDBProPlugin = {
                             if (cumulativeCount >= minMessages) {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
                                 const conversationText = cleanTexts.join("\n");
+                                const finalConversationTurns = buildConversationTurnsForExtraction({
+                                    messageLoopTurns: conversationTurns,
+                                    eligibleTexts,
+                                    newUserTexts: cleanTexts,
+                                    assistantContextForRun,
+                                    assistantContextTexts,
+                                });
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun, conversationTurns: finalConversationTurns });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
