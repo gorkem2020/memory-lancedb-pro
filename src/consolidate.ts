@@ -9,7 +9,7 @@ import {
   type SmartMemoryMetadata,
 } from "./smart-metadata.js";
 import { APPEND_ONLY_CATEGORIES, type MemoryCategory } from "./memory-categories.js";
-import { buildMergePrompt, buildConsolidatePrompt } from "./extraction-prompts.js";
+import { buildMergePrompt, buildConsolidatePrompt, CONSOLIDATE_MERGE_SYSTEM_PROMPT } from "./extraction-prompts.js";
 
 export type ConsolidateVerdict = "skip" | "merge" | "supersede" | "contradict";
 
@@ -28,6 +28,7 @@ export interface ConsolidateCandidate {
   content: string;
   factKey?: string;
   source?: string;
+  validFrom?: number;
 }
 
 const REVERSAL_SIGNAL_PATTERN =
@@ -122,6 +123,7 @@ export function buildConsolidateCandidate(entry: MemoryEntry): ConsolidateCandid
     content: meta.l2_content || entry.text,
     factKey,
     source: meta.source,
+    validFrom: meta.valid_from,
   };
 }
 
@@ -251,7 +253,7 @@ export interface ConsolidateWriteDeps {
   ) => Promise<unknown>;
   delete: (id: string, scopeFilter?: string[]) => Promise<unknown>;
   embed: (text: string) => Promise<number[]>;
-  completeJson: <T>(prompt: string, label?: string) => Promise<T | null>;
+  completeJson: <T>(prompt: string, label?: string, system?: string) => Promise<T | null>;
 }
 
 async function applyMergeVerdict(
@@ -280,7 +282,8 @@ async function applyMergeVerdict(
     );
     const merged = await deps.completeJson<{ abstract: string; overview: string; content: string }>(
       prompt,
-      "consolidate-merge"
+      "consolidate-merge",
+      CONSOLIDATE_MERGE_SYSTEM_PROMPT
     );
     if (merged) {
       abstract = merged.abstract;
@@ -434,10 +437,11 @@ export async function runConsolidate(
           overview: m.overview,
           content: m.content,
           source: m.source,
+          timestamp: m.entry.timestamp,
+          validFrom: m.validFrom,
         }))
       );
-      const combinedPrompt = `${prompt.system}\n\n${prompt.user}`;
-      const raw = await deps.completeJson<Record<string, unknown>>(combinedPrompt, "consolidate-decide");
+      const raw = await deps.completeJson<Record<string, unknown>>(prompt.user, "consolidate-decide", prompt.system);
       const verdict = raw ? parseConsolidateVerdict(raw, members.length) : null;
 
       if (!verdict) {
