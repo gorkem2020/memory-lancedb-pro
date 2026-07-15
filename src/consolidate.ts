@@ -291,7 +291,7 @@ export interface ConsolidateWriteDeps {
   ) => Promise<unknown>;
   delete: (id: string, scopeFilter?: string[]) => Promise<unknown>;
   embed: (text: string) => Promise<number[]>;
-  completeJson: <T>(prompt: string, label?: string, system?: string) => Promise<T | null>;
+  completeJson: <T>(prompt: string, label?: string, system?: string, temperature?: number) => Promise<T | null>;
 }
 
 async function applyMergeVerdict(
@@ -451,7 +451,15 @@ export async function runConsolidate(
       if (!isMemoryActiveAt(meta, now)) return false;
       if (options.category && candidate.memoryCategory !== options.category) return false;
       return true;
-    });
+    })
+    // Sort by row id (a stable key) before clustering, not just before
+    // building the prompt: clusterConsolidateCandidates' seed-based scan
+    // always picks the lowest surviving array index as the next seed, so a
+    // pre-sorted candidate array makes both which rows end up in the same
+    // cluster AND their order within it a pure function of the candidate
+    // SET -- independent of whatever order fetchRows happened to return
+    // this call, which store/DB internals don't guarantee is stable.
+    .sort((a, b) => (a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0));
 
   const similarityThreshold = options.similarityThreshold ?? DEFAULT_SIMILARITY_THRESHOLD;
   const clusterCap = options.clusterCap ?? DEFAULT_CLUSTER_CAP;
@@ -461,18 +469,29 @@ export async function runConsolidate(
   const applied: ConsolidateAuditEntry[] = [];
   let skippedMalformed = 0;
 
+  const byId = (a: ConsolidateCandidate, b: ConsolidateCandidate) =>
+    a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0;
+
   // Flatten every cluster (and any cluster chunked past clusterCap) into a
   // single ordered list of decision units first, so the decider can be
   // asked about all of them in ONE completeJson call instead of one call
-  // per cluster.
+  // per cluster. Members within a unit, and units themselves, are
+  // explicitly re-sorted by row id here too (belt-and-suspenders on top of
+  // the pre-clustering sort above) so prompt assembly never depends on
+  // clusterConsolidateCandidates' internal grouping order.
   const units: Array<{ clusterIndex: number; members: ConsolidateCandidate[] }> = [];
   for (const group of clusterIndexGroups) {
-    const chunks = chunkCluster(group, clusterCap);
+    const sortedGroup = [...group].sort((a, b) => byId(candidates[a], candidates[b]));
+    const chunks = chunkCluster(sortedGroup, clusterCap);
     for (const chunkIndices of chunks) {
       if (chunkIndices.length < 2) continue;
       units.push({ clusterIndex: units.length + 1, members: chunkIndices.map((i) => candidates[i]) });
     }
   }
+  units.sort((a, b) => byId(a.members[0], b.members[0]));
+  units.forEach((unit, i) => {
+    unit.clusterIndex = i + 1;
+  });
 
   if (units.length > 0) {
     const batchClusters: ConsolidateBatchCluster[] = units.map((unit) => ({
@@ -489,7 +508,7 @@ export async function runConsolidate(
       })),
     }));
     const prompt = buildConsolidateBatchPrompt(batchClusters);
-    const raw = await deps.completeJson<Record<string, unknown>>(prompt.user, "consolidate-decide", prompt.system);
+    const raw = await deps.completeJson<Record<string, unknown>>(prompt.user, "consolidate-decide", prompt.system, 0);
     const verdictMap = raw
       ? parseConsolidateBatchVerdicts(
           raw,
