@@ -104,6 +104,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/register-scope-dedup.test.mjs", args: ["--test"] },
   // Reflection distiller sub-run must request raw-run semantics (skip foreign before_prompt_build hooks)
   { group: "core-regression", runner: "node", file: "test/raw-run-distiller-hooks.test.mjs", args: ["--test"] },
+  { group: "storage-and-schema", runner: "node", file: "test/smart-metadata-source-classification.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
