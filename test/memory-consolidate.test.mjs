@@ -394,6 +394,15 @@ describe("memory consolidate: prompt shape", () => {
     );
   });
 
+  it("tells the decider same-category append-only duplicates may be merged, but never superseded", () => {
+    const prompt = buildConsolidatePrompt([
+      { index: 1, category: "preferences", abstract: "a", overview: "", content: "a", source: "manual" },
+    ]);
+    assert.match(prompt.system, /append-only/i);
+    assert.match(prompt.system, /same append-only category/i);
+    assert.match(prompt.system, /can never be superseded or contradicted/i);
+  });
+
   it("renders identical L0/L1/L2 tiers once per member instead of repeating the same raw fallback text three times", () => {
     // mapped/manual/legacy rows without real overview/content commonly fall
     // back to the raw abstract text in all three tiers (see
@@ -477,6 +486,13 @@ describe("memory consolidate: batch prompt shape", () => {
     ]);
     assert.match(prompt.system, /legacy\s*=\s*pre-smart-format rows/i);
     assert.ok(prompt.user.includes(`timestamp: ${new Date(ts).toISOString()}`));
+  });
+
+  it("still tells the decider same-category append-only duplicates may be merged, but never superseded", () => {
+    const prompt = buildConsolidateBatchPrompt([{ clusterIndex: 1, members: [member(1, "a")] }]);
+    assert.match(prompt.system, /append-only/i);
+    assert.match(prompt.system, /same append-only category/i);
+    assert.match(prompt.system, /can never be superseded or contradicted/i);
   });
 });
 
@@ -839,7 +855,11 @@ describe("memory consolidate: orchestration", () => {
     assert.equal(included.eligible, 2, "reflection rows included with the opt-in flag");
   });
 
-  it("refuses to merge or supersede append-only categories even if the LLM says to", async () => {
+  it("refuses to supersede append-only categories even if the LLM says to, even within the same category", async () => {
+    // Append-only means invalidation-protection, not merge-immunity: supersede
+    // (and contradict) invalidate the absorbed row's currency, which must never
+    // happen to an events/cases row regardless of whether every acted-upon row
+    // shares the same append-only category.
     const ts = 1_700_000_000_000;
     const rows = [
       makeRow({ category: "decision", memoryCategory: "events", abstract: "Deploy event: shipped v1", factKey: "events:deploy", vector: [1, 0], timestamp: ts }),
@@ -851,9 +871,9 @@ describe("memory consolidate: orchestration", () => {
       verdicts: [
         {
           cluster_index: 1,
-          verdict: "merge",
-          survivor_index: 1,
-          absorbed_indices: [2],
+          verdict: "supersede",
+          survivor_index: 2,
+          absorbed_indices: [1],
           reason: "an unsafe LLM verdict that must be rejected",
         },
       ],
@@ -864,9 +884,105 @@ describe("memory consolidate: orchestration", () => {
       { scope: "global", apply: true, autoConfirm: true, now: ts + 100 }
     );
 
-    assert.equal(result.applied.length, 0, "append-only categories must never merge/supersede, even on LLM instruction");
+    assert.equal(result.applied.length, 0, "append-only categories must never be superseded, even on LLM instruction");
     assert.equal(store.rows.length, 2, "both events rows must remain untouched");
     assert.ok(logs.some((l) => /append-only/i.test(l)));
+  });
+
+  it("allows merging near-identical duplicate rows within the same append-only category", async () => {
+    // The append-only shield exists to protect against invalidation, not to
+    // block dedup of true duplicates -- two rows describing the exact same
+    // occurrence should still be able to merge into one.
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ category: "decision", memoryCategory: "events", abstract: "Deploy event: shipped v1", factKey: "events:deploy", vector: [1, 0], timestamp: ts }),
+      makeRow({ category: "decision", memoryCategory: "events", abstract: "Deploy event: shipped v1 again", factKey: "events:deploy", vector: [1, 0], timestamp: ts + 1 }),
+    ];
+    const store = makeFakeStore(rows);
+    const completeJson = async () => ({
+      verdicts: [
+        {
+          cluster_index: 1,
+          verdict: "merge",
+          survivor_index: 1,
+          absorbed_indices: [2],
+          reason: "byte-near duplicate event rows describing the same deploy",
+        },
+      ],
+    });
+
+    const result = await runConsolidate(
+      { ...store, completeJson },
+      { scope: "global", apply: true, autoConfirm: true, now: ts + 100 }
+    );
+
+    assert.equal(result.applied.length, 1, "same-category append-only duplicates must be allowed to merge");
+    assert.equal(result.applied[0].survivorId, rows[0].id);
+    assert.deepEqual(result.applied[0].absorbedIds, [rows[1].id]);
+    assert.equal(store.rows.length, 2, "merge is non-destructive: both rows remain present");
+    const absorbedRow = store.rows.find((r) => r.id === rows[1].id);
+    assert.ok(
+      JSON.parse(absorbedRow.metadata).invalidated_at,
+      "the absorbed duplicate must be marked invalidated, not hard-deleted"
+    );
+  });
+
+  it("still refuses to merge append-only rows across different categories", async () => {
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ category: "decision", memoryCategory: "events", abstract: "Deploy event: shipped v1", factKey: "events:deploy", vector: [1, 0], timestamp: ts }),
+      makeRow({ category: "fact", memoryCategory: "cases", abstract: "Deploy runbook: roll back to v0 on failure", factKey: "cases:deploy", vector: [1, 0], timestamp: ts + 1 }),
+    ];
+    const store = makeFakeStore(rows);
+    const logs = [];
+    const completeJson = async () => ({
+      verdicts: [
+        {
+          cluster_index: 1,
+          verdict: "merge",
+          survivor_index: 1,
+          absorbed_indices: [2],
+          reason: "an unsafe cross-category LLM verdict that must be rejected",
+        },
+      ],
+    });
+
+    const result = await runConsolidate(
+      { ...store, completeJson, log: (msg) => logs.push(msg) },
+      { scope: "global", apply: true, autoConfirm: true, now: ts + 100 }
+    );
+
+    assert.equal(result.applied.length, 0, "append-only rows from different categories must never merge into each other");
+    assert.equal(store.rows.length, 2);
+    assert.ok(logs.some((l) => /append-only/i.test(l)));
+  });
+
+  it("a preference row can never supersede an event row", async () => {
+    const ts = 1_700_000_000_000;
+    const rows = [
+      makeRow({ category: "preference", memoryCategory: "preferences", abstract: "Prefers the new deploy process", factKey: "preferences:deploy process", vector: [1, 0], timestamp: ts + 1 }),
+      makeRow({ category: "decision", memoryCategory: "events", abstract: "Deploy event: shipped v1", factKey: "events:deploy process", vector: [1, 0], timestamp: ts }),
+    ];
+    const store = makeFakeStore(rows);
+    const completeJson = async () => ({
+      verdicts: [
+        {
+          cluster_index: 1,
+          verdict: "supersede",
+          survivor_index: 1,
+          absorbed_indices: [2],
+          reason: "an unsafe LLM verdict claiming the preference supersedes the event",
+        },
+      ],
+    });
+
+    const result = await runConsolidate(
+      { ...store, completeJson },
+      { scope: "global", apply: true, autoConfirm: true, now: ts + 100 }
+    );
+
+    assert.equal(result.applied.length, 0, "a non-append-only row must never supersede an append-only row");
+    assert.equal(store.rows.length, 2);
   });
 
   it("still merges the actionable duplicates in a cluster that also contains an unreferenced append-only row (paraphrased live shape)", async () => {
@@ -1166,6 +1282,44 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
     assert.ok(merge, "expected a consolidate-merge completeJson call");
     assert.ok(merge.system, "the CLI adapter dropped the merge writer's system prompt");
     assert.match(merge.system, /merge writer/i);
+  });
+});
+
+describe("memory-pro stats: live/total split (nit)", () => {
+  it("prints both live and total counts in the human-readable output, matching what --json already exposes", async () => {
+    const { createMemoryCLI } = jiti(path.join(testDir, "..", "cli.ts"));
+
+    const context = {
+      store: {
+        stats: async () => ({
+          totalCount: 5,
+          liveCount: 3,
+          scopeCounts: { global: 5 },
+          categoryCounts: { preference: 5 },
+        }),
+        hasFtsSupport: true,
+      },
+      retriever: { getConfig: () => ({ mode: "hybrid" }) },
+      scopeManager: { getStats: () => ({ totalScopes: 1 }) },
+      migrator: {},
+    };
+
+    const program = new Command();
+    program.exitOverride();
+    createMemoryCLI(context)({ program });
+
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (...args) => logs.push(args.join(" "));
+    try {
+      await program.parseAsync(["node", "openclaw", "memory-pro", "stats"]);
+    } finally {
+      console.log = originalLog;
+    }
+
+    const output = logs.join("\n");
+    assert.match(output, /Live memories:\s*3/i, "human-readable output must show the live count, like --json does");
+    assert.match(output, /Total memories:\s*5/i);
   });
 });
 
