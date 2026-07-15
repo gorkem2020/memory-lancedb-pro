@@ -288,7 +288,9 @@ export function parseSmartMetadata(
   const fallbackSource =
     parsed.type === "session-summary"
       ? "session-summary"
-      : parsed.type === "memory-reflection" || parsed.type === "memory-reflection-item"
+      : parsed.type === "memory-reflection" ||
+          parsed.type === "memory-reflection-item" ||
+          parsed.type === "memory-reflection-mapped"
         ? "reflection"
         : "legacy";
   const source = normalizeSource(parsed.source ?? fallbackSource);
