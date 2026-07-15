@@ -460,16 +460,16 @@ function cosineSimilarity(left: number[], right: number[]): number {
   return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 }
 
-function buildUtilityPrompt(candidate: CandidateMemory, conversationText: string): string {
-  const excerpt =
-    conversationText.length > 3000
-      ? conversationText.slice(-3000)
-      : conversationText;
-
+/**
+ * The admission judge scores solely on what extraction provided (the
+ * candidate's own category/abstract/overview/content) plus, elsewhere in
+ * AdmissionController, the store's existing rows via the separate
+ * non-LLM novelty feature — never on raw conversation/transcript text, so
+ * this prompt intentionally carries no conversation excerpt or other
+ * source-context blob.
+ */
+function buildUtilityPrompt(candidate: CandidateMemory): string {
   return `Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
-
-Conversation excerpt:
-${excerpt}
 
 Candidate memory:
 - Category: ${candidate.category}
@@ -501,16 +501,24 @@ interface BatchUtilityResponse {
  * with the system/user prompt-architecture split is mechanical: on this
  * branch the two are concatenated before the single-string completeJson()
  * call, since that split hasn't landed here yet.
+ *
+ * Like buildUtilityPrompt, this intentionally carries no conversation
+ * excerpt or other source-context blob — the admission judge scores solely
+ * on what extraction provided for each candidate (category/abstract/
+ * overview/content) plus, elsewhere in AdmissionController, the store's
+ * existing rows via the non-LLM novelty feature.
+ *
+ * Formatting: every logical block (intro, scoring guidance, the few-shot
+ * example, the return-format spec) is blank-line separated, candidates
+ * within the example and within the live batch are blank-line separated
+ * from each other, and each candidate's multi-line fields are indented
+ * under its numbered line — this keeps the few-shot example and the live
+ * batch visually consistent, and both easy to scan for a multi-candidate
+ * batch.
  */
 function buildBatchUtilityPrompt(
   candidates: CandidateMemory[],
-  conversationText: string,
 ): { system: string; user: string } {
-  const excerpt =
-    conversationText.length > 3000
-      ? conversationText.slice(-3000)
-      : conversationText;
-
   const system = `You are an admission judge. Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
 
 Score each candidate's future usefulness independently on a 0.0-1.0 scale. Score every item on its own absolute merit — do not rank or curve candidates relative to each other within this batch; a batch of entirely weak candidates should all score low, and a batch of entirely strong candidates should all score high.
@@ -520,12 +528,18 @@ Use lower scores for one-off chatter, low-signal situational remarks, thin resta
 
 --- EXAMPLE (not your current batch) ---
 Example of absolute scoring across a mixed-quality batch:
+
 Candidates:
+
 1. Category: preferences — "User's preferred name is Alex"
+
 2. Category: events — "User said hello"
+
 3. Category: entities — "The project uses PostgreSQL as its primary datastore"
+
 Example response:
 {"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}
+
 Candidate 2 scores low even though candidates 1 and 3 score high in the same batch: each item is judged on its own merit, never curved against its neighbors.
 --- END EXAMPLE ---
 
@@ -544,12 +558,10 @@ Return JSON only, with exactly one entry per candidate, in this shape:
    Overview: ${candidate.overview}
    Content: ${candidate.content}`;
     })
-    .join("\n");
+    .join("\n\n");
 
-  const user = `Conversation excerpt:
-${excerpt}
+  const user = `Candidates:
 
-Candidates:
 ${candidateBlocks}`;
 
   return { system, user };
@@ -711,7 +723,6 @@ async function scoreUtility(
   llm: LlmClient,
   mode: AdmissionControlConfig["utilityMode"],
   candidate: CandidateMemory,
-  conversationText: string,
 ): Promise<{ score: number; reason?: string }> {
   if (mode === "off") {
     return { score: 0.5, reason: "Utility scoring disabled" };
@@ -720,7 +731,7 @@ async function scoreUtility(
   let response: { utility?: number; reason?: string } | null = null;
   try {
     response = await llm.completeJson<{ utility?: number; reason?: string }>(
-      buildUtilityPrompt(candidate, conversationText),
+      buildUtilityPrompt(candidate),
       "admission-utility",
     );
   } catch {
@@ -780,12 +791,7 @@ export class AdmissionController {
     scopeFilter: string[];
     now?: number;
   }): Promise<AdmissionEvaluation> {
-    const utility = await scoreUtility(
-      this.llm,
-      this.config.utilityMode,
-      params.candidate,
-      params.conversationText,
-    );
+    const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate);
     return this.evaluateWithUtility(params, utility);
   }
 
@@ -937,10 +943,7 @@ export class AdmissionController {
       return out;
     }
 
-    const utilities = await this.scoreUtilityBatch(
-      chunk.map((item) => item.candidate),
-      chunk[0].conversationText,
-    );
+    const utilities = await this.scoreUtilityBatch(chunk.map((item) => item.candidate));
 
     const out: AdmissionEvaluation[] = [];
     for (let i = 0; i < chunk.length; i++) {
@@ -960,9 +963,8 @@ export class AdmissionController {
    */
   private async scoreUtilityBatch(
     candidates: CandidateMemory[],
-    conversationText: string,
   ): Promise<Array<{ score: number; reason?: string }>> {
-    const { system, user } = buildBatchUtilityPrompt(candidates, conversationText);
+    const { system, user } = buildBatchUtilityPrompt(candidates);
     let response: BatchUtilityResponse | null = null;
     try {
       response = await this.llm.completeJson<BatchUtilityResponse>(
@@ -975,7 +977,7 @@ export class AdmissionController {
       );
       const out: Array<{ score: number; reason?: string }> = [];
       for (const candidate of candidates) {
-        out.push(await scoreUtility(this.llm, "standalone", candidate, conversationText));
+        out.push(await scoreUtility(this.llm, "standalone", candidate));
       }
       return out;
     }
