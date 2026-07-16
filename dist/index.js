@@ -768,9 +768,14 @@ function asNonEmptyString(value) {
 function isInternalReflectionSessionKey(sessionKey) {
     return typeof sessionKey === "string" && sessionKey.trim().startsWith("temp:memory-reflection");
 }
-// Memory sub-completions (active-memory's embedded recall sub-build, and any :subagent:
-// sub-build) must not re-enter memory prompt injection: they would waste an embedding+vector
-// search per turn, and their injected block can leak into the main prompt via shared session messages.
+// Any :subagent:/:active-memory: sub-build (delegated subagents in general, not only
+// memory-internal ones) is treated as "its context comes from the parent" across every
+// memory-adjacent hook in this file: auto-recall injection, reflection injection, and
+// self-improvement reminders all skip it via this same check (each with its own "skip for
+// sub-agent sessions" comment at its call site), and auto-capture (agent_end) follows the
+// same convention. This is deliberately broader than "memory-internal only"; a subagent's
+// own task-scoped conversation is not treated as an independent, capturable/injectable
+// top-level conversation by this plugin.
 function isMemorySubsessionKey(sessionKey) {
     return typeof sessionKey === "string" && (sessionKey.includes(":subagent:") || sessionKey.includes(":active-memory:"));
 }
@@ -2860,6 +2865,16 @@ const memoryLanceDBProPlugin = {
         if (config.autoCapture !== false) {
             const agentEndAutoCaptureHook = (event, ctx) => {
                 if (!event.success || !event.messages || event.messages.length === 0) {
+                    return;
+                }
+                // Internal memory sub-sessions (the reflection distiller's embedded
+                // temp:memory-reflection run, :subagent:/:active-memory: sub-builds) emit
+                // agent_end too; capturing them would extract memory scaffolding prompts
+                // as if they were conversation. Same guard convention as the sibling
+                // reflection injection hooks.
+                const hookSessionKey = ctx?.sessionKey || event.sessionKey;
+                if (isInternalReflectionSessionKey(hookSessionKey) || isMemorySubsessionKey(hookSessionKey)) {
+                    api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 internal memory session '${hookSessionKey}'`);
                     return;
                 }
                 // Fire-and-forget: run capture work in the background so the hook
