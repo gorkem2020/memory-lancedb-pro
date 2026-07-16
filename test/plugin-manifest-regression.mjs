@@ -110,6 +110,67 @@ assert.ok(
   ),
   "captureAssistant oneOf should allow the string literal \"context\"",
 );
+assert.ok(
+  manifest.configSchema.properties.llm.properties.transport.enum.includes("host"),
+  "llm.transport schema should declare the host transport option",
+);
+assert.equal(
+  manifest.configSchema.properties.llm.properties.transport.default,
+  "direct",
+  "llm.transport schema default should remain direct (host routing is opt-in)",
+);
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "thinkLevel"),
+  "configSchema should declare the canonical llm.thinkLevel"
+);
+assert.equal(
+  manifest.configSchema.properties.llm.properties.thinkLevel.type,
+  "string",
+  "llm.thinkLevel schema should accept a free-form string, same as the deprecated reasoningEffort"
+);
+assert.equal(
+  manifest.configSchema.properties.llm.properties.thinkLevel.default,
+  "medium",
+  "llm.thinkLevel schema default should stay medium"
+);
+assert.doesNotMatch(
+  manifest.configSchema.properties.llm.properties.thinkLevel.description,
+  /reasoning effort requested on the host transport only/i,
+  "thinkLevel description must not claim it's host-only now that the direct transport also sends it"
+);
+assert.match(
+  manifest.configSchema.properties.llm.properties.thinkLevel.description,
+  /host.*always sent.*default.*medium/i,
+  "thinkLevel description should document the host transport always sending a default"
+);
+assert.match(
+  manifest.configSchema.properties.llm.properties.thinkLevel.description,
+  /direct.*sent only when explicitly configured/i,
+  "thinkLevel description should document the direct transport only sending it when configured"
+);
+
+// llm.reasoningEffort must stay in the schema (config validation must not
+// break on either key), but marked deprecated and pointing at the new name --
+// the operator's live config still sets reasoningEffort directly.
+assert.ok(
+  Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "reasoningEffort"),
+  "configSchema must keep the deprecated llm.reasoningEffort so existing configs still validate"
+);
+assert.equal(
+  manifest.configSchema.properties.llm.properties.reasoningEffort.type,
+  "string",
+  "the deprecated llm.reasoningEffort should keep accepting a plain string"
+);
+assert.match(
+  manifest.configSchema.properties.llm.properties.reasoningEffort.description,
+  /deprecat/i,
+  "the deprecated llm.reasoningEffort description should say it's deprecated"
+);
+assert.match(
+  manifest.configSchema.properties.llm.properties.reasoningEffort.description,
+  /thinkLevel/,
+  "the deprecated llm.reasoningEffort description should point at llm.thinkLevel"
+);
 
 assert.equal(
   manifest.configSchema.properties.autoRecallMinRepeated.default,
