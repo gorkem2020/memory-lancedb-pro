@@ -29,7 +29,7 @@ describe("llm.thinkLevel canonical key with deprecated llm.reasoningEffort alias
       assert.deepEqual(warns, []);
     });
 
-    it("returns the deprecated reasoningEffort value when only reasoningEffort is configured", () => {
+    it("returns the deprecated reasoningEffort value when only reasoningEffort is configured, with no both-keys-wins warning (2026-07-16 live incident regression: a schema-materialized thinkLevel default was observed silently winning over this exact config on a CLI config-load path)", () => {
       const warns = [];
       const result = resolveThinkLevel({ reasoningEffort: "low" }, (msg) => warns.push(msg));
       assert.equal(result, "low");
@@ -37,6 +37,11 @@ describe("llm.thinkLevel canonical key with deprecated llm.reasoningEffort alias
       assert.match(warns[0], /llm\.reasoningEffort/);
       assert.match(warns[0], /llm\.thinkLevel/);
       assert.match(warns[0], /deprecat/i);
+      assert.doesNotMatch(
+        warns[0],
+        /wins/i,
+        "must emit only the deprecated-alias-only warning, never the both-keys-configured warning, when thinkLevel is genuinely unset",
+      );
     });
 
     it("prefers thinkLevel when both are configured", () => {
