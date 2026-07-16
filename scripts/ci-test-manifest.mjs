@@ -121,6 +121,10 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/memory-categories-storage-map.test.mjs", args: ["--test"] },
   // Extraction category rubric for durable/recurring state and habit changes
   { group: "llm-clients-and-auth", runner: "node", file: "test/extraction-category-rubric.test.mjs" },
+  // D1: standalone admission controller decoupled from SmartExtractor
+  { group: "core-regression", runner: "node", file: "test/admission-controller-standalone.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-admission-controller-injection.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/admission-without-smart-extraction.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
