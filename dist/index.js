@@ -1022,8 +1022,8 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
             .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
             .join("\n")
         : "- (none)";
-    return [
-        "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+    const system = [
+        "You are a memory reflection distiller. Generate a durable MEMORY REFLECTION entry for an AI assistant system.",
         "",
         "Output Markdown only. No intro text. No outro text. No extra headings.",
         "",
@@ -1119,7 +1119,8 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         "",
         "## Derived",
         "- This run showed ...",
-        "",
+    ].join("\n");
+    const user = [
         "Recent tool error signals:",
         errorHints,
         "",
@@ -1128,6 +1129,7 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         clipped,
         "```",
     ].join("\n");
+    return { system, user };
 }
 function buildReflectionFallbackText() {
     return [
@@ -1203,7 +1205,8 @@ export async function generateReflectionText(params) {
     }
 }
 async function generateReflectionTextUnbounded(params) {
-    const prompt = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const { system: reflectionSystemPrompt, user: reflectionUserPrompt } = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const prompt = `${reflectionSystemPrompt}\n\n${reflectionUserPrompt}`;
     const promptHash = sha256Hex(prompt);
     const tempSessionFile = join(tmpdir(), `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
     let reflectionText = null;
