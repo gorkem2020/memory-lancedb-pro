@@ -562,6 +562,17 @@ export function resetThinkLevelDeprecationWarnForTests() {
  * usage keeps working unchanged, with its own once-per-process deprecation
  * warning naming the new key. Blank/whitespace-only values are treated as
  * unset for both keys, matching reasoningEffort's pre-existing semantics.
+ *
+ * Presence-based by construction: "configured" here means "a non-blank
+ * string reached this function." That is only a correct proxy for "the
+ * user actually set it" as long as neither openclaw.plugin.json schema
+ * entry (llm.thinkLevel / llm.reasoningEffort) declares a JSON-schema
+ * "default" -- a schema default gets materialized into the config object
+ * upstream (observed on at least one OpenClaw host config-loading path)
+ * before this function ever runs, indistinguishably from a genuine user
+ * value. Do not add "default" back to either manifest key; that silently
+ * resurrects an override of an explicitly-configured deprecated
+ * reasoningEffort (2026-07-16 live incident).
  */
 export function resolveThinkLevel(config, warnLog) {
     const thinkLevel = config.thinkLevel?.trim();
