@@ -109,6 +109,7 @@ export const CI_TEST_MANIFEST = [
   { group: "storage-and-schema", runner: "node", file: "test/memory-categories-storage-map.test.mjs", args: ["--test"] },
   // Scope/ownership leak hardening: NULL-scope visibility, isOwnedByAgent main/blank leaks, parse-failure attribution
   { group: "core-regression", runner: "node", file: "test/scope-owner-leak-hardening.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/isOwnedByAgent.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {

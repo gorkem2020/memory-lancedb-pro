@@ -4826,7 +4826,16 @@ const memoryLanceDBProPlugin = {
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
           const targetScope = isSystemBypassId(sourceAgentId)
             ? config.scopes?.default ?? "global"
-            : scopeManager.getDefaultScope(sourceAgentId);
+            : parsedAgentId
+              ? scopeManager.getDefaultScope(sourceAgentId)
+              // A session that never resolved to a real agent must not be routed into
+              // main's default scope: ownerAgentId is already blanked for exactly this
+              // case so the row is not inheritable via isOwnedByAgent(), but a plain
+              // scope-filtered read (list/vectorSearch/etc. with no ownership check)
+              // would still see it if it landed in "agent:main". Route it into a scope
+              // no agent's getAccessibleScopes() ever grants instead, so it stays
+              // findable by an unrestricted/admin read but invisible to every agent.
+              : "unattributed:reflection";
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
