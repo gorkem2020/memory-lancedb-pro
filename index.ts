@@ -2339,6 +2339,7 @@ interface PluginSingletonState {
   reflectionDerivedBySession: Map<string, { updatedAt: number; derived: string[] }>;
   reflectionDerivedSuppressionBySession: Map<string, ReflectionDerivedSuppressionState>;
   reflectionByAgentCache: Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>;
+  reflectionByAgentCacheGeneration: { count: number };
   recallHistory: Map<string, Map<string, number>>;
   turnCounter: Map<string, number>;
   autoCaptureSeenTextCount: Map<string, number>;
@@ -2538,6 +2539,11 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
   const reflectionDerivedSuppressionBySession = new Map<string, ReflectionDerivedSuppressionState>();
   const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
+  // Bumped on every invalidateReflectionCachesAfterDelete call. loadAgentReflectionSlices
+  // snapshots this before its awaited store.list() reads and skips caching its result if
+  // it changed mid-flight, so an in-flight read can never publish a stale pre-delete
+  // snapshot back into the cache after the delete already invalidated it.
+  const reflectionByAgentCacheGeneration = { count: 0 };
   const recallHistory = new Map<string, Map<string, number>>();
   const turnCounter = new Map<string, number>();
   const autoCaptureSeenTextCount = new Map<string, number>();
@@ -2565,6 +2571,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     reflectionDerivedBySession,
     reflectionDerivedSuppressionBySession,
     reflectionByAgentCache,
+    reflectionByAgentCacheGeneration,
     recallHistory,
     turnCounter,
     autoCaptureSeenTextCount,
@@ -2717,6 +2724,7 @@ const memoryLanceDBProPlugin = {
       reflectionDerivedBySession,
       reflectionDerivedSuppressionBySession,
       reflectionByAgentCache,
+      reflectionByAgentCacheGeneration,
       recallHistory,
       turnCounter,
       autoCaptureSeenTextCount,
@@ -2933,6 +2941,7 @@ const memoryLanceDBProPlugin = {
       const cacheKey = `${agentId}::${scopeKey}`;
       const cached = reflectionByAgentCache.get(cacheKey);
       if (cached && Date.now() - cached.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS) return cached;
+      const generationAtStart = reflectionByAgentCacheGeneration.count;
 
       // Prefer reflection-category rows to avoid full-table reads on bypass callers.
       // Fall back to an uncategorized scan only when the category query produced no
@@ -2961,7 +2970,12 @@ const memoryLanceDBProPlugin = {
       }
       const { invariants, derived } = slices;
       const next = { updatedAt: Date.now(), invariants, derived };
-      reflectionByAgentCache.set(cacheKey, next);
+      // Only cache if no delete invalidated this cacheKey while the awaits above were in
+      // flight (TOCTOU guard); otherwise this late-arriving, possibly-stale read would
+      // silently resurrect a cache entry the delete just cleared.
+      if (reflectionByAgentCacheGeneration.count === generationAtStart) {
+        reflectionByAgentCache.set(cacheKey, next);
+      }
       return next;
     };
 
@@ -2985,6 +2999,7 @@ const memoryLanceDBProPlugin = {
     // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
     // cleared in full rather than left to expire on its own TTL.
     const invalidateReflectionCachesAfterDelete = (deletedScopes: string[] | undefined) => {
+      reflectionByAgentCacheGeneration.count++;
       const deletedSet = new Set(deletedScopes ?? []);
       for (const cacheKey of reflectionByAgentCache.keys()) {
         const sepIdx = cacheKey.indexOf("::");
@@ -3142,6 +3157,9 @@ const memoryLanceDBProPlugin = {
         mdMirror,
         workspaceBoundary: config.workspaceBoundary,
         selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
+        // Mirrors the CLI context wiring below: keep in-process reflection caches
+        // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
+        onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -5042,7 +5060,13 @@ const memoryLanceDBProPlugin = {
             });
             if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
               reflectionDerivedBySession.set(sessionKey, {
-                updatedAt: nowTs,
+                // Deliberately Date.now(), not nowTs (which mirrors the host-supplied
+                // event.timestamp and can be skewed/future-dated): this field is a TTL
+                // bookkeeping mark, and DEFAULT_REFLECTION_CACHE_TTL_MS above compares it
+                // against a fresh Date.now() on every read. A skewed updatedAt can make
+                // "Date.now() - updatedAt" go negative, which is always < the TTL, so the
+                // cache would read as fresh indefinitely until wall-clock time caught up.
+                updatedAt: Date.now(),
                 derived: stored.slices.derived,
               });
             }
