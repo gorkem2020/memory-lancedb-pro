@@ -340,6 +340,18 @@ function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
   return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
 
+// A NULL/undefined row scope must never be treated as if it were literally
+// "global" for ACL purposes: list/vectorSearch/bm25Search/stats/fetchForCompaction
+// all deny a NULL-scope row against any real scope filter (no more "OR scope IS
+// NULL"), so ID-based lookups must apply the same deny-by-default rule against
+// the row's real (uncoerced) scope, not a display-only "global" fallback that a
+// filter containing "global" would spuriously match.
+function isRowScopeAccessible(realScope: string | null | undefined, scopeFilter?: string[]): boolean {
+  if (!scopeFilter || scopeFilter.length === 0) return true;
+  if (!realScope) return false;
+  return scopeFilter.includes(realScope);
+}
+
 function hasFtsIndex(indices: unknown): boolean {
   return Array.isArray(indices) && indices.some((idx: any) =>
     idx?.indexType === "FTS" ||
@@ -1088,7 +1100,11 @@ export class MemoryStore {
           const originalRow = {
             ...row,
             vector: Array.from(row.vector as Iterable<number>),
-            scope: (row.scope as string | undefined) ?? "global",
+            // Deliberately NOT coercing a NULL/undefined scope to "global" here: this
+            // delete+re-add cycle exists purely to normalize legacy timestamps and must
+            // not have the side effect of silently promoting a NULL-scope row into the
+            // real "global" scope (which would defeat the deny-by-default ACL rule that
+            // list/vectorSearch/getById/etc. apply to genuinely scopeless rows).
             metadata: (row.metadata as string | undefined) || "{}",
           };
           const normalizedRow = {
@@ -1669,8 +1685,8 @@ export class MemoryStore {
     if (rows.length === 0) return null;
 
     const row = rows[0];
-    const rowScope = (row.scope as string | undefined) ?? "global";
-    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+    const realScope = row.scope as string | null | undefined;
+    if (!isRowScopeAccessible(realScope, scopeFilter)) {
       return null;
     }
 
@@ -1679,7 +1695,7 @@ export class MemoryStore {
       text: row.text as string,
       vector: Array.from(row.vector as Iterable<number>),
       category: row.category as MemoryEntry["category"],
-      scope: rowScope,
+      scope: realScope ?? "global",
       importance: clampImportance(Number(row.importance)),
       timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
       metadata: (row.metadata as string) || "{}",
@@ -1716,8 +1732,8 @@ export class MemoryStore {
 
     if (rows.length === 0) return false;
 
-    const rowScope = (rows[0].scope as string | undefined) ?? "global";
-    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+    const realScope = rows[0].scope as string | null | undefined;
+    if (!isRowScopeAccessible(realScope, scopeFilter)) {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
@@ -2023,14 +2039,10 @@ export class MemoryStore {
     }
 
     const resolvedId = candidates[0].id as string;
-    const rowScope = (candidates[0].scope as string | undefined) ?? "global";
+    const realScope = candidates[0].scope as string | null | undefined;
 
     // Check scope permissions
-    if (
-      scopeFilter &&
-      scopeFilter.length > 0 &&
-      !scopeFilter.includes(rowScope)
-    ) {
+    if (!isRowScopeAccessible(realScope, scopeFilter)) {
       throw new Error(`Memory ${resolvedId} is outside accessible scopes`);
     }
 
@@ -2253,12 +2265,8 @@ export class MemoryStore {
             continue;
           }
 
-          const rowScope = (row.scope as string | undefined) ?? "global";
-          if (
-            scopeFilter &&
-            scopeFilter.length > 0 &&
-            !scopeFilter.includes(rowScope)
-          ) {
+          const realScope = row.scope as string | null | undefined;
+          if (!isRowScopeAccessible(realScope, scopeFilter)) {
             results.set(candidate.inputIndex, {
               id: candidate.id,
               entry: null,
@@ -2266,6 +2274,7 @@ export class MemoryStore {
             });
             continue;
           }
+          const rowScope = realScope ?? "global";
 
           const original: MemoryEntry = {
             id: row.id as string,
@@ -2443,16 +2452,13 @@ export class MemoryStore {
       if (rows.length === 0) return null;
 
       const row = rows[0];
-      const rowScope = (row.scope as string | undefined) ?? "global";
+      const realScope = row.scope as string | null | undefined;
 
       // Check scope permissions
-      if (
-        scopeFilter &&
-        scopeFilter.length > 0 &&
-        !scopeFilter.includes(rowScope)
-      ) {
+      if (!isRowScopeAccessible(realScope, scopeFilter)) {
         throw new Error(`Memory ${id} is outside accessible scopes`);
       }
+      const rowScope = realScope ?? "global";
 
       const original: MemoryEntry = {
         id: row.id as string,

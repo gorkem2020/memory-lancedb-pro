@@ -172,6 +172,119 @@ describe("(a2) sibling read paths no longer pass NULL-scope rows through a scope
   });
 });
 
+describe("(a3) ID-based read/write paths no longer treat a NULL scope as literally \"global\"", () => {
+  async function seedNullScopeRow(store) {
+    await store.upsert({
+      id: "id-path-null-scope",
+      timestamp: Date.now(),
+      text: "legacy row with no scope, reached by id",
+      vector: [0.1, 0.2, 0.3],
+      category: "fact",
+      scope: null,
+      importance: 0.5,
+      metadata: "{}",
+    });
+  }
+
+  it("getById excludes a NULL-scope row when the filter includes \"global\" (previously leaked)", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeRow(store);
+      // A NULL-scope row's *display* default is "global", but that must not make it
+      // match an ACL filter that happens to include "global" — the row's real scope
+      // is still NULL/absent, and a real scope filter must deny it like every other
+      // read path in this PR already does.
+      const result = await store.getById("id-path-null-scope", ["agent-a", "global"]);
+      assert.equal(result, null, "a NULL-scope row must not be reachable by ID through a \"global\"-inclusive filter");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("getById still returns the row with no scope filter (internal/unrestricted read, regression)", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeRow(store);
+      const result = await store.getById("id-path-null-scope");
+      assert.ok(result, "an unrestricted getById must still find the row");
+      assert.equal(result.scope, "global", "display-only scope default is unchanged");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("deleteExactId refuses to delete a NULL-scope row through a \"global\"-inclusive filter", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeRow(store);
+      await assert.rejects(
+        () => store.deleteExactId("id-path-null-scope", ["agent-a", "global"]),
+        /outside accessible scopes/,
+      );
+      const stillThere = await store.getById("id-path-null-scope");
+      assert.ok(stillThere, "the row must not have been deleted");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("update refuses to update a NULL-scope row through a \"global\"-inclusive filter", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeRow(store);
+      await assert.rejects(
+        () => store.update("id-path-null-scope", { text: "hijacked" }, ["agent-a", "global"]),
+        /outside accessible scopes/,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("bulkUpdateExact reports a NULL-scope row as outside accessible scopes through a \"global\"-inclusive filter", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeRow(store);
+      const [result] = await store.bulkUpdateExact(
+        [{ id: "id-path-null-scope", updates: { text: "hijacked" } }],
+        ["agent-a", "global"],
+      );
+      assert.equal(result.entry, null);
+      assert.match(result.error ?? "", /outside accessible scopes/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("delete (distinct from deleteExactId) refuses to delete a NULL-scope row through a \"global\"-inclusive filter", async () => {
+    const { store, dir } = makeStore();
+    try {
+      // delete() validates ID format (full UUID / hex prefix / legacy mem-md-N) before
+      // even reaching the scope check, unlike deleteExactId's exact-string match — use a
+      // UUID-shaped id so the assertion below actually exercises the scope-leak path.
+      const uuidId = "11111111-2222-4333-8444-555555555555";
+      await store.upsert({
+        id: uuidId,
+        timestamp: Date.now(),
+        text: "legacy row with no scope, reached by id",
+        vector: [0.1, 0.2, 0.3],
+        category: "fact",
+        scope: null,
+        importance: 0.5,
+        metadata: "{}",
+      });
+      await assert.rejects(
+        () => store.delete(uuidId, ["agent-a", "global"]),
+        /outside accessible scopes/,
+      );
+      const stillThere = await store.getById(uuidId);
+      assert.ok(stillThere, "the row must not have been deleted");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("(b) isOwnedByAgent no longer grants universal main or blank-owner access", () => {
   it("rejects a blank-owner legacy/invariant row for any requesting agent", () => {
     const metadata = { type: "memory-reflection", agentId: "" };
@@ -211,6 +324,18 @@ describe("(c) reflection ownership is never minted as main when the sessionKey f
     return parseAgentIdFromSessionKey(sessionKey) || "";
   }
 
+  // Mirrors index.ts's targetScope derivation. Blanking ownerAgentId alone is not
+  // enough: the row's DB `scope` column must also avoid main's default scope
+  // (getDefaultScope("main") = "agent:main"), or a plain scope-filtered read (one
+  // that never calls isOwnedByAgent) can still retrieve an "unattributed" row
+  // alongside main's own legitimately-owned rows.
+  const UNATTRIBUTED_REFLECTION_SCOPE = "unattributed:reflection";
+  function deriveTargetScope(sessionKey, scopeManager) {
+    const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
+    if (!parsedAgentId) return UNATTRIBUTED_REFLECTION_SCOPE;
+    return scopeManager.getDefaultScope(parsedAgentId || "main");
+  }
+
   it("does not mint a main-owned row for a sessionKey that fails to parse to an agent", () => {
     const sessionKey = "channel:example:998877"; // does not start with "agent:"
     assert.equal(parseAgentIdFromSessionKey(sessionKey), undefined, "sanity: this sessionKey must fail to parse");
@@ -238,6 +363,10 @@ describe("(c) reflection ownership is never minted as main when the sessionKey f
     try {
       const { storeReflectionToLanceDB } = jiti("../src/reflection-store.ts");
       const ownerAgentId = deriveOwnerAgentId("channel:example:998877");
+      const targetScope = deriveTargetScope("channel:example:998877", {
+        getDefaultScope: (agentId) => (agentId ? `agent:${agentId}` : "global"),
+      });
+      assert.equal(targetScope, UNATTRIBUTED_REFLECTION_SCOPE, "sanity: parse failure must route to the unattributed scope");
 
       await storeReflectionToLanceDB({
         reflectionText: ["## Invariants", "- Some invariant from an unparseable session.", "## Derived", "- Some derived note."].join("\n"),
@@ -245,7 +374,7 @@ describe("(c) reflection ownership is never minted as main when the sessionKey f
         sessionId: "session-unparseable",
         agentId: ownerAgentId,
         command: "command:new",
-        scope: "global",
+        scope: targetScope,
         toolErrorSignals: [],
         runAt: Date.now(),
         usedFallback: false,
@@ -254,7 +383,7 @@ describe("(c) reflection ownership is never minted as main when the sessionKey f
         store: async (entry) => store.store(entry),
       });
 
-      const stored = await store.list(["global"], "reflection", 20, 0);
+      const stored = await store.list([targetScope], "reflection", 20, 0);
       assert.ok(stored.length > 0, "expected the reflection to have been persisted");
       for (const entry of stored) {
         const metadata = JSON.parse(entry.metadata);
@@ -262,6 +391,19 @@ describe("(c) reflection ownership is never minted as main when the sessionKey f
         assert.equal(isOwnedByAgent(metadata, "main"), false);
         assert.equal(isOwnedByAgent(metadata, "agent-two"), false);
       }
+
+      // The real leak this closes: a plain scope-filtered read for main's own
+      // default scope (no isOwnedByAgent() check at all) must not see this row.
+      const mainScopedRead = await store.list(["agent:main"], "reflection", 20, 0);
+      assert.ok(
+        !mainScopedRead.some((r) => r.id === stored[0]?.id),
+        "an unattributed reflection must not be readable via a plain agent:main scope filter",
+      );
+      const globalScopedRead = await store.list(["global"], "reflection", 20, 0);
+      assert.ok(
+        !globalScopedRead.some((r) => r.id === stored[0]?.id),
+        "an unattributed reflection must not be readable via a plain global scope filter either",
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

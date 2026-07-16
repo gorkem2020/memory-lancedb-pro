@@ -122,3 +122,4 @@ export function getEntriesForGroup(group) {
   return CI_TEST_MANIFEST.filter((entry) => entry.group === group);
 }
   { group: "core-regression", runner: "node", file: "test/scope-owner-leak-hardening.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/isOwnedByAgent.test.mjs", args: ["--test"] },
