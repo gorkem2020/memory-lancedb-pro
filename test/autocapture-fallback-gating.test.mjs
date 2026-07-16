@@ -274,6 +274,52 @@ describe("regex-fallback gating (Path 1: minMessages not met)", () => {
     );
   });
 
+  it("re-queues deferred ingress texts so a later turn's extraction sees all of them (ingress flow)", async () => {
+    // Distinct from the "history flow" test above: an ingress-fed session has no
+    // external transcript to re-read on the next turn, so the accumulator rollback
+    // that works for history-carrying sessions cannot apply here. Before the fix,
+    // pendingIngressTexts was consumed and deleted on every below-threshold turn
+    // with nothing to replace it: the counter advanced correctly, but the actual
+    // text content of every deferred turn except the last was silently lost.
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: smartConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const messageReceivedHooks = (harness.eventHandlers.get("message_received") || []).map((h) => h.handler);
+    assert.ok(messageReceivedHooks.length > 0, "expected at least one message_received handler");
+
+    const ingressCtx = { channelId: "synthchat", conversationId: "conv1" };
+    const sessionKey = "agent:dave:synthchat:conv1";
+
+    function fireMessageReceived(text) {
+      for (const handler of messageReceivedHooks) {
+        handler({ content: text, from: "dave" }, ingressCtx);
+      }
+    }
+
+    // Turn 1: one ingress message queued, then agent_end fires. The hook requires a
+    // non-empty event.messages to run at all, but pendingIngressTexts fully overrides
+    // eligibleTexts once present, so a trivial placeholder message's own content never
+    // reaches extraction and does not affect the count. Below threshold, deferred.
+    fireMessageReceived(PREFERENCE_TEXT);
+    await fireAgentEnd(hook, userMessages("(assistant turn placeholder)"), { sessionKey, agentId: "dave" });
+    assert.equal(extractionPrompts.length, 0, "turn 1 alone must stay below the threshold");
+
+    // Turn 2: a second ingress message arrives. If turn 1's text was lost (the
+    // pre-fix bug), only SECOND_TEXT would be visible here.
+    fireMessageReceived(SECOND_TEXT);
+    await fireAgentEnd(hook, userMessages("(assistant turn placeholder)"), { sessionKey, agentId: "dave" });
+
+    assert.equal(extractionPrompts.length, 1, "the threshold is met on turn 2");
+    assert.ok(
+      extractionPrompts[0].includes(PREFERENCE_TEXT),
+      "turn 1's deferred ingress text must still reach extraction on turn 2, not just turn 2's own text",
+    );
+    assert.ok(
+      extractionPrompts[0].includes(SECOND_TEXT),
+      "turn 2's own ingress text must also reach extraction",
+    );
+  });
+
   it("preserves the legacy fallback when smart extraction is disabled (pin)", async () => {
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,
@@ -417,5 +463,25 @@ describe("gateRegexFallbackCapture (Path 2 unit)", () => {
     assert.equal(result.admit, true);
     assert.match(result.reason, /failed open/);
     assert.equal(warnings.length, 1);
+
+    // A fail-open admit still needs durable, queryable provenance on the persisted
+    // row itself (the ephemeral warnLog line above is never stored) so this row is
+    // distinguishable from a normally-scored admit later.
+    assert.ok(result.auditJson, "expected a synthesized audit record on the fail-open path");
+    const audit = JSON.parse(result.auditJson);
+    assert.equal(audit.failedOpen, true);
+    assert.equal(audit.provenance, "auto-capture-regex-fallback");
+    assert.match(audit.error, /vector store unavailable/);
+  });
+
+  it("omits the fail-open audit when auditMetadata persistence is off", async () => {
+    const controller = { async evaluate() { throw new Error("vector store unavailable"); } };
+    const result = await gateRegexFallbackCapture({
+      ...baseParams,
+      admissionController: controller,
+      attachAudit: false,
+    });
+    assert.equal(result.admit, true);
+    assert.equal(result.auditJson, undefined);
   });
 });

@@ -3974,12 +3974,24 @@ const memoryLanceDBProPlugin = {
               // regex fallback (which stores text verbatim, bypassing the
               // grounding filter and admission control). For history-carrying
               // sessions, roll the cursor back so the next turn's slice
-              // re-includes these texts in the extraction input. Ingress-fed
-              // sessions keep their accumulator advance: their per-turn text
-              // is not recoverable on the next turn by design, and rolling
-              // back would keep the count below the threshold forever.
+              // re-includes these texts in the extraction input. Ingress-fed sessions
+              // keep their accumulator advance instead (rolling the counter back alone
+              // would stall it below threshold forever, since only fresh
+              // message_received events grow it) and re-queue the consumed pending
+              // texts so the actual content, not just the count, survives for the
+              // next turn to pick up. Previously the content was silently discarded
+              // here: only the counter advanced, so by the time it crossed
+              // minMessages on a later turn, every earlier deferred turn's text was
+              // already gone.
               if (pendingIngressTexts.length === 0) {
                 autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+              } else if (conversationKey) {
+                const requeuedIngressTexts = [
+                  ...pendingIngressTexts,
+                  ...(autoCapturePendingIngressTexts.get(conversationKey) || []),
+                ].slice(-6);
+                autoCapturePendingIngressTexts.set(conversationKey, requeuedIngressTexts);
+                pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
               }
               api.logger.debug(
                 `memory-lancedb-pro: auto-capture deferred below-threshold turn for agent ${agentId}; regex fallback skipped (smart extraction enabled)`,
