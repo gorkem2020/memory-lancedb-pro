@@ -279,7 +279,7 @@ async function buildMergePlanContent(deps, members, verdict) {
     for (const idx of verdict.absorbedIndices) {
         const absorbed = members[idx - 1];
         const prompt = buildMergePrompt(abstract, overview, content, absorbed.abstract, absorbed.overview, absorbed.content, survivor.memoryCategory || "preferences");
-        const merged = await deps.completeJson(prompt, "consolidate-merge", CONSOLIDATE_MERGE_SYSTEM_PROMPT);
+        const merged = await deps.completeJson(prompt.user, "consolidate-merge", CONSOLIDATE_MERGE_SYSTEM_PROMPT);
         if (merged) {
             abstract = merged.abstract;
             overview = merged.overview;

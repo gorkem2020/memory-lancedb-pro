@@ -29,6 +29,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         preset: "balanced",
         enabled: false,
         utilityMode: "standalone",
+        modelAffinity: "global",
         weights: DEFAULT_WEIGHTS,
         rejectThreshold: 0.45,
         admitThreshold: 0.6,
@@ -45,6 +46,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         preset: "conservative",
         enabled: false,
         utilityMode: "standalone",
+        modelAffinity: "global",
         weights: {
             utility: 0.16,
             confidence: 0.16,
@@ -74,6 +76,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         preset: "high-recall",
         enabled: false,
         utilityMode: "standalone",
+        modelAffinity: "global",
         weights: {
             utility: 0.08,
             confidence: 0.1,
@@ -206,6 +209,10 @@ export function normalizeAdmissionControlConfig(raw) {
             obj.rejectedAuditFilePath.trim().length > 0
             ? obj.rejectedAuditFilePath.trim()
             : undefined,
+        model: typeof obj.model === "string" && obj.model.trim().length > 0
+            ? obj.model.trim()
+            : undefined,
+        modelAffinity: obj.modelAffinity === "lane" ? "lane" : "global",
     };
 }
 export function resolveRejectedAuditFilePath(dbPath, config) {
@@ -313,22 +320,14 @@ function cosineSimilarity(left, right) {
 }
 /**
  * The admission judge scores solely on what extraction provided (the
- * candidate's own category/abstract/overview/content) plus, elsewhere in
- * AdmissionController, the store's existing rows via the separate
- * non-LLM novelty feature — never on raw conversation/transcript text, so
- * this prompt intentionally carries no conversation excerpt or other
- * source-context blob.
+ * candidate's own category/abstract/overview/content/grounding) plus,
+ * elsewhere in AdmissionController, the store's existing rows via the
+ * separate non-LLM novelty feature — never on raw conversation/transcript
+ * text, so this prompt intentionally carries no conversation excerpt or
+ * other source-context blob.
  */
 function buildUtilityPrompt(candidate) {
-    return `Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
-
-Candidate memory:
-- Category: ${candidate.category}
-- Abstract: ${candidate.abstract}
-- Overview: ${candidate.overview}
-- Content: ${candidate.content}
-- Grounding: ${candidate.grounding ?? "unknown (legacy payload, treat as real)"}
-- Conversation register: ${candidate.conversationRegister ?? "unknown (legacy payload)"}
+    const system = `You are an admission judge. Evaluate whether a candidate memory is worth keeping for future cross-session interactions.
 
 Score future usefulness on a 0.0-1.0 scale.
 
@@ -338,13 +337,32 @@ Use higher scores for durable profile facts, preferences, entity state, patterns
 Use moderate scores for events worth an episodic record.
 Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
 
-Grounding rule: content asserted only inside roleplay, a game, fiction, a hypothetical, or a simulation is not a fact about the real user. If the excerpt shows a constructed frame (game rules, personas, "let's play", "suppose", canon of an invented world) and the candidate's claim lives inside that frame, score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity may still score moderately.
+Grounding rule: this candidate's own grounding tag already passed the deterministic pre-admission check (a "constructed" tag is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If the candidate's own Grounding tag below is "constructed", or its Category/Abstract/Overview/Content otherwise describes such a frame and the claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
+
+--- EXAMPLE (not part of the live data) ---
+Candidate memory:
+- Category: preferences
+- Abstract: User's preferred name is Alex
+
+Example response:
+{"utility": 0.9, "reason": "durable identity fact"}
+--- END EXAMPLE ---
 
 Return JSON only:
 {
   "utility": 0.0,
   "reason": "short explanation"
 }`;
+    const user = `Candidate memory:
+- Category: ${candidate.category}
+- Abstract: ${candidate.abstract}
+
+- Overview: ${candidate.overview.replace(/\n/g, "\n  ")}
+
+- Content: ${candidate.content.replace(/\n/g, "\n  ")}
+- Grounding: ${candidate.grounding ?? "unknown (legacy payload, treat as real)"}
+- Conversation register: ${candidate.conversationRegister ?? "unknown (legacy payload)"}`;
+    return { system, user };
 }
 /** Max candidates scored in a single batch-utility LLM call; larger batches are chunked. */
 const BATCH_UTILITY_MAX_SIZE = 10;
@@ -449,6 +467,53 @@ function parseBatchUtilityResponse(response, expectedCount) {
     }
     return out;
 }
+/**
+ * The admission-control LLM client talks directly to OpenRouter, so it needs
+ * the bare "<vendor>/<model>" id OpenRouter's chat-completions API expects.
+ * Model refs sourced from memoryReflection.model (or an explicit override)
+ * may instead be in the core-style "openrouter/<vendor>/<model>" form the
+ * reflection distiller's own embedded runner accepts — that runner picks a
+ * backend from the leading segment, then forwards the rest as the model id.
+ * Strip that literal "openrouter/" prefix so both forms reach this plugin's
+ * direct client correctly; a bare "<vendor>/<model>" or an "@preset/<name>"
+ * alias already work against OpenRouter unchanged, so they pass through.
+ */
+export function normalizeAdmissionModelRef(modelRef) {
+    const trimmed = modelRef.trim();
+    const idx = trimmed.indexOf("/");
+    if (idx <= 0)
+        return trimmed;
+    const provider = trimmed.slice(0, idx).trim().toLowerCase();
+    if (provider !== "openrouter")
+        return trimmed;
+    const rest = trimmed.slice(idx + 1).trim();
+    return rest || trimmed;
+}
+/**
+ * Resolves which LLM model an admission call should use, in order:
+ * 1. An explicit admissionControl.model override always wins, on every lane.
+ * 2. When modelAffinity is "lane", the reflection lane resolves the
+ *    memoryReflection model (falling back to the global model if none is
+ *    configured) — the judge is never dumber than the author whose rows it
+ *    audits. Every other lane stays on the global model.
+ * 3. Default ("global", or the knob absent): every lane uses the global
+ *    model — today's behavior, unchanged.
+ * Every returned model passes through normalizeAdmissionModelRef so a
+ * core-style provider-prefixed string reaches this plugin's OpenRouter-direct
+ * client in the form it requires, regardless of which of the three paths
+ * above produced it.
+ */
+export function resolveAdmissionModel(params) {
+    const explicit = params.admissionControl.model?.trim();
+    if (explicit) {
+        return normalizeAdmissionModelRef(explicit);
+    }
+    if (params.admissionControl.modelAffinity === "lane" && params.lane === "reflection") {
+        const reflectionModel = params.reflectionModel?.trim();
+        return normalizeAdmissionModelRef(reflectionModel || params.globalModel);
+    }
+    return normalizeAdmissionModelRef(params.globalModel);
+}
 function buildReason(details) {
     const scoreText = details.score.toFixed(3);
     const similarityText = details.maxSimilarity.toFixed(3);
@@ -544,7 +609,8 @@ async function scoreUtility(llm, mode, candidate) {
     }
     let response = null;
     try {
-        response = await llm.completeJson(buildUtilityPrompt(candidate), "admission-utility");
+        const { system, user } = buildUtilityPrompt(candidate);
+        response = await llm.completeJson(user, "admission-utility", system);
     }
     catch {
         return { score: 0.5, reason: "Utility scoring failed" };
@@ -579,7 +645,10 @@ export class AdmissionController {
         this.config = config;
         this.debugLog = debugLog;
     }
-    rejectConstructedDurable(candidate, now) {
+    isConstructed(candidate) {
+        return candidate.grounding === "constructed";
+    }
+    rejectConstructed(candidate, now) {
         const featureScores = {
             utility: 0,
             confidence: 0,
@@ -587,7 +656,7 @@ export class AdmissionController {
             recency: 0,
             typePrior: 0,
         };
-        const reason = `Admission rejected (constructed-grounding candidate targeting durable category "${candidate.category}"; deterministic pre-admission short-circuit, no LLM call).`;
+        const reason = `Admission rejected (constructed-grounding candidate category "${candidate.category}"; deterministic pre-admission short-circuit, no LLM call).`;
         const audit = {
             version: "amac-v1",
             decision: "reject",
@@ -606,7 +675,7 @@ export class AdmissionController {
             grounding: candidate.grounding,
             conversation_register: candidate.conversationRegister,
         };
-        this.debugLog(`memory-lancedb-pro: admission-control: decision=reject (constructed durable short-circuit) candidate=${JSON.stringify(candidate.abstract.slice(0, 80))}`);
+        this.debugLog(`memory-lancedb-pro: admission-control: decision=reject (constructed short-circuit) candidate=${JSON.stringify(candidate.abstract.slice(0, 80))}`);
         return { decision: "reject", audit };
     }
     async loadRelevantMatches(candidate, candidateVector, scopeFilter) {
@@ -624,6 +693,9 @@ export class AdmissionController {
         return sameCategoryMatches.length > 0 ? sameCategoryMatches : rawMatches;
     }
     async evaluate(params) {
+        if (this.isConstructed(params.candidate)) {
+            return this.rejectConstructed(params.candidate, params.now ?? Date.now());
+        }
         const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate);
         return this.evaluateWithUtility(params, utility);
     }
@@ -637,13 +709,13 @@ export class AdmissionController {
     async evaluateWithUtility(params, utility) {
         const now = params.now ?? Date.now();
         // Deterministic pre-admission short-circuit: a candidate tagged
-        // "constructed" must never occupy a durable register, no matter how any
-        // downstream score would blend. Reject before any LLM call. Candidates
-        // without grounding metadata (legacy payloads) fall through to normal
-        // scoring.
-        if (params.candidate.grounding === "constructed" &&
-            DURABLE_CATEGORIES.has(params.candidate.category)) {
-            return this.rejectConstructedDurable(params.candidate, now);
+        // "constructed" is true only within the fiction, never about the real
+        // world — it must never be stored, in any category or register, no
+        // matter how any downstream score would blend. Reject before any LLM
+        // call. Candidates without grounding metadata (legacy payloads) fall
+        // through to normal scoring.
+        if (this.isConstructed(params.candidate)) {
+            return this.rejectConstructed(params.candidate, now);
         }
         const relevantMatches = await this.loadRelevantMatches(params.candidate, params.candidateVector, params.scopeFilter);
         const confidence = scoreConfidenceSupport(params.candidate, params.conversationText);
@@ -741,10 +813,22 @@ export class AdmissionController {
             }
             return out;
         }
-        const utilities = await this.scoreUtilityBatch(chunk.map((item) => item.candidate));
-        const out = [];
-        for (let i = 0; i < chunk.length; i++) {
-            out.push(await this.evaluateWithUtility(chunk[i], utilities[i]));
+        // Deterministic pre-admission short-circuit applies before the batch
+        // LLM call too: a constructed candidate never spends a slot in the batch
+        // (or a standalone call), it rejects instantly.
+        const now = Date.now();
+        const out = chunk.map((item) => this.isConstructed(item.candidate)
+            ? this.rejectConstructed(item.candidate, item.now ?? now)
+            : null);
+        const scorable = chunk
+            .map((item, i) => ({ item, i }))
+            .filter(({ i }) => out[i] === null);
+        if (scorable.length > 0) {
+            const utilities = await this.scoreUtilityBatch(scorable.map(({ item }) => item.candidate));
+            for (let j = 0; j < scorable.length; j++) {
+                const { item, i } = scorable[j];
+                out[i] = await this.evaluateWithUtility(item, utilities[j]);
+            }
         }
         return out;
     }
@@ -761,7 +845,7 @@ export class AdmissionController {
         const { system, user } = buildBatchUtilityPrompt(candidates);
         let response = null;
         try {
-            response = await this.llm.completeJson(`${system}\n\n${user}`, "admission-utility-batch");
+            response = await this.llm.completeJson(user, "admission-utility-batch", system);
         }
         catch {
             // Candidate count is included on both this line and the success line

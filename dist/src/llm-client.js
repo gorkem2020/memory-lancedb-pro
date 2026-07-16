@@ -4,7 +4,6 @@
  */
 import OpenAI from "openai";
 import { buildOauthEndpoint, extractOutputTextFromSse, loadOAuthSession, needsRefresh, normalizeOauthModel, refreshOAuthSession, saveOAuthSession, } from "./llm-oauth.js";
-const DEFAULT_SYSTEM_PROMPT = "You are a memory extraction assistant. Always respond with valid JSON only.";
 /**
  * Strips a core-style provider prefix (e.g. "openrouter/anthropic/claude-...")
  * down to the bare "<vendor>/<model>" form a direct OpenRouter-compatible API
@@ -24,6 +23,7 @@ export function normalizeDirectModelRef(modelRef) {
     const rest = trimmed.slice(idx + 1).trim();
     return rest || trimmed;
 }
+const DEFAULT_SYSTEM_PROMPT = "You are a memory extraction assistant. Always respond with valid JSON only.";
 /**
  * Default reasoning effort sent on the host transport when llm.thinkLevel
  * (or its deprecated llm.reasoningEffort alias) is not configured. "medium"
@@ -227,7 +227,7 @@ function raceWithTimeout(promise, timeoutMs) {
 function createHostClient(config, runtimeLlmComplete, log, warnLog) {
     let lastError = null;
     return {
-        async completeJson(prompt, label = "generic", systemPrompt) {
+        async completeJson(prompt, label = "generic", systemPrompt, temperature) {
             lastError = null;
             try {
                 const result = await raceWithTimeout(runtimeLlmComplete({
@@ -240,7 +240,7 @@ function createHostClient(config, runtimeLlmComplete, log, warnLog) {
                         { role: "user", content: prompt },
                     ],
                     model: config.model,
-                    temperature: 0.1,
+                    temperature: temperature ?? 0.1,
                     purpose: `memory-lancedb-pro:${label}`,
                     reasoning: config.thinkLevel?.trim() || DEFAULT_HOST_REASONING_EFFORT,
                 }), config.timeoutMs);
@@ -305,7 +305,7 @@ function createApiKeyClient(config, log, warnLog) {
     });
     let lastError = null;
     return {
-        async completeJson(prompt, label = "generic", systemPrompt) {
+        async completeJson(prompt, label = "generic", systemPrompt, temperature) {
             lastError = null;
             try {
                 const request = {
@@ -317,7 +317,7 @@ function createApiKeyClient(config, log, warnLog) {
                         },
                         { role: "user", content: prompt },
                     ],
-                    temperature: 0.1,
+                    temperature: temperature ?? 0.1,
                     ...(config.thinkLevel?.trim()
                         ? { reasoning: { effort: config.thinkLevel.trim() } }
                         : {}),
@@ -417,7 +417,7 @@ function createOauthClient(config, log, warnLog) {
         return session;
     }
     return {
-        async completeJson(prompt, label = "generic", systemPrompt) {
+        async completeJson(prompt, label = "generic", systemPrompt, _temperature) {
             lastError = null;
             try {
                 const session = await getSession();

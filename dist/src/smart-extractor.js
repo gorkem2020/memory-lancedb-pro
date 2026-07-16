@@ -6,8 +6,8 @@
  *
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, } from "./extraction-prompts.js";
-import { AdmissionController, } from "./admission-control.js";
-import { ALWAYS_MERGE_CATEGORIES, DURABLE_CATEGORIES, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
+import { formatConversationTranscript, } from "./auto-capture-cleanup.js";
+import { ALWAYS_MERGE_CATEGORIES, DURABLE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
 import { isUserMdExclusiveMemory, } from "./workspace-boundary.js";
@@ -224,10 +224,7 @@ export class SmartExtractor {
                 config.admissionControl.auditMetadata !== false;
         this.onAdmissionRejected = config.onAdmissionRejected;
         this.onPersisted = config.onPersisted;
-        this.admissionController =
-            config.admissionControl?.enabled === true
-                ? new AdmissionController(this.store, this.llm, config.admissionControl, this.debugLog)
-                : null;
+        this.admissionController = config.admissionController ?? null;
     }
     /**
      * Expose the admission controller so sibling write paths (reflection
@@ -284,7 +281,7 @@ export class SmartExtractor {
             return stats;
         }
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText, policyMode);
+        const extraction = await this.extractCandidates(conversationText, policyMode, options.assistantContextTexts, options.conversationTurns);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
@@ -579,19 +576,31 @@ export class SmartExtractor {
     // Step 1: LLM Extraction
     // --------------------------------------------------------------------------
     /**
-     * Call LLM to extract candidate memories from conversation text.
+     * Call LLM to extract candidate memories from conversation text. Assembles
+     * the single interleaved conversation-turns transcript: `conversationTurns`
+     * (oldest-first, real per-message roles) when the caller has them, else a
+     * fallback of one user turn from `conversationText` followed by
+     * `assistantContextTexts` as trailing assistant turns. Assistant turns are
+     * context only -- the extractor must never source a candidate from one
+     * directly (enforced by prompt instruction, not a deterministic gate).
      */
-    async extractCandidates(conversationText, policyMode = "full") {
+    async extractCandidates(conversationText, policyMode = "full", assistantContextTexts, conversationTurns) {
         const maxChars = this.config.extractMaxChars ?? 8000;
-        const truncated = conversationText.length > maxChars
-            ? conversationText.slice(-maxChars)
-            : conversationText;
+        const user = this.config.user ?? "User";
         // Strip platform envelope metadata injected by OpenClaw channels
         // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
         // These pollute extraction if treated as conversation content.
-        const cleaned = stripEnvelopeMetadata(truncated);
-        const user = this.config.user ?? "User";
-        const { system, user: userPrompt } = buildExtractionPrompt(cleaned, user);
+        const turns = conversationTurns
+            ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
+            : [
+                ...(conversationText
+                    ? [{ role: "user", text: stripEnvelopeMetadata(conversationText) }]
+                    : []),
+                ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant", text })),
+            ];
+        const rawTranscript = formatConversationTranscript(turns, user);
+        const transcript = rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
+        const { system, user: userPrompt } = buildExtractionPrompt(transcript, user);
         const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");
@@ -619,7 +628,6 @@ export class SmartExtractor {
         let policyDroppedCount = 0;
         let constructedDroppedCount = 0;
         let fictionRegisterDroppedCount = 0;
-        let constructedEpisodicUsed = false;
         let batchHasConstructedTag = false;
         for (const raw of result.memories) {
             if (!raw || typeof raw !== "object") {
@@ -654,46 +662,33 @@ export class SmartExtractor {
                 this.debugLog(`memory-lancedb-pro: smart-extractor: dropping candidate due to episodic-only extraction policy category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
                 continue;
             }
-            // Option A: grounding-aware register filter. Missing/non-string/unrecognized
+            // Option A / v3: grounding-aware filter. Missing/non-string/unrecognized
             // per-item values fail open to "real" so a model that ignores the field
-            // can't break extraction. Constructed content (games, roleplay, fiction,
-            // hypotheticals, sample data) never becomes a durable profile/preferences/
-            // entities/cases/patterns memory; at most one constructed "events" note per
-            // extraction records that the real participants did the activity.
+            // can't break extraction. Grounding describes the truth-grounding of the
+            // ASSERTION itself: "real" includes an assertion ABOUT a fiction/game
+            // session (e.g. that it happened); "constructed" is a claim true only
+            // WITHIN the fiction. A constructed-tagged candidate is never stored,
+            // in any category or register — there is no per-extraction cap anymore.
             const rawGrounding = typeof raw.grounding === "string" ? raw.grounding.toLowerCase().trim() : "";
             const grounding = rawGrounding === "constructed" ? "constructed" : "real";
             if (rawGrounding === "constructed") {
                 batchHasConstructedTag = true;
             }
-            if (conversationRegister === "fiction") {
-                // Register enforcement: an in-fiction batch can never produce durable
-                // memories, whatever the per-item self-tags claim (the per-item tags
-                // are exactly the wobble the batch register exists to override), and
-                // keeps at most one session-scoped events note.
-                if (DURABLE_CATEGORIES.has(category)) {
-                    fictionRegisterDroppedCount++;
-                    this.debugLog(`memory-lancedb-pro: smart-extractor: dropping durable candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
-                    continue;
-                }
-                if (constructedEpisodicUsed) {
-                    fictionRegisterDroppedCount++;
-                    this.debugLog(`memory-lancedb-pro: smart-extractor: dropping extra events candidate from fiction-register batch (cap 1 per extraction) abstract=${JSON.stringify(abstract.slice(0, 120))}`);
-                    continue;
-                }
-                constructedEpisodicUsed = true;
+            // Register enforcement: an in-fiction batch can never produce durable
+            // memories, whatever the per-item self-tags claim (the per-item tags
+            // are exactly the wobble the batch register exists to override).
+            if (conversationRegister === "fiction" && DURABLE_CATEGORIES.has(category)) {
+                fictionRegisterDroppedCount++;
+                this.debugLog(`memory-lancedb-pro: smart-extractor: dropping durable candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
+                continue;
             }
-            else if (grounding === "constructed") {
-                if (category !== "events") {
-                    constructedDroppedCount++;
-                    this.debugLog(`memory-lancedb-pro: smart-extractor: dropping constructed-grounding candidate outside events category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
-                    continue;
-                }
-                if (constructedEpisodicUsed) {
-                    constructedDroppedCount++;
-                    this.debugLog(`memory-lancedb-pro: smart-extractor: dropping extra constructed-grounding events candidate (cap 1 per extraction) abstract=${JSON.stringify(abstract.slice(0, 120))}`);
-                    continue;
-                }
-                constructedEpisodicUsed = true;
+            // Grounding enforcement: a constructed assertion is true only within
+            // the fiction, never about the real world — never stored, regardless
+            // of category or register.
+            if (grounding === "constructed") {
+                constructedDroppedCount++;
+                this.debugLog(`memory-lancedb-pro: smart-extractor: dropping constructed-grounding candidate category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
+                continue;
             }
             candidates.push({ category, abstract, overview, content, grounding, conversationRegister });
         }
@@ -1337,23 +1332,17 @@ export class SmartExtractor {
     /**
      * Map 6-category to existing 5-category store type for backward compatibility.
      */
+    /**
+     * Map a smart register onto its legacy storage category, delegating to the
+     * shared SMART_TO_STORAGE_CATEGORY constant (memory-categories) so the
+     * mapping has a single source of truth. Note: "reflection" is a legacy
+     * storage category minted only by the reflection writer and is deliberately
+     * absent from this map; smart extraction never produces reflection rows.
+     * The "other" fallback covers non-union values arriving from untyped
+     * callers at runtime, matching the old switch's default arm.
+     */
     mapToStoreCategory(category) {
-        switch (category) {
-            case "profile":
-                return "fact";
-            case "preferences":
-                return "preference";
-            case "entities":
-                return "entity";
-            case "events":
-                return "decision";
-            case "cases":
-                return "fact";
-            case "patterns":
-                return "other";
-            default:
-                return "other";
-        }
+        return getStorageCategoryForMemoryCategory(category) ?? "other";
     }
     /**
      * Get default importance score by category.
