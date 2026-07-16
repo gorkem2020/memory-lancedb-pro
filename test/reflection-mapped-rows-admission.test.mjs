@@ -304,10 +304,10 @@ describe("buildReflectionPrompt grounding discipline", () => {
     assert.equal(typeof buildReflectionPrompt, "function", "buildReflectionPrompt must be exported for prompt-content tests");
     const prompt = buildReflectionPrompt("conversation text", 4000, []);
 
-    assert.match(prompt, /roleplay/i);
-    assert.match(prompt, /not real/i);
+    assert.match(prompt.system, /roleplay/i);
+    assert.match(prompt.system, /not real/i);
     assert.match(
-      prompt,
+      prompt.system,
       /must NEVER appear under Decisions \(durable\), User model deltas, Agent model deltas, or Lessons & pitfalls/,
       "the rule must name the four mapped sections verbatim",
     );

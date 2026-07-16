@@ -33,7 +33,7 @@ export type AdmissionControlPreset =
 export interface AdmissionControlConfig {
   preset: AdmissionControlPreset;
   enabled: boolean;
-  utilityMode: "standalone" | "off";
+  utilityMode: "standalone" | "off" | "batch";
   weights: AdmissionWeights;
   rejectThreshold: number;
   admitThreshold: number;
@@ -310,7 +310,9 @@ export function normalizeAdmissionControlConfig(raw: unknown): AdmissionControlC
         ? "off"
         : obj.utilityMode === "standalone"
           ? "standalone"
-          : base.utilityMode,
+          : obj.utilityMode === "batch"
+            ? "batch"
+            : base.utilityMode,
     weights: normalizeWeights(obj.weights, base.weights),
     rejectThreshold,
     admitThreshold: normalizedAdmit,
@@ -462,19 +464,15 @@ function cosineSimilarity(left: number[], right: number[]): number {
   return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 }
 
-/** Where the excerpt shown to the admission judge came from. */
-export type AdmissionSourceKind = "conversation" | "reflection";
-
-function buildUtilityPrompt(
-  candidate: CandidateMemory,
-  conversationText: string,
-  sourceKind: AdmissionSourceKind = "conversation",
-): { system: string; user: string } {
-  const excerpt =
-    conversationText.length > 3000
-      ? conversationText.slice(-3000)
-      : conversationText;
-
+/**
+ * The admission judge scores solely on what extraction provided (the
+ * candidate's own category/abstract/overview/content/grounding) plus,
+ * elsewhere in AdmissionController, the store's existing rows via the
+ * separate non-LLM novelty feature — never on raw conversation/transcript
+ * text, so this prompt intentionally carries no conversation excerpt or
+ * other source-context blob.
+ */
+function buildUtilityPrompt(candidate: CandidateMemory): { system: string; user: string } {
   const system = `You are an admission judge. Evaluate whether a candidate memory is worth keeping for future cross-session interactions.
 
 Score future usefulness on a 0.0-1.0 scale.
@@ -485,7 +483,7 @@ Use higher scores for durable profile facts, preferences, entity state, patterns
 Use moderate scores for events worth an episodic record.
 Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
 
-Grounding rule: content asserted only inside roleplay, a game, fiction, a hypothetical, or a simulation is not a fact about the real user. If the excerpt shows a constructed frame (game rules, personas, "let's play", "suppose", canon of an invented world) and the candidate's claim lives inside that frame, score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity may still score moderately.
+Grounding rule: content asserted only inside roleplay, a game, fiction, a hypothetical, or a simulation is not a fact about the real user. If the candidate's own Grounding tag below is "constructed", or its Category/Abstract/Overview/Content otherwise describes such a frame (game rules, personas, "let's play", "suppose", canon of an invented world), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity may still score moderately.
 
 --- EXAMPLE (not part of the live data) ---
 Candidate memory:
@@ -502,15 +500,7 @@ Return JSON only:
   "reason": "short explanation"
 }`;
 
-  const excerptHeading =
-    sourceKind === "reflection"
-      ? "Source document (agent reflection):"
-      : "Conversation excerpt:";
-
-  const user = `${excerptHeading}
-${excerpt}
-
-Candidate memory:
+  const user = `Candidate memory:
 - Category: ${candidate.category}
 - Abstract: ${candidate.abstract}
 
@@ -521,6 +511,126 @@ Candidate memory:
 - Conversation register: ${candidate.conversationRegister ?? "unknown (legacy payload)"}`;
 
   return { system, user };
+}
+
+/** Max candidates scored in a single batch-utility LLM call; larger batches are chunked. */
+const BATCH_UTILITY_MAX_SIZE = 10;
+
+interface BatchUtilityResponse {
+  results?: Array<{ index?: number; utility?: number; reason?: string }>;
+}
+
+/**
+ * Builds the batch-utility prompt as {system, user} so the eventual merge
+ * with the system/user prompt-architecture split is mechanical: on this
+ * branch the two are concatenated before the single-string completeJson()
+ * call, since that split hasn't landed here yet.
+ *
+ * Like buildUtilityPrompt, this intentionally carries no conversation
+ * excerpt or other source-context blob — the admission judge scores solely
+ * on what extraction provided for each candidate (category/abstract/
+ * overview/content) plus, elsewhere in AdmissionController, the store's
+ * existing rows via the non-LLM novelty feature.
+ *
+ * Formatting: every logical block (intro, scoring guidance, the few-shot
+ * example, the return-format spec) is blank-line separated, candidates
+ * within the example and within the live batch are blank-line separated
+ * from each other, and each candidate's multi-line fields are indented
+ * under its numbered line — this keeps the few-shot example and the live
+ * batch visually consistent, and both easy to scan for a multi-candidate
+ * batch.
+ */
+function buildBatchUtilityPrompt(
+  candidates: CandidateMemory[],
+): { system: string; user: string } {
+  const system = `You are an admission judge. Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
+
+Score each candidate's future usefulness independently on a 0.0-1.0 scale. Score every item on its own absolute merit — do not rank or curve candidates relative to each other within this batch; a batch of entirely weak candidates should all score low, and a batch of entirely strong candidates should all score high.
+
+Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
+Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
+
+--- EXAMPLE (not your current batch) ---
+Example of absolute scoring across a mixed-quality batch:
+
+Candidates:
+
+1. Category: preferences — "User's preferred name is Alex"
+
+2. Category: events — "User said hello"
+
+3. Category: entities — "The project uses PostgreSQL as its primary datastore"
+
+Example response:
+{"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}
+
+Candidate 2 scores low even though candidates 1 and 3 score high in the same batch: each item is judged on its own merit, never curved against its neighbors.
+--- END EXAMPLE ---
+
+Return JSON only, with exactly one entry per candidate, in this shape:
+{
+  "results": [
+    { "index": 1, "utility": 0.0, "reason": "short explanation" }
+  ]
+}`;
+
+  const candidateBlocks = candidates
+    .map((candidate, i) => {
+      const n = i + 1;
+      return `${n}. Category: ${candidate.category}
+   Abstract: ${candidate.abstract}
+   Overview: ${candidate.overview}
+   Content: ${candidate.content}`;
+    })
+    .join("\n\n");
+
+  const user = `Candidates:
+
+${candidateBlocks}`;
+
+  return { system, user };
+}
+
+/** Reason used for a batch row whose response entry is missing or malformed. */
+const MALFORMED_BATCH_ENTRY_REASON = "Malformed batch entry: no usable response for this candidate";
+
+/**
+ * Maps a batch-utility response back to per-candidate scores in input order,
+ * always returning exactly `expectedCount` entries — one per candidate,
+ * never null. A response that is missing entirely, isn't shaped as
+ * `{results: [...]}`, or omits/duplicates/misindexes a given candidate's
+ * entry degrades that ROW ONLY, defaulting it to a neutral 0.5 utility
+ * (mirroring scoreUtility's own failure default); every other row still
+ * uses its real parsed score. This keeps the batch call count exactly
+ * ceil(N/BATCH_UTILITY_MAX_SIZE) even when part of a response comes back
+ * malformed — a single bad entry must never fan back out into one
+ * standalone LLM call per candidate in the chunk.
+ */
+function parseBatchUtilityResponse(
+  response: BatchUtilityResponse | null,
+  expectedCount: number,
+): Array<{ score: number; reason?: string }> {
+  const results = response && Array.isArray(response.results) ? response.results : [];
+
+  const byIndex = new Map<number, { utility?: number; reason?: string }>();
+  for (const entry of results) {
+    if (!entry || typeof entry.index !== "number") continue;
+    byIndex.set(entry.index, entry);
+  }
+
+  const out: Array<{ score: number; reason?: string }> = [];
+  for (let i = 1; i <= expectedCount; i++) {
+    const entry = byIndex.get(i);
+    if (!entry) {
+      out.push({ score: 0.5, reason: MALFORMED_BATCH_ENTRY_REASON });
+      continue;
+    }
+    out.push({
+      score: clamp01(entry.utility, 0.5),
+      reason: typeof entry.reason === "string" ? entry.reason.trim() : undefined,
+    });
+  }
+  return out;
 }
 
 function buildReason(details: {
@@ -659,8 +769,6 @@ async function scoreUtility(
   llm: LlmClient,
   mode: AdmissionControlConfig["utilityMode"],
   candidate: CandidateMemory,
-  conversationText: string,
-  sourceKind: AdmissionSourceKind = "conversation",
 ): Promise<{ score: number; reason?: string }> {
   if (mode === "off") {
     return { score: 0.5, reason: "Utility scoring disabled" };
@@ -668,7 +776,7 @@ async function scoreUtility(
 
   let response: { utility?: number; reason?: string } | null = null;
   try {
-    const { system, user } = buildUtilityPrompt(candidate, conversationText, sourceKind);
+    const { system, user } = buildUtilityPrompt(candidate);
     response = await llm.completeJson<{ utility?: number; reason?: string }>(
       user,
       "admission-utility",
@@ -712,6 +820,10 @@ export class AdmissionController {
     private readonly config: AdmissionControlConfig,
     private readonly debugLog: (msg: string) => void = () => {},
   ) {}
+
+  private isConstructedDurable(candidate: CandidateMemory): boolean {
+    return candidate.grounding === "constructed" && DURABLE_CATEGORIES.has(candidate.category);
+  }
 
   private rejectConstructedDurable(
     candidate: CandidateMemory,
@@ -783,9 +895,31 @@ export class AdmissionController {
     conversationText: string;
     scopeFilter: string[];
     now?: number;
-    /** Honest framing for the excerpt shown to the admission judge. Defaults to "conversation". */
-    sourceKind?: AdmissionSourceKind;
   }): Promise<AdmissionEvaluation> {
+    if (this.isConstructedDurable(params.candidate)) {
+      return this.rejectConstructedDurable(params.candidate, params.now ?? Date.now());
+    }
+    const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate);
+    return this.evaluateWithUtility(params, utility);
+  }
+
+  /**
+   * Evaluate a single candidate given an already-scored utility feature.
+   * Shared by evaluate() (per-candidate utility scoring) and evaluateBatch()
+   * (utility scored once for the whole batch) — every other feature
+   * (confidence/novelty/recency/typePrior) and the decision/audit logic stay
+   * identical between the two paths.
+   */
+  private async evaluateWithUtility(
+    params: {
+      candidate: CandidateMemory;
+      candidateVector: number[];
+      conversationText: string;
+      scopeFilter: string[];
+      now?: number;
+    },
+    utility: { score: number; reason?: string },
+  ): Promise<AdmissionEvaluation> {
     const now = params.now ?? Date.now();
 
     // Deterministic pre-admission short-circuit: a candidate tagged
@@ -793,10 +927,7 @@ export class AdmissionController {
     // downstream score would blend. Reject before any LLM call. Candidates
     // without grounding metadata (legacy payloads) fall through to normal
     // scoring.
-    if (
-      params.candidate.grounding === "constructed" &&
-      DURABLE_CATEGORIES.has(params.candidate.category)
-    ) {
+    if (this.isConstructedDurable(params.candidate)) {
       return this.rejectConstructedDurable(params.candidate, now);
     }
 
@@ -806,13 +937,6 @@ export class AdmissionController {
       params.scopeFilter,
     );
 
-    const utility = await scoreUtility(
-      this.llm,
-      this.config.utilityMode,
-      params.candidate,
-      params.conversationText,
-      params.sourceKind ?? "conversation",
-    );
     const confidence = scoreConfidenceSupport(params.candidate, params.conversationText);
     const novelty = scoreNoveltyFromMatches(params.candidateVector, relevantMatches);
     const recency = scoreRecencyGap(now, relevantMatches, this.config.recency.halfLifeDays);
@@ -876,5 +1000,134 @@ export class AdmissionController {
     );
 
     return { decision, hint, audit };
+  }
+
+  /**
+   * Evaluate a batch of candidates that share one conversation/source
+   * excerpt, scoring utility with exactly one LLM call per chunk of up to
+   * BATCH_UTILITY_MAX_SIZE candidates (chunking larger batches) — this call
+   * count holds regardless of caller (extraction lane today; any other lane,
+   * e.g. reflection-mapped rows, that constructs its own AdmissionController
+   * and calls evaluateBatch composes into the same guarantee with no further
+   * changes here). Every other feature (confidence/novelty/recency/
+   * typePrior) and the decision/audit logic remain fully per-candidate,
+   * unchanged from evaluate().
+   *
+   * When utilityMode isn't "batch", falls back to one standalone evaluate()
+   * call per candidate in that chunk. When utilityMode is "batch" but the
+   * completeJson call itself throws, the same per-candidate standalone
+   * fallback applies for that chunk. A response that comes back but is
+   * partially malformed (missing/misindexed entries for specific
+   * candidates) never fans out into extra calls: parseBatchUtilityResponse
+   * degrades only the affected rows to a neutral default, so a malformed
+   * entry drops only that row's utility score, not the whole chunk's call
+   * budget.
+   */
+  async evaluateBatch(
+    items: Array<{
+      candidate: CandidateMemory;
+      candidateVector: number[];
+      conversationText: string;
+      scopeFilter: string[];
+      now?: number;
+    }>,
+  ): Promise<AdmissionEvaluation[]> {
+    if (items.length === 0) return [];
+
+    const chunks: (typeof items)[] = [];
+    for (let i = 0; i < items.length; i += BATCH_UTILITY_MAX_SIZE) {
+      chunks.push(items.slice(i, i + BATCH_UTILITY_MAX_SIZE));
+    }
+
+    const results: AdmissionEvaluation[] = [];
+    for (const chunk of chunks) {
+      results.push(...(await this.evaluateChunk(chunk)));
+    }
+    return results;
+  }
+
+  private async evaluateChunk(
+    chunk: Array<{
+      candidate: CandidateMemory;
+      candidateVector: number[];
+      conversationText: string;
+      scopeFilter: string[];
+      now?: number;
+    }>,
+  ): Promise<AdmissionEvaluation[]> {
+    if (this.config.utilityMode !== "batch") {
+      const out: AdmissionEvaluation[] = [];
+      for (const item of chunk) {
+        out.push(await this.evaluate(item));
+      }
+      return out;
+    }
+
+    // Deterministic pre-admission short-circuit applies before the batch
+    // LLM call too: a constructed-durable candidate never spends a slot in
+    // the batch (or a standalone call), it rejects instantly.
+    const now = Date.now();
+    const out: (AdmissionEvaluation | null)[] = chunk.map((item) =>
+      this.isConstructedDurable(item.candidate)
+        ? this.rejectConstructedDurable(item.candidate, item.now ?? now)
+        : null,
+    );
+
+    const scorable = chunk
+      .map((item, i) => ({ item, i }))
+      .filter(({ i }) => out[i] === null);
+
+    if (scorable.length > 0) {
+      const utilities = await this.scoreUtilityBatch(scorable.map(({ item }) => item.candidate));
+      for (let j = 0; j < scorable.length; j++) {
+        const { item, i } = scorable[j];
+        out[i] = await this.evaluateWithUtility(item, utilities[j]);
+      }
+    }
+
+    return out as AdmissionEvaluation[];
+  }
+
+  /**
+   * Scores utility for one chunk with a single LLM call. Only a call-level
+   * failure (the completeJson call itself throwing, e.g. a network error)
+   * falls back to one standalone evaluate() per candidate — a genuinely
+   * empty response for the whole chunk. A response that comes back but is
+   * partially malformed (missing/misindexed entries) never triggers that
+   * fallback: parseBatchUtilityResponse degrades only the affected rows, so
+   * the call count for this chunk is always exactly one either way.
+   */
+  private async scoreUtilityBatch(
+    candidates: CandidateMemory[],
+  ): Promise<Array<{ score: number; reason?: string }>> {
+    const { system, user } = buildBatchUtilityPrompt(candidates);
+    let response: BatchUtilityResponse | null = null;
+    try {
+      response = await this.llm.completeJson<BatchUtilityResponse>(
+        user,
+        "admission-utility-batch",
+        system,
+      );
+    } catch {
+      // Candidate count is included on both this line and the success line
+      // below so a flow-accounting audit reading logs can tally batch-call
+      // volume the same way regardless of outcome, and so a second
+      // evaluateBatch call-site (e.g. a future reflection-lane controller,
+      // composed at assembly per item 3) attributes cleanly through
+      // whatever debugLog prefix that lane's own construction site injects.
+      this.debugLog(
+        `memory-lancedb-pro: admission-control: batch utility call failed for ${candidates.length} candidates, falling back to standalone`,
+      );
+      const out: Array<{ score: number; reason?: string }> = [];
+      for (const candidate of candidates) {
+        out.push(await scoreUtility(this.llm, "standalone", candidate));
+      }
+      return out;
+    }
+
+    this.debugLog(
+      `memory-lancedb-pro: admission-control: batch utility call scored ${candidates.length} candidates in one call`,
+    );
+    return parseBatchUtilityResponse(response, candidates.length);
   }
 }

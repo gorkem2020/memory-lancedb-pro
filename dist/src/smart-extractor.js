@@ -360,11 +360,38 @@ export class SmartExtractor {
                 this.log(`memory-pro: smart-extractor: batch pre-embed failed, will embed individually: ${String(err)}`);
             }
         }
+        // When utilityMode is "batch", score admission utility for every
+        // non-profile candidate in this extraction up front, with one LLM call
+        // per chunk of up to 10 candidates, instead of one call per candidate
+        // inside the sequential processCandidate loop below. Profile candidates
+        // are excluded: they run their own admission check inside
+        // handleProfileMerge, unaffected by batching.
+        const precomputedAdmissions = new Map();
+        if (this.admissionController && this.config.admissionControl?.utilityMode === "batch") {
+            const batchable = processableCandidates.filter(({ candidate }) => !ALWAYS_MERGE_CATEGORIES.has(candidate.category));
+            if (batchable.length > 0) {
+                const batchItems = batchable.map(({ index, candidate }) => ({
+                    candidate,
+                    candidateVector: precomputedVectors.get(index) ?? [],
+                    conversationText,
+                    scopeFilter: scopeFilter ?? [targetScope],
+                }));
+                try {
+                    const evaluations = await this.admissionController.evaluateBatch(batchItems);
+                    batchable.forEach(({ index }, i) => {
+                        precomputedAdmissions.set(index, evaluations[i]);
+                    });
+                }
+                catch (err) {
+                    this.log(`memory-pro: smart-extractor: batch admission evaluation failed, falling back to per-candidate: ${String(err)}`);
+                }
+            }
+        }
         const createEntries = [];
         const pendingSupersedeInvalidations = [];
         for (const { index, candidate } of processableCandidates) {
             try {
-                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries, pendingSupersedeInvalidations, agentId);
+                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries, pendingSupersedeInvalidations, agentId, precomputedAdmissions.get(index));
             }
             catch (err) {
                 this.log(`memory-pro: smart-extractor: failed to process candidate [${candidate.category}]: ${String(err)}`);
@@ -698,8 +725,11 @@ export class SmartExtractor {
      * @param precomputedVector - Optional pre-embedded vector for the candidate.
      *   When provided (from batch pre-embedding), skips the per-candidate embed
      *   call to reduce API round-trips.
+     * @param precomputedAdmission - Optional pre-scored admission evaluation
+     *   (from batch utility mode). When provided, skips the per-candidate
+     *   admissionController.evaluate() call below.
      */
-    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries, pendingSupersedeInvalidations, agentId) {
+    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries, pendingSupersedeInvalidations, agentId, precomputedAdmission) {
         // Profile always merges (skip dedup — admission control still applies)
         if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
             const profileResult = await this.handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, undefined, createEntries, agentId);
@@ -709,9 +739,11 @@ export class SmartExtractor {
             else if (profileResult === "created") {
                 stats.created++;
             }
-            else {
+            else if (profileResult === "merged") {
                 stats.merged++;
             }
+            // "llm-failed": nothing was persisted (handleMerge already logged
+            // it) — don't count it as either a merge or a create.
             return;
         }
         // Use pre-computed vector if available (batch embed optimization),
@@ -723,15 +755,18 @@ export class SmartExtractor {
             stats.created++;
             return;
         }
-        // Admission control gate (before dedup)
-        const admission = this.admissionController
-            ? await this.admissionController.evaluate({
-                candidate,
-                candidateVector: vector,
-                conversationText,
-                scopeFilter: scopeFilter ?? [targetScope],
-            })
-            : undefined;
+        // Admission control gate (before dedup). Reuse the batch-mode evaluation
+        // computed up front for this candidate when available, instead of
+        // issuing another per-candidate call.
+        const admission = precomputedAdmission ??
+            (this.admissionController
+                ? await this.admissionController.evaluate({
+                    candidate,
+                    candidateVector: vector,
+                    conversationText,
+                    scopeFilter: scopeFilter ?? [targetScope],
+                })
+                : undefined);
         if (admission?.decision === "reject") {
             stats.rejected = (stats.rejected ?? 0) + 1;
             this.log(`memory-pro: smart-extractor: admission rejected [${candidate.category}] ${candidate.abstract.slice(0, 60)} — ${admission.audit.reason}`);
@@ -748,8 +783,15 @@ export class SmartExtractor {
             case "merge":
                 if (dedupResult.matchId &&
                     MERGE_SUPPORTED_CATEGORIES.has(candidate.category)) {
-                    await this.handleMerge(candidate, dedupResult.matchId, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
-                    stats.merged++;
+                    const mergeOutcome = await this.handleMerge(candidate, dedupResult.matchId, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
+                    if (mergeOutcome === "merged") {
+                        stats.merged++;
+                    }
+                    else if (mergeOutcome === "created") {
+                        stats.created++;
+                    }
+                    // "llm-failed": nothing was persisted (handleMerge already logged
+                    // it) — don't count it as either a merge or a create.
                 }
                 else {
                     // Category doesn't support merge → create instead
@@ -945,8 +987,8 @@ export class SmartExtractor {
             }
         });
         if (profileMatch) {
-            await this.handleMerge(candidate, profileMatch.entry.id, targetScope, scopeFilter, undefined, admissionAudit, createEntries, agentId);
-            return "merged";
+            const mergeOutcome = await this.handleMerge(candidate, profileMatch.entry.id, targetScope, scopeFilter, undefined, admissionAudit, createEntries, agentId);
+            return mergeOutcome;
         }
         else {
             // No existing profile — create new
@@ -956,6 +998,16 @@ export class SmartExtractor {
     }
     /**
      * Merge a candidate into an existing memory using LLM.
+     */
+    /**
+     * Attempts to merge `candidate` into the existing memory at `matchId`.
+     * Returns which outcome actually happened so the caller can account for
+     * it truthfully:
+     * - "merged": store.update() persisted the merged content.
+     * - "created": the existing row couldn't be read, so the candidate was
+     *   queued as a new entry instead — a create, not a merge.
+     * - "llm-failed": the merge-memory completion came back null/unparseable;
+     *   nothing was persisted and the existing row is untouched.
      */
     async handleMerge(candidate, matchId, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries, agentId) {
         let existingAbstract = "";
@@ -975,14 +1027,14 @@ export class SmartExtractor {
             this.log(`memory-pro: smart-extractor: could not read existing memory ${matchId}, storing as new`);
             const vector = await this.embedder.embed(`${candidate.abstract} ${candidate.content}`);
             createEntries?.push(this.buildStoreEntry(candidate, vector || [], "merge-fallback", targetScope));
-            return;
+            return "created";
         }
         // Call LLM to merge
         const { system, user: userPrompt } = buildMergePrompt(existingAbstract, existingOverview, existingContent, candidate.abstract, candidate.overview, candidate.content, candidate.category);
         const merged = await this.llm.completeJson(userPrompt, "merge-memory", system);
         if (!merged) {
             this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
-            return;
+            return "llm-failed";
         }
         // Re-embed the merged content
         const mergedText = `${merged.abstract} ${merged.content}`;
@@ -1023,6 +1075,7 @@ export class SmartExtractor {
             // Non-critical: merge succeeded, support stats update is best-effort
         }
         this.log(`memory-pro: smart-extractor: merged [${candidate.category}]${contextLabel ? ` [${contextLabel}]` : ""} into ${matchId.slice(0, 8)}`);
+        return "merged";
     }
     /**
      * Handle SUPERSEDE: preserve the old record as historical but mark it as no

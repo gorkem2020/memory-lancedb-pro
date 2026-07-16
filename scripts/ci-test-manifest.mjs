@@ -125,6 +125,13 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/admission-controller-standalone.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-admission-controller-injection.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/admission-without-smart-extraction.test.mjs", args: ["--test"] },
+  // D2: batch admission utility scoring mode
+  { group: "core-regression", runner: "node", file: "test/admission-control-batch-utility.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-admission.test.mjs", args: ["--test"] },
+  // Item 6: admission judge goes transcript-free, batch prompt formatting standard
+  { group: "core-regression", runner: "node", file: "test/admission-control-prompt-shape.test.mjs", args: ["--test"] },
+  // Rider 1: truthful stats.merged accounting (handleMerge outcome-aware)
+  { group: "core-regression", runner: "node", file: "test/smart-extractor-merge-accounting.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
