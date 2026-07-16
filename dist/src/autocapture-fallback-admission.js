@@ -48,8 +48,23 @@ export async function gateRegexFallbackCapture(params) {
         });
     }
     catch (err) {
+        const reason = "admission evaluation failed open";
         params.warnLog?.(`memory-lancedb-pro: regex-fallback admission evaluation failed, admitting without audit: ${String(err)}`);
-        return { admit: true, reason: "admission evaluation failed open" };
+        return {
+            admit: true,
+            reason,
+            // Fail-open admits still need durable, queryable provenance on the row itself
+            // (not just an ephemeral log line): otherwise this row is indistinguishable
+            // from a normally-scored admit once persisted.
+            auditJson: params.attachAudit
+                ? JSON.stringify({
+                    provenance: "auto-capture-regex-fallback",
+                    failedOpen: true,
+                    reason,
+                    error: String(err),
+                })
+                : undefined,
+        };
     }
     if (evaluation.decision === "reject") {
         return { admit: false, reason: evaluation.audit.reason };
