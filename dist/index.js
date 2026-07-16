@@ -1875,6 +1875,11 @@ function _initPluginState(api) {
     const reflectionDerivedBySession = new Map();
     const reflectionDerivedSuppressionBySession = new Map();
     const reflectionByAgentCache = new Map();
+    // Bumped on every invalidateReflectionCachesAfterDelete call. loadAgentReflectionSlices
+    // snapshots this before its awaited store.list() reads and skips caching its result if
+    // it changed mid-flight, so an in-flight read can never publish a stale pre-delete
+    // snapshot back into the cache after the delete already invalidated it.
+    const reflectionByAgentCacheGeneration = { count: 0 };
     const recallHistory = new Map();
     const turnCounter = new Map();
     const autoCaptureSeenTextCount = new Map();
@@ -1901,6 +1906,7 @@ function _initPluginState(api) {
         reflectionDerivedBySession,
         reflectionDerivedSuppressionBySession,
         reflectionByAgentCache,
+        reflectionByAgentCacheGeneration,
         recallHistory,
         turnCounter,
         autoCaptureSeenTextCount,
@@ -2014,7 +2020,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2179,6 +2185,7 @@ const memoryLanceDBProPlugin = {
             const cached = reflectionByAgentCache.get(cacheKey);
             if (cached && Date.now() - cached.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS)
                 return cached;
+            const generationAtStart = reflectionByAgentCacheGeneration.count;
             // Prefer reflection-category rows to avoid full-table reads on bypass callers.
             // Fall back to an uncategorized scan only when the category query produced no
             // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
@@ -2207,7 +2214,12 @@ const memoryLanceDBProPlugin = {
             }
             const { invariants, derived } = slices;
             const next = { updatedAt: Date.now(), invariants, derived };
-            reflectionByAgentCache.set(cacheKey, next);
+            // Only cache if no delete invalidated this cacheKey while the awaits above were in
+            // flight (TOCTOU guard); otherwise this late-arriving, possibly-stale read would
+            // silently resurrect a cache entry the delete just cleared.
+            if (reflectionByAgentCacheGeneration.count === generationAtStart) {
+                reflectionByAgentCache.set(cacheKey, next);
+            }
             return next;
         };
         // Fast-path invalidation for SAME-PROCESS deletes only: CLI delete/delete-bulk
@@ -2230,6 +2242,7 @@ const memoryLanceDBProPlugin = {
         // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
         // cleared in full rather than left to expire on its own TTL.
         const invalidateReflectionCachesAfterDelete = (deletedScopes) => {
+            reflectionByAgentCacheGeneration.count++;
             const deletedSet = new Set(deletedScopes ?? []);
             for (const cacheKey of reflectionByAgentCache.keys()) {
                 const sepIdx = cacheKey.indexOf("::");
@@ -2348,6 +2361,9 @@ const memoryLanceDBProPlugin = {
             mdMirror,
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
+            // Mirrors the CLI context wiring below: keep in-process reflection caches
+            // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
+            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         }, {
             enableManagementTools: config.enableManagementTools,
             enableSelfImprovementTools: config.selfImprovement?.enabled === true,
@@ -3971,7 +3987,13 @@ const memoryLanceDBProPlugin = {
                         });
                         if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
                             reflectionDerivedBySession.set(sessionKey, {
-                                updatedAt: nowTs,
+                                // Deliberately Date.now(), not nowTs (which mirrors the host-supplied
+                                // event.timestamp and can be skewed/future-dated): this field is a TTL
+                                // bookkeeping mark, and DEFAULT_REFLECTION_CACHE_TTL_MS above compares it
+                                // against a fresh Date.now() on every read. A skewed updatedAt can make
+                                // "Date.now() - updatedAt" go negative, which is always < the TTL, so the
+                                // cache would read as fresh indefinitely until wall-clock time caught up.
+                                updatedAt: Date.now(),
                                 derived: stored.slices.derived,
                             });
                         }

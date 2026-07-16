@@ -73,6 +73,9 @@ interface ToolContext {
   mdMirror?: MdMirrorWriter | null;
   workspaceBoundary?: WorkspaceBoundaryConfig;
   selfImprovementMaxEntries?: number;
+  // Mirrors MemoryCliContext's onMemoriesDeleted (cli.ts): lets the host invalidate
+  // in-process reflection caches after a live delete, not just CLI delete/delete-bulk.
+  onMemoriesDeleted?: (info: { scopeFilter?: string[] }) => void;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -1555,6 +1558,7 @@ export function registerMemoryForgetTool(
           if (memoryId) {
             const deleted = await context.store.delete(memoryId, scopeFilter);
             if (deleted) {
+              context.onMemoriesDeleted?.({ scopeFilter });
               return {
                 content: [
                   { type: "text", text: `Memory ${memoryId} forgotten.` },
@@ -1596,6 +1600,7 @@ export function registerMemoryForgetTool(
                 scopeFilter,
               );
               if (deleted) {
+                context.onMemoriesDeleted?.({ scopeFilter });
                 return {
                   content: [
                     {

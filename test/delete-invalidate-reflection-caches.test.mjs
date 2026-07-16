@@ -63,6 +63,7 @@ function createPluginApiHarness({ pluginConfig, resolveRoot }) {
   const eventHandlers = new Map();
   const logs = [];
   const cliFactories = [];
+  const toolFactories = [];
 
   const api = {
     pluginConfig,
@@ -85,7 +86,9 @@ function createPluginApiHarness({ pluginConfig, resolveRoot }) {
         logs.push(["error", String(message)]);
       },
     },
-    registerTool() {},
+    registerTool(toolFactory, meta) {
+      toolFactories.push({ toolFactory, meta });
+    },
     registerCli(cliFactory) {
       cliFactories.push(cliFactory);
     },
@@ -102,7 +105,14 @@ function createPluginApiHarness({ pluginConfig, resolveRoot }) {
     },
   };
 
-  return { api, eventHandlers, logs, cliFactories };
+  return { api, eventHandlers, logs, cliFactories, toolFactories };
+}
+
+async function callMemoryForgetTool(toolFactories, toolCtx, params, runtimeCtx) {
+  const entry = toolFactories.find(({ meta }) => meta?.name === "memory_forget");
+  assert.ok(entry, "expected a registered memory_forget tool");
+  const tool = entry.toolFactory(toolCtx);
+  return tool.execute("test-call-id", params, undefined, undefined, runtimeCtx);
 }
 
 function makePluginConfig(workDir) {
@@ -178,10 +188,58 @@ describe("delete/delete-bulk synchronously invalidate in-process reflection cach
     );
   });
 
+  it("reflectionByAgentCache: a live memory_forget TOOL call (not just the CLI) invalidates the cache", async () => {
+    const pluginConfig = makePluginConfig(workDir);
+    await seedReflection(pluginConfig.dbPath, "dave", "agent:dave");
+
+    const harness = createPluginApiHarness({ resolveRoot: workDir, pluginConfig });
+    memoryLanceDBProPlugin.register(harness.api);
+    const { inheritedRules } = getReflectionHooks(harness.eventHandlers);
+    const ctx = { sessionKey: "agent:dave:test", agentId: "dave" };
+
+    // Prime reflectionByAgentCache with the seeded invariant.
+    const primed = await inheritedRules({}, ctx);
+    assert.match(primed?.prependContext ?? "", /Always verify reflection hook coverage for dave\./);
+
+    const rawStore = new MemoryStore({ dbPath: pluginConfig.dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const rows = await rawStore.list(["agent:dave"], "reflection", 20, 0);
+    assert.ok(rows.length > 0, "sanity: dave's seeded row(s) must exist before deleting them");
+
+    // storeReflectionToLanceDB can persist more than one physical row per reflection
+    // (per-item mapped rows plus a legacy combined row) — delete through the live
+    // memory_forget TOOL path (what an agent actually calls, not the CLI delete-bulk
+    // path the earlier test already covers) for every row, not just the first.
+    for (const row of rows) {
+      const result = await callMemoryForgetTool(
+        harness.toolFactories,
+        {},
+        { memoryId: row.id },
+        { agentId: "dave" },
+      );
+      assert.equal(result?.details?.action, "deleted", `sanity: memory_forget must have deleted row ${row.id}`);
+    }
+
+    // Immediately re-read through the same injection path (well within the TTL window).
+    // Before onMemoriesDeleted was wired into the tool context, this kept serving the
+    // stale cached invariant because only the CLI's delete/delete-bulk paths invalidated it.
+    const afterDelete = await inheritedRules({}, ctx);
+    assert.equal(
+      afterDelete,
+      undefined,
+      "the inherited-rules hook must not keep serving the deleted invariant after a live memory_forget tool call",
+    );
+  });
+
   it("reflectionByAgentCache: an unrelated scope's cache entry is left untouched by the delete", async () => {
     const pluginConfig = makePluginConfig(workDir);
-    await seedReflection(pluginConfig.dbPath, "dave", "global");
-    await seedReflection(pluginConfig.dbPath, "carol", "global");
+    // Deliberately NOT "global" for either agent: every agent's own accessible-scope list
+    // always includes "global" too (it's shared/auto-granted), so a delete-bulk from
+    // "global" correctly invalidates every agent's cache entry by design (their own read
+    // queried "global" as part of its scope filter, even if none of their rows live there).
+    // Using each agent's own private default scope ("agent:<id>") is what actually isolates
+    // the two agents' cache footprints from one another.
+    await seedReflection(pluginConfig.dbPath, "dave", "agent:dave");
+    await seedReflection(pluginConfig.dbPath, "carol", "agent:carol");
 
     const harness = createPluginApiHarness({ resolveRoot: workDir, pluginConfig });
     memoryLanceDBProPlugin.register(harness.api);
@@ -191,14 +249,29 @@ describe("delete/delete-bulk synchronously invalidate in-process reflection cach
     await inheritedRules({}, { sessionKey: "agent:dave:test", agentId: "dave" });
     await inheritedRules({}, { sessionKey: "agent:carol:test", agentId: "carol" });
 
-    // Delete from a scope neither agent's reflections live in.
-    await runCliDeleteBulk(harness.cliFactories, "unrelated-scope");
+    // Delete carol's underlying row directly (bypassing the plugin's own cache-invalidation
+    // path entirely), so the *only* way a later read can still see her original text is if
+    // it came from the still-intact cache entry, not a fresh DB query.
+    const rawStore = new MemoryStore({ dbPath: pluginConfig.dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const carolRows = await rawStore.list(["agent:carol"], "reflection", 20, 0);
+    assert.ok(carolRows.length > 0, "sanity: carol's seeded row must exist before the direct delete");
+    for (const row of carolRows) {
+      await rawStore.delete(row.id, ["agent:carol"]);
+    }
+
+    // Delete-bulk from dave's own private scope only: this genuinely matches a row
+    // (deletedCount > 0, unlike the previous unrelated-scope version of this test, which
+    // matched nothing and never even exercised the invalidation callback), so the
+    // scope-intersection logic in invalidateReflectionCachesAfterDelete actually runs and
+    // must correctly determine that "agent:dave" does not intersect carol's cache key.
+    await runCliDeleteBulk(harness.cliFactories, "agent:dave");
 
     const carolAfter = await inheritedRules({}, { sessionKey: "agent:carol:test", agentId: "carol" });
     assert.match(
       carolAfter?.prependContext ?? "",
       /Always verify reflection hook coverage for carol\./,
-      "an unaffected agent's cached invariant should still be served without a fresh DB round trip",
+      "an unaffected agent's cached invariant must still be served from cache — the underlying " +
+      "row was deleted directly, so a fresh (wrongly-invalidated) DB read would find nothing",
     );
   });
 
