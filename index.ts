@@ -726,6 +726,7 @@ const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES = 200;
+const DEFAULT_REFLECTION_CACHE_TTL_MS = 15_000;
 // After /new or /reset, the just-closed session may have generated fresh
 // derived deltas. Keep those out of the immediately opened prompt window.
 const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
@@ -2338,6 +2339,7 @@ interface PluginSingletonState {
   reflectionDerivedBySession: Map<string, { updatedAt: number; derived: string[] }>;
   reflectionDerivedSuppressionBySession: Map<string, ReflectionDerivedSuppressionState>;
   reflectionByAgentCache: Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>;
+  reflectionByAgentCacheGeneration: { count: number };
   recallHistory: Map<string, Map<string, number>>;
   turnCounter: Map<string, number>;
   autoCaptureSeenTextCount: Map<string, number>;
@@ -2537,6 +2539,11 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
   const reflectionDerivedSuppressionBySession = new Map<string, ReflectionDerivedSuppressionState>();
   const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
+  // Bumped on every invalidateReflectionCachesAfterDelete call. loadAgentReflectionSlices
+  // snapshots this before its awaited store.list() reads and skips caching its result if
+  // it changed mid-flight, so an in-flight read can never publish a stale pre-delete
+  // snapshot back into the cache after the delete already invalidated it.
+  const reflectionByAgentCacheGeneration = { count: 0 };
   const recallHistory = new Map<string, Map<string, number>>();
   const turnCounter = new Map<string, number>();
   const autoCaptureSeenTextCount = new Map<string, number>();
@@ -2564,6 +2571,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     reflectionDerivedBySession,
     reflectionDerivedSuppressionBySession,
     reflectionByAgentCache,
+    reflectionByAgentCacheGeneration,
     recallHistory,
     turnCounter,
     autoCaptureSeenTextCount,
@@ -2716,6 +2724,7 @@ const memoryLanceDBProPlugin = {
       reflectionDerivedBySession,
       reflectionDerivedSuppressionBySession,
       reflectionByAgentCache,
+      reflectionByAgentCacheGeneration,
       recallHistory,
       turnCounter,
       autoCaptureSeenTextCount,
@@ -2931,7 +2940,8 @@ const memoryLanceDBProPlugin = {
         : "<NO_SCOPE_FILTER>";
       const cacheKey = `${agentId}::${scopeKey}`;
       const cached = reflectionByAgentCache.get(cacheKey);
-      if (cached && Date.now() - cached.updatedAt < 15_000) return cached;
+      if (cached && Date.now() - cached.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS) return cached;
+      const generationAtStart = reflectionByAgentCacheGeneration.count;
 
       // Prefer reflection-category rows to avoid full-table reads on bypass callers.
       // Fall back to an uncategorized scan only when the category query produced no
@@ -2960,8 +2970,50 @@ const memoryLanceDBProPlugin = {
       }
       const { invariants, derived } = slices;
       const next = { updatedAt: Date.now(), invariants, derived };
-      reflectionByAgentCache.set(cacheKey, next);
+      // Only cache if no delete invalidated this cacheKey while the awaits above were in
+      // flight (TOCTOU guard); otherwise this late-arriving, possibly-stale read would
+      // silently resurrect a cache entry the delete just cleared.
+      if (reflectionByAgentCacheGeneration.count === generationAtStart) {
+        reflectionByAgentCache.set(cacheKey, next);
+      }
       return next;
+    };
+
+    // Fast-path invalidation for SAME-PROCESS deletes only: CLI delete/delete-bulk
+    // commands run as a short-lived, separate process from the long-running Gateway
+    // in typical deployments, so this callback firing there does not reach (and
+    // cannot invalidate) the Gateway process own in-memory caches. It only has an
+    // effect when a delete genuinely happens inside this same plugin instance.
+    //
+    // The actual cross-process staleness bound comes from two other layers:
+    //   - DEFAULT_REFLECTION_CACHE_TTL_MS bounds how long either cache below can
+    //     serve stale content after ANY delete, same-process or not (see the read
+    //     sites in loadAgentReflectionSlices and the derived-focus injector).
+    //   - readConsistencyInterval (store config) bounds how long the underlying
+    //     LanceDB table handle can serve stale rows to a fresh query in the first
+    //     place, which is what a TTL-expired cache re-populates from.
+    //
+    // reflectionByAgentCache is keyed "<agentId>::scopes:<sorted,scopes>" (or
+    // "<agentId>::<NO_SCOPE_FILTER>"); drop any entry whose scope set intersects
+    // the deleted scopes, plus every no-scope-filter entry (it spans all scopes).
+    // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
+    // cleared in full rather than left to expire on its own TTL.
+    const invalidateReflectionCachesAfterDelete = (deletedScopes: string[] | undefined) => {
+      reflectionByAgentCacheGeneration.count++;
+      const deletedSet = new Set(deletedScopes ?? []);
+      for (const cacheKey of reflectionByAgentCache.keys()) {
+        const sepIdx = cacheKey.indexOf("::");
+        const scopePart = sepIdx === -1 ? "" : cacheKey.slice(sepIdx + 2);
+        if (scopePart === "<NO_SCOPE_FILTER>" || deletedSet.size === 0) {
+          reflectionByAgentCache.delete(cacheKey);
+          continue;
+        }
+        const cachedScopes = scopePart.startsWith("scopes:") ? scopePart.slice("scopes:".length).split(",") : [];
+        if (cachedScopes.some((s) => deletedSet.has(s))) {
+          reflectionByAgentCache.delete(cacheKey);
+        }
+      }
+      reflectionDerivedBySession.clear();
     };
 
     // ========================================================================
@@ -3105,6 +3157,9 @@ const memoryLanceDBProPlugin = {
         mdMirror,
         workspaceBoundary: config.workspaceBoundary,
         selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
+        // Mirrors the CLI context wiring below: keep in-process reflection caches
+        // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
+        onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -3155,6 +3210,7 @@ const memoryLanceDBProPlugin = {
         store,
         retriever,
         scopeManager,
+        onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         migrator,
         embedder,
         llmClient: smartExtractor ? (() => {
@@ -4557,7 +4613,8 @@ const memoryLanceDBProPlugin = {
               if (suppression) reflectionDerivedSuppressionBySession.delete(sessionKey);
               const scopes = resolveScopeFilter(scopeManager, agentId);
               const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-              const derivedLines = derivedCache?.derived?.length
+              const derivedCacheFresh = derivedCache && Date.now() - derivedCache.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS;
+              const derivedLines = derivedCacheFresh && derivedCache.derived.length
                 ? derivedCache.derived
                 : (await loadAgentReflectionSlices(agentId, scopes)).derived;
               if (derivedLines.length > 0) {
@@ -5018,7 +5075,13 @@ const memoryLanceDBProPlugin = {
             });
             if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
               reflectionDerivedBySession.set(sessionKey, {
-                updatedAt: nowTs,
+                // Deliberately Date.now(), not nowTs (which mirrors the host-supplied
+                // event.timestamp and can be skewed/future-dated): this field is a TTL
+                // bookkeeping mark, and DEFAULT_REFLECTION_CACHE_TTL_MS above compares it
+                // against a fresh Date.now() on every read. A skewed updatedAt can make
+                // "Date.now() - updatedAt" go negative, which is always < the TTL, so the
+                // cache would read as fresh indefinitely until wall-clock time caught up.
+                updatedAt: Date.now(),
                 derived: stored.slices.derived,
               });
             }
