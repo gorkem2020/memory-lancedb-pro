@@ -114,10 +114,14 @@ assert.equal(
   "string",
   "llm.thinkLevel schema should accept a free-form string, same as the deprecated reasoningEffort"
 );
-assert.equal(
-  manifest.configSchema.properties.llm.properties.thinkLevel.default,
-  "medium",
-  "llm.thinkLevel schema default should stay medium"
+assert.ok(
+  !Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties.thinkLevel, "default"),
+  "llm.thinkLevel schema must NOT declare a JSON-schema default -- the OpenClaw host materializes schema " +
+  "defaults into the plugin config on at least one config-loading path, indistinguishably from a genuine " +
+  "user value, which silently overrides an explicitly-configured deprecated llm.reasoningEffort once " +
+  "resolveThinkLevel sees a thinkLevel it never actually configured (2026-07-16 live incident: llm.reasoningEffort " +
+  "was the only key on disk, yet a CLI-mode config load produced thinkLevel=medium and it won). The medium " +
+  "default for the host transport lives in code (DEFAULT_HOST_REASONING_EFFORT in src/llm-client.ts), not here."
 );
 assert.doesNotMatch(
   manifest.configSchema.properties.llm.properties.thinkLevel.description,
@@ -156,6 +160,11 @@ assert.match(
   manifest.configSchema.properties.llm.properties.reasoningEffort.description,
   /thinkLevel/,
   "the deprecated llm.reasoningEffort description should point at llm.thinkLevel"
+);
+assert.ok(
+  !Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties.reasoningEffort, "default"),
+  "the deprecated llm.reasoningEffort schema must NOT declare a JSON-schema default either, for the same " +
+  "reason as llm.thinkLevel above"
 );
 
 assert.equal(
