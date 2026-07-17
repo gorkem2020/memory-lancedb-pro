@@ -4,13 +4,21 @@
  * - buildExtractionPrompt: 6-category L0/L1/L2 extraction with few-shot
  * - buildDedupPrompt: CREATE/MERGE/SKIP dedup decision
  * - buildMergePrompt: Memory merge with three-level structure
+ * Batched variants (one LLM call per pipeline stage):
+ * - buildBatchDedupPrompt: one dedup decision per numbered candidate
+ * - buildBatchMergePrompt: one merged record per numbered merge job
  *
  * Each builder returns a {system, user} pair: instructions, criteria,
  * identity, and the output-format contract live in `system`; the per-call
  * conversation excerpt / candidate rows / neighbor rows live in `user`.
+ * Static content shared across builders (category taxonomy, identity
+ * openers, the candidate/job markdown formatter) is single-sourced in
+ * ./prompt-blocks.ts and composed below -- copied prompt text between
+ * builders is a defect.
  */
+import { CATEGORY_TAXONOMY, DEDUP_JUDGE_IDENTITY, EXTRACTION_AGENT_IDENTITY, MERGE_WRITER_IDENTITY, formatCandidateBlock, formatExistingMemoriesSection, formatMemoryFieldLines, jsonBlock, } from "./prompt-blocks.js";
 export function buildExtractionPrompt(conversationText, user) {
-    const system = `You are an extraction agent. Analyze session context and extract memories worth long-term preservation.
+    const system = `${EXTRACTION_AGENT_IDENTITY} Analyze session context and extract memories worth long-term preservation.
 
 # Memory Extraction Criteria
 
@@ -112,7 +120,7 @@ Each memory contains three levels:
 # Output Format
 
 Return JSON:
-{
+${jsonBlock(`{
   "memories": [
     {
       "category": "profile|preferences|entities|events|cases|patterns",
@@ -121,7 +129,7 @@ Return JSON:
       "content": "Full narrative"
     }
   ]
-}
+}`)}
 
 Notes:
 - Output language should match the dominant language in the conversation
@@ -137,8 +145,13 @@ Target Output Language: auto (detect from recent messages)
 ${conversationText}`;
     return { system, user: userMessage };
 }
-export function buildDedupPrompt(candidateAbstract, candidateOverview, candidateContent, existingMemories) {
-    const system = `You are a dedup decider. Determine how to handle a candidate memory relative to existing similar memories.
+export function buildDedupPrompt(candidate, existingMemories) {
+    const existingSection = formatExistingMemoriesSection(String(existingMemories ?? "")
+        .split("\n")
+        .filter((line) => line.length > 0));
+    const system = `${DEDUP_JUDGE_IDENTITY}
+
+${CATEGORY_TAXONOMY}
 
 Please decide:
 - SKIP: Candidate memory duplicates existing memories, no need to save. Also SKIP if the candidate contains LESS information than an existing memory on the same topic (information degradation — e.g., candidate says "programming language preference" but existing memory already says "programming language preference: Python, TypeScript")
@@ -156,62 +169,134 @@ IMPORTANT:
 - For "preferences" and "entities", use SUPERSEDE when the candidate replaces the current truth instead of adding detail or context. Example: existing "Preferred editor: VS Code", candidate "Preferred editor: Zed".
 - For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
 
-Return JSON format:
-{
+Return JSON only:
+${jsonBlock(`{
   "decision": "skip|create|merge|supersede|support|contextualize|contradict",
   "match_index": 1,
   "reason": "Decision reason",
   "context_label": "evening"
-}
+}`)}
 
 - If decision is "merge"/"supersede"/"support"/"contextualize"/"contradict", set "match_index" to the number of the existing memory (1-based).
 - Only include "context_label" for support/contextualize/contradict decisions.`;
-    const userMessage = `**Candidate Memory**:
-Abstract: ${candidateAbstract}
+    const userMessage = `## Candidate
 
-Overview:
-${candidateOverview}
+${formatCandidateBlock(1, candidate)}
 
-Content:
-${candidateContent}
-
-**Existing Similar Memories**:
-${existingMemories}`;
+${existingSection}`;
     return { system, user: userMessage };
 }
-export function buildMergePrompt(existingAbstract, existingOverview, existingContent, newAbstract, newOverview, newContent, category) {
-    const system = `You are a merge writer. Merge two versions of the same memory into a single coherent record with all three levels.
+export function buildMergePrompt(existing, addition) {
+    const system = `${MERGE_WRITER_IDENTITY}
+
+${CATEGORY_TAXONOMY}
 
 Requirements:
 - Remove duplicate information
 - Keep the most up-to-date details
 - Maintain a coherent narrative
-- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
+- Keep code identifiers / URIs / model names unchanged when they are proper nouns
 
-Return JSON:
-{
+Return JSON only:
+${jsonBlock(`{
   "abstract": "Merged one-line abstract",
   "overview": "Merged structured Markdown overview",
   "content": "Merged full content"
-}`;
-    const userMessage = `Category: ${category}
+}`)}`;
+    const userMessage = `## Merge job
 
-Existing Memory:
-Abstract: ${existingAbstract}
+### Existing memory
+${formatMemoryFieldLines(existing).join("\n")}
 
-Overview:
-${existingOverview}
-
-Content:
-${existingContent}
-
-New Information:
-Abstract: ${newAbstract}
-
-Overview:
-${newOverview}
-
-Content:
-${newContent}`;
+### New information
+${formatMemoryFieldLines(addition).join("\n")}`;
     return { system, user: userMessage };
+}
+/**
+ * Batched variant of buildDedupPrompt: one LLM call decides every numbered
+ * candidate independently. Verdict vocabulary, rules, and match_index
+ * semantics are identical to the single-candidate prompt — only the call
+ * topology changes.
+ */
+export function buildBatchDedupPrompt(items) {
+    const system = `${DEDUP_JUDGE_IDENTITY} Decide every candidate independently, using only that candidate's own "Existing similar memories" list — never another candidate's.
+
+${CATEGORY_TAXONOMY}
+
+For each candidate, decide:
+- SKIP: Candidate memory duplicates existing memories, no need to save. Also SKIP if the candidate contains LESS information than an existing memory on the same topic (information degradation — e.g., candidate says "programming language preference" but existing memory already says "programming language preference: Python, TypeScript")
+- CREATE: This is completely new information not covered by any existing memory, should be created
+- MERGE: Candidate memory adds genuinely NEW details to an existing memory and should be merged
+- SUPERSEDE: Candidate states that the same mutable fact has changed over time. Keep the old memory as historical but no longer current, and create a new current memory.
+- SUPPORT: Candidate reinforces/confirms an existing memory in a specific context (e.g. "still prefers tea in the evening")
+- CONTEXTUALIZE: Candidate adds a situational nuance to an existing memory (e.g. existing: "likes coffee", candidate: "prefers tea at night" — different context, same topic)
+- CONTRADICT: Candidate directly contradicts an existing memory in a specific context (e.g. existing: "runs on weekends", candidate: "stopped running on weekends")
+
+IMPORTANT:
+- "events" and "cases" categories are independent records — they do NOT support MERGE/SUPERSEDE/SUPPORT/CONTEXTUALIZE/CONTRADICT. For these categories, only use SKIP or CREATE.
+- If the candidate appears to be derived from a recall question (e.g., "Do you remember X?" / "你记得X吗？") and an existing memory already covers topic X with equal or more detail, you MUST choose SKIP.
+- A candidate with less information than an existing memory on the same topic should NEVER be CREATED or MERGED — always SKIP.
+- For "preferences" and "entities", use SUPERSEDE when the candidate replaces the current truth instead of adding detail or context. Example: existing "Preferred editor: VS Code", candidate "Preferred editor: Zed".
+- For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
+- "match_index" always refers to the numbering of that candidate's OWN "Existing similar memories" list (1-based), never to another candidate's list and never to the candidate numbering itself.
+
+Return JSON only, with exactly one entry per candidate, in this shape:
+${jsonBlock(`{
+  "results": [
+    { "index": 1, "decision": "skip|create|merge|supersede|support|contextualize|contradict", "match_index": 1, "reason": "Decision reason", "context_label": "evening" }
+  ]
+}`)}
+
+- "index" is the candidate's number in the batch below.
+- If decision is "merge"/"supersede"/"support"/"contextualize"/"contradict", set "match_index" to the number of the matching existing memory (1-based) in that candidate's own list.
+- Only include "context_label" for support/contextualize/contradict decisions.`;
+    const blocks = items.map((item, i) => {
+        const candidateBlock = formatCandidateBlock(i + 1, item.candidate);
+        const existingSection = formatExistingMemoriesSection(String(item.existingMemories ?? "")
+            .split("\n")
+            .filter((line) => line.length > 0));
+        return existingSection ? `${candidateBlock}\n\n${existingSection}` : candidateBlock;
+    });
+    const user = `## Candidates
+
+${blocks.join("\n\n")}`;
+    return { system, user };
+}
+/**
+ * Batched variant of buildMergePrompt: one LLM call writes every numbered
+ * merge job. Each job carries its target ("Existing memory") and every
+ * candidate merging into it ("New information"); merge requirements are
+ * identical to the single-job prompt — only the call topology changes.
+ */
+export function buildBatchMergePrompt(jobs) {
+    const system = `${MERGE_WRITER_IDENTITY} For each job, merge every "New information" section into that job's "Existing memory"; never mix content across jobs.
+
+${CATEGORY_TAXONOMY}
+
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers / URIs / model names unchanged when they are proper nouns
+
+Return JSON only, with exactly one entry per job, in this shape:
+${jsonBlock(`{
+  "results": [
+    { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
+  ]
+}`)}
+
+- "index" is the job's number in the batch below.`;
+    const blocks = jobs.map((job, i) => {
+        const lines = [`### ${i + 1}. ${job.category}`, "", "#### Existing memory", ...formatMemoryFieldLines(job.existing)];
+        job.additions.forEach((addition, j) => {
+            const heading = job.additions.length > 1 ? `#### New information ${j + 1}` : "#### New information";
+            lines.push("", heading, ...formatMemoryFieldLines(addition));
+        });
+        return lines.join("\n");
+    });
+    const user = `## Merge jobs
+
+${blocks.join("\n\n")}`;
+    return { system, user };
 }

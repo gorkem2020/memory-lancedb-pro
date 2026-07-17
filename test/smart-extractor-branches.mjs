@@ -241,7 +241,7 @@ async function runScenario(mode) {
     llmCalls += 1;
 
     let content;
-    if (prompt.includes("You are an extraction agent")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       content = JSON.stringify({
         memories: [
           {
@@ -256,20 +256,32 @@ async function runScenario(mode) {
           },
         ],
       });
-    } else if (prompt.includes("You are a dedup decider")) {
-      content = JSON.stringify({
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
+      const verdict = {
         decision: mode === "merge" ? "merge" : "skip",
         match_index: 1,
         reason: mode === "merge"
           ? "Same preference domain, merge into existing memory"
           : "Candidate fully duplicates existing memory",
-      });
-    } else if (prompt.includes("You are a merge writer")) {
-      content = JSON.stringify({
+      };
+      content = prompt.includes("Decide every candidate independently")
+        ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+        : JSON.stringify(verdict);
+    } else if (
+      prompt.includes("You are a memory merge writer.") ||
+      prompt.includes("For each job, merge every")
+    ) {
+      const merged = {
         abstract: "饮品偏好：乌龙茶、茉莉花茶",
         overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢乌龙茶\n- 喜欢茉莉花茶",
         content: "用户长期喜欢乌龙茶，并补充说明也喜欢茉莉花茶。",
-      });
+      };
+      content = prompt.includes("For each job, merge every")
+        ? JSON.stringify({ results: [{ index: 1, ...merged }] })
+        : JSON.stringify(merged);
     } else {
       content = JSON.stringify({ memories: [] });
     }
@@ -377,7 +389,7 @@ async function runMultiRoundScenario() {
     const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
     let content;
-    if (prompt.includes("You are an extraction agent")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       extractionCall += 1;
       if (extractionCall === 1) {
         content = JSON.stringify({
@@ -424,34 +436,47 @@ async function runMultiRoundScenario() {
           ],
         });
       }
-    } else if (prompt.includes("You are a dedup decider")) {
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
       dedupCall += 1;
+      let verdict;
       if (dedupCall === 1) {
-        content = JSON.stringify({
+        verdict = {
           decision: "skip",
           match_index: 1,
           reason: "Candidate fully duplicates existing memory",
-        });
+        };
       } else if (dedupCall === 2) {
-        content = JSON.stringify({
+        verdict = {
           decision: "merge",
           match_index: 1,
           reason: "New tea preference should extend existing memory",
-        });
+        };
       } else {
-        content = JSON.stringify({
+        verdict = {
           decision: "skip",
           match_index: 1,
           reason: "Already merged into existing memory",
-        });
+        };
       }
-    } else if (prompt.includes("You are a merge writer")) {
+      content = prompt.includes("Decide every candidate independently")
+        ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+        : JSON.stringify(verdict);
+    } else if (
+      prompt.includes("You are a memory merge writer.") ||
+      prompt.includes("For each job, merge every")
+    ) {
       mergeCall += 1;
-      content = JSON.stringify({
+      const merged = {
         abstract: "饮品偏好：乌龙茶、茉莉花茶",
         overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢乌龙茶\n- 喜欢茉莉花茶",
         content: "用户长期喜欢乌龙茶，并补充说明也喜欢茉莉花茶。",
-      });
+      };
+      content = prompt.includes("For each job, merge every")
+        ? JSON.stringify({ results: [{ index: 1, ...merged }] })
+        : JSON.stringify(merged);
     } else {
       content = JSON.stringify({ memories: [] });
     }
@@ -1023,7 +1048,7 @@ async function runUserMdExclusiveProfileScenario() {
     const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
     let content = JSON.stringify({ memories: [] });
-    if (prompt.includes("You are an extraction agent")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       content = JSON.stringify({
         memories: [
           {
@@ -1121,7 +1146,7 @@ async function runBoundarySkipKeepsRegexFallbackScenario() {
     const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
     let content = JSON.stringify({ memories: [] });
-    if (prompt.includes("You are an extraction agent")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       content = JSON.stringify({
         memories: [
           {
@@ -1223,7 +1248,7 @@ async function runInboundMetadataCleanupScenario() {
     llmCalls += 1;
 
     let content;
-    if (prompt.includes("You are an extraction agent")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       extractionPrompt = prompt;
       content = JSON.stringify({
         memories: [
@@ -1235,11 +1260,17 @@ async function runInboundMetadataCleanupScenario() {
           },
         ],
       });
-    } else if (prompt.includes("You are a dedup decider")) {
-      content = JSON.stringify({
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
+      const verdict = {
         decision: "create",
         reason: "No similar memory exists yet",
-      });
+      };
+      content = prompt.includes("Decide every candidate independently")
+        ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+        : JSON.stringify(verdict);
     } else {
       content = JSON.stringify({ memories: [] });
     }
@@ -1570,7 +1601,7 @@ assert.ok(
   assistantContextResult.logs.map((e) => e[1]).join(" | "),
 );
 assert.ok(
-  assistantContextResult.capturedPrompts.some((p) => p.includes("## Recent conversation turns")),
+  assistantContextResult.capturedPrompts.some((p) => p.includes("## Recent Conversation")),
   "extraction prompt should include the single conversation-turns transcript header",
 );
 assert.ok(
@@ -1741,7 +1772,7 @@ async function runDedupDecisionLLMCallScenario() {
     const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
 
-    if (prompt.includes("You are an extraction agent")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       extractCalls += 1;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -1760,15 +1791,21 @@ async function runDedupDecisionLLMCallScenario() {
           }, finish_reason: "stop"
         }]
       }));
-    } else if (prompt.includes("You are a dedup decider")) {
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
       dedupCalls += 1;
+      const verdict = { decision: "skip", match_index: 1, reason: "duplicate" };
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         id: "chatcmpl-test", object: "chat.completion",
         created: Math.floor(Date.now() / 1000), model: "mock-memory-model",
         choices: [{
           index: 0, message: { role: "assistant",
-            content: JSON.stringify({ decision: "skip", match_index: 1, reason: "duplicate" })
+            content: prompt.includes("Decide every candidate independently")
+              ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+              : JSON.stringify(verdict)
           }, finish_reason: "stop"
         }]
       }));

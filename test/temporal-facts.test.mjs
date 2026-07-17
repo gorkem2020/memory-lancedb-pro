@@ -88,7 +88,7 @@ async function runTest() {
     const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
     let content = JSON.stringify({ memories: [] });
 
-    if (prompt.includes("You are an extraction agent")) {
+    if (prompt.includes("You are a memory extraction agent")) {
       content = JSON.stringify({
         memories: [{
           category: "preferences",
@@ -97,12 +97,18 @@ async function runTest() {
           content: "用户现在改喝咖啡。",
         }],
       });
-    } else if (prompt.includes("You are a dedup decider")) {
-      content = JSON.stringify({
+    } else if (
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
+    ) {
+      const verdict = {
         decision: dedupDecision,
         match_index: 1,
         reason: "same preference topic, new truth replaces old truth",
-      });
+      };
+      content = prompt.includes("Decide every candidate independently")
+        ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+        : JSON.stringify(verdict);
     }
 
     res.writeHead(200, { "Content-Type": "application/json" });

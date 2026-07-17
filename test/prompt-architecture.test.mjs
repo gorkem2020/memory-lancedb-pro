@@ -35,7 +35,7 @@ const { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt } = jiti(
   "../src/extraction-prompts.ts",
 );
 const { createLlmClient } = jiti("../src/llm-client.ts");
-const { formatExistingMemoryForDedupPrompt } = jiti("../src/smart-extractor.ts");
+const { formatExistingMemoryEntry } = jiti("../src/prompt-blocks.ts");
 const { buildReflectionPrompt } = jiti("../index.ts");
 
 // ============================================================================
@@ -81,14 +81,12 @@ describe("buildDedupPrompt system/user split", () => {
   const abstractMarker = "UNIQUE-ABSTRACT-MARKER-9910";
   const existingMarker = "UNIQUE-EXISTING-MARKER-2201";
   const { system, user } = buildDedupPrompt(
-    abstractMarker,
-    "overview text",
-    "content text",
+    { category: "preferences", abstract: abstractMarker, overview: "overview text", content: "content text" },
     existingMarker,
   );
 
-  it("system carries the dedup decider identity and decision vocabulary", () => {
-    assert.match(system, /dedup decider/i);
+  it("system carries the dedup judge identity and decision vocabulary", () => {
+    assert.match(system, /dedup judge/i);
     assert.match(system, /\bSKIP\b/);
     assert.match(system, /\bCREATE\b/);
     assert.match(system, /\bMERGE\b/);
@@ -103,8 +101,8 @@ describe("buildDedupPrompt system/user split", () => {
     assert.doesNotMatch(system, new RegExp(existingMarker));
   });
 
-  it("separates the candidate's Abstract/Overview/Content fields with blank lines so markdown in Overview/Content doesn't collapse into the label line above it", () => {
-    assert.match(user, /Abstract: .*\n\nOverview:\n.*\n\nContent:\n/s);
+  it("renders the candidate's Abstract/Overview/Content fields as plain flush-left lines under the candidate heading", () => {
+    assert.match(user, /Abstract: .*\nOverview: overview text\nContent: content text/s);
   });
 });
 
@@ -116,13 +114,8 @@ describe("buildMergePrompt system/user split and formatting", () => {
   const existingAbstractMarker = "UNIQUE-EXISTING-ABSTRACT-3301";
   const newAbstractMarker = "UNIQUE-NEW-ABSTRACT-4402";
   const { system, user } = buildMergePrompt(
-    existingAbstractMarker,
-    "existing overview",
-    "existing content",
-    newAbstractMarker,
-    "new overview",
-    "new content",
-    "preferences",
+    { abstract: existingAbstractMarker, overview: "existing overview", content: "existing content" },
+    { category: "preferences", abstract: newAbstractMarker, overview: "new overview", content: "new content" },
   );
 
   it("system carries the merge writer identity and output format", () => {
@@ -132,8 +125,7 @@ describe("buildMergePrompt system/user split and formatting", () => {
     assert.match(system, /"content"/);
   });
 
-  it("user carries only the category and existing/new memory data", () => {
-    assert.match(user, /preferences/);
+  it("user carries the existing and new memory data", () => {
     assert.match(user, new RegExp(existingAbstractMarker));
     assert.match(user, new RegExp(newAbstractMarker));
   });
@@ -150,40 +142,25 @@ describe("buildMergePrompt system/user split and formatting", () => {
     assert.deepEqual(indentedBullets, [], "no indented bullet lines (progressive indentation regression)");
   });
 
-  it("separates each memory's Abstract/Overview/Content fields with blank lines in both the existing and new blocks", () => {
-    assert.match(user, /Existing Memory:\nAbstract: .*\n\nOverview:\n.*\n\nContent:\n/s);
-    assert.match(user, /New Information:\nAbstract: .*\n\nOverview:\n.*\n\nContent:\n/s);
+  it("renders each memory's Abstract/Overview/Content fields as plain flush-left lines under Existing/New headings", () => {
+    assert.match(user, /### Existing memory\nAbstract: .*\nOverview: existing overview\nContent: existing content/s);
+    assert.match(user, /### New information\nAbstract: .*\nOverview: new overview\nContent: new content/s);
   });
 });
 
 // ============================================================================
-// formatExistingMemoryForDedupPrompt — numbered-list indentation
+// formatExistingMemoryEntry — single-line existing-memory listing
 // ============================================================================
 
-describe("formatExistingMemoryForDedupPrompt (dedup candidate listing)", () => {
-  it("indents continuation lines of a multi-line Overview so its markdown stays nested under the numbered item instead of landing flush-left mid-list", () => {
-    const formatted = formatExistingMemoryForDedupPrompt(
-      1,
-      "preferences",
-      "Editor preferences",
-      "## Preference Domain\n- Editor: Zed\n- Theme: dark",
-      0.876,
-    );
-
-    assert.doesNotMatch(
-      formatted,
-      /\n## Preference Domain/,
-      "a continuation line of the Overview field must not land flush-left (would escape item 1's block in a rendered list)"
-    );
-    assert.equal(
-      formatted,
-      "1. [preferences] Editor preferences\n   Overview: ## Preference Domain\n   - Editor: Zed\n   - Theme: dark\n   Score: 0.876"
-    );
+describe("formatExistingMemoryEntry (dedup candidate listing)", () => {
+  it("formats one existing-memory line with category, abstract, and score", () => {
+    const formatted = formatExistingMemoryEntry(1, "preferences", "Editor preferences", 0.876);
+    assert.equal(formatted, "1. [preferences] Editor preferences (score 0.876)");
   });
 
-  it("leaves a single-line Overview unchanged", () => {
-    const formatted = formatExistingMemoryForDedupPrompt(2, "profile", "User is a backend engineer", "", 0.5);
-    assert.equal(formatted, "2. [profile] User is a backend engineer\n   Overview: \n   Score: 0.500");
+  it("formats a second entry independently", () => {
+    const formatted = formatExistingMemoryEntry(2, "profile", "User is a backend engineer", 0.5);
+    assert.equal(formatted, "2. [profile] User is a backend engineer (score 0.500)");
   });
 });
 
@@ -330,7 +307,7 @@ describe("LlmClient system-message threading (OAuth path)", () => {
 // admission-control.ts buildUtilityPrompt — identity, split, reflection framing
 // ============================================================================
 
-describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
+describe("AdmissionController buildUtilityPrompt (candidate formatting)", () => {
   const { AdmissionController, ADMISSION_CONTROL_PRESETS } = jiti("../src/admission-control.ts");
   const balanced = ADMISSION_CONTROL_PRESETS.balanced;
   const admissionStore = { async vectorSearch() { return []; } };
@@ -349,7 +326,7 @@ describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
     };
   }
 
-  it("system carries the admission judge identity; user defaults to a Conversation excerpt framing", async () => {
+  it("system carries the admission judge identity; user carries only the candidate, never the conversation excerpt", async () => {
     const llm = makeAdmissionLlm();
     const controller = new AdmissionController(admissionStore, llm, balanced);
 
@@ -368,34 +345,12 @@ describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
     assert.equal(llm.prompts.length, 1);
     const { userPrompt, systemPrompt } = llm.prompts[0];
     assert.match(systemPrompt, /admission judge/i);
-    assert.match(userPrompt, /Conversation excerpt:/);
-    assert.doesNotMatch(userPrompt, /Source document/i);
-  });
-
-  it("frames a reflection-sourced excerpt as a source document, not a conversation", async () => {
-    const llm = makeAdmissionLlm();
-    const controller = new AdmissionController(admissionStore, llm, balanced);
-
-    await controller.evaluate({
-      candidate: {
-        category: "cases",
-        abstract: "Lesson learned about retries",
-        overview: "",
-        content: "Always add jitter to retry backoff.",
-      },
-      candidateVector: [1, 0, 0],
-      conversationText: "## Lessons & pitfalls\n- Always add jitter to retry backoff",
-      scopeFilter: ["global"],
-      sourceKind: "reflection",
-    });
-
-    assert.equal(llm.prompts.length, 1);
-    const { userPrompt } = llm.prompts[0];
-    assert.match(userPrompt, /Source document \(agent reflection\)/i);
     assert.doesNotMatch(userPrompt, /Conversation excerpt:/);
+    assert.doesNotMatch(userPrompt, /Source document/i);
+    assert.doesNotMatch(userPrompt, /some real conversation text/);
   });
 
-  it("indents continuation lines of a multi-line Overview so its markdown stays nested under the bullet instead of landing flush-left mid-list", async () => {
+  it("renders a multi-line Overview as flush-left continuation lines under the candidate heading, not nested under a bullet", async () => {
     const llm = makeAdmissionLlm();
     const controller = new AdmissionController(admissionStore, llm, balanced);
 
@@ -417,7 +372,7 @@ describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
       /\n## Preference Domain/,
       "a continuation line of the Overview bullet must not land flush-left (would escape the bullet in rendered markdown)"
     );
-    assert.match(userPrompt, /- Overview: ## Preference Domain\n {2}- Editor: Zed\n {2}- Theme: dark/);
+    assert.match(userPrompt, /Overview: ## Preference Domain\nEditor: Zed\nTheme: dark/);
   });
 
   it("blank-line separates the Overview and Content bullets from the rest of the candidate block instead of gluing them with a single newline", async () => {
@@ -439,8 +394,8 @@ describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
     const { userPrompt } = llm.prompts[0];
     assert.match(
       userPrompt,
-      /- Abstract: Editor preferences\n\n- Overview: Uses Zed\n\n- Content: User prefers the Zed editor\./,
-      "Overview and Content carry multi-line content so each gets its own blank-line-separated block, not a single-\\n glued list"
+      /Abstract: Editor preferences\nOverview: Uses Zed\nContent: User prefers the Zed editor\./,
+      "Overview and Content render as plain flush-left field lines under the candidate heading"
     );
   });
 
