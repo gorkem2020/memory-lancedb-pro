@@ -4,6 +4,9 @@
  * - buildExtractionPrompt: 6-category L0/L1/L2 extraction with few-shot
  * - buildDedupPrompt: CREATE/MERGE/SKIP dedup decision
  * - buildMergePrompt: Memory merge with three-level structure
+ * Batched variants (one LLM call per pipeline stage):
+ * - buildBatchDedupPrompt: one dedup decision per numbered candidate
+ * - buildBatchMergePrompt: one merged record per numbered merge job
  */
 export function buildExtractionPrompt(conversationText, user) {
     return `Analyze the following session context and extract memories worth long-term preservation.
@@ -200,4 +203,143 @@ Return JSON:
       "overview": "Merged structured Markdown overview",
         "content": "Merged full content"
   } `;
+}
+/**
+ * Formats one labelled field for a numbered prompt block: the field on its
+ * own 3-space-indented line, multi-line values split per line with any
+ * leading markdown list-marker run (`- ` / `* `, repeated) stripped while
+ * the line's own inner indentation is kept, and every continuation line
+ * indented under the block. Other content markdown (e.g. `##` headings) is
+ * deliberately left as-is.
+ */
+function formatIndentedFieldLines(label, value) {
+    const valueLines = String(value ?? "")
+        .split("\n")
+        .map((line) => line.replace(/^(\s*)(?:[-*] )+/, "$1"));
+    const lines = [`   ${label}: ${valueLines[0]}`];
+    for (const continuation of valueLines.slice(1)) {
+        lines.push(`   ${continuation}`);
+    }
+    return lines;
+}
+/**
+ * Formats one candidate as a numbered block: `N. Category: <cat>` with the
+ * number inline on the first line, then each remaining field on its own line
+ * indented under the candidate. Multi-line field values (stored overviews
+ * commonly carry bulleted markdown like "- Name: ...") are split per line,
+ * any leading markdown list marker (`- ` / `* `) is stripped while the
+ * line's own inner indentation is kept, and every continuation line is
+ * indented under the candidate so the block stays visually grouped. Without
+ * this, content-carried bullets land at column 0 inside the numbered list
+ * and (in markdown renderers) break the list apart.
+ *
+ * Every prompt path that renders candidate memories (admission standalone,
+ * admission batch and its few-shot example, batched dedup) must emit
+ * candidate blocks through this one function so the shapes can never drift
+ * apart.
+ */
+export function formatCandidateBlock(n, candidate) {
+    const lines = [`${n}. Category: ${candidate.category}`];
+    const fields = [
+        ["Abstract", candidate.abstract],
+        ["Overview", candidate.overview],
+        ["Content", candidate.content],
+    ];
+    for (const [label, value] of fields) {
+        lines.push(...formatIndentedFieldLines(label, value));
+    }
+    return lines.join("\n");
+}
+/**
+ * Batched variant of buildDedupPrompt: one LLM call decides every numbered
+ * candidate independently. Verdict vocabulary, rules, and match_index
+ * semantics are identical to the single-candidate prompt — only the call
+ * topology changes. Returned as {system, user} so the eventual merge with
+ * the system/user prompt-architecture split is mechanical; on this branch
+ * the two are concatenated before the single-string completeJson() call.
+ */
+export function buildBatchDedupPrompt(items) {
+    const system = `Determine how to handle each numbered candidate memory in this batch. Decide every candidate independently, using only that candidate's own "Existing similar memories" list — never another candidate's.
+
+For each candidate, decide:
+- SKIP: Candidate memory duplicates existing memories, no need to save. Also SKIP if the candidate contains LESS information than an existing memory on the same topic (information degradation — e.g., candidate says "programming language preference" but existing memory already says "programming language preference: Python, TypeScript")
+- CREATE: This is completely new information not covered by any existing memory, should be created
+- MERGE: Candidate memory adds genuinely NEW details to an existing memory and should be merged
+- SUPERSEDE: Candidate states that the same mutable fact has changed over time. Keep the old memory as historical but no longer current, and create a new current memory.
+- SUPPORT: Candidate reinforces/confirms an existing memory in a specific context (e.g. "still prefers tea in the evening")
+- CONTEXTUALIZE: Candidate adds a situational nuance to an existing memory (e.g. existing: "likes coffee", candidate: "prefers tea at night" — different context, same topic)
+- CONTRADICT: Candidate directly contradicts an existing memory in a specific context (e.g. existing: "runs on weekends", candidate: "stopped running on weekends")
+
+IMPORTANT:
+- "events" and "cases" categories are independent records — they do NOT support MERGE/SUPERSEDE/SUPPORT/CONTEXTUALIZE/CONTRADICT. For these categories, only use SKIP or CREATE.
+- If the candidate appears to be derived from a recall question (e.g., "Do you remember X?" / "你记得X吗？") and an existing memory already covers topic X with equal or more detail, you MUST choose SKIP.
+- A candidate with less information than an existing memory on the same topic should NEVER be CREATED or MERGED — always SKIP.
+- For "preferences" and "entities", use SUPERSEDE when the candidate replaces the current truth instead of adding detail or context. Example: existing "Preferred editor: VS Code", candidate "Preferred editor: Zed".
+- For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
+- "match_index" always refers to the numbering of that candidate's OWN "Existing similar memories" list (1-based), never to another candidate's list and never to the candidate numbering itself.
+
+Return JSON only, with exactly one entry per candidate, in this shape:
+{
+  "results": [
+    { "index": 1, "decision": "skip|create|merge|supersede|support|contextualize|contradict", "match_index": 1, "reason": "Decision reason", "context_label": "evening" }
+  ]
+}
+
+- "index" is the candidate's number in the batch below.
+- If decision is "merge"/"supersede"/"support"/"contextualize"/"contradict", set "match_index" to the number of the matching existing memory (1-based) in that candidate's own list.
+- Only include "context_label" for support/contextualize/contradict decisions.`;
+    const blocks = items.map((item, i) => {
+        const candidateBlock = formatCandidateBlock(i + 1, item.candidate);
+        const existing = String(item.existingMemories ?? "")
+            .split("\n")
+            .map((line) => `   ${line}`)
+            .join("\n");
+        return `${candidateBlock}\n   Existing similar memories:\n${existing}`;
+    });
+    const user = `Candidates:
+
+${blocks.join("\n\n")}`;
+    return { system, user };
+}
+/**
+ * Batched variant of buildMergePrompt: one LLM call writes every numbered
+ * merge job. Each job carries its target ("Existing memory") and every
+ * candidate merging into it ("New information"); merge requirements are
+ * identical to the single-job prompt — only the call topology changes.
+ * Returned as {system, user}, concatenated at the call site on this branch.
+ */
+export function buildBatchMergePrompt(jobs) {
+    const system = `Merge each numbered job below into a single coherent record with all three levels. For each job, merge every "New information" section into that job's "Existing memory"; never mix content across jobs.
+
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers / URIs / model names unchanged when they are proper nouns
+
+Return JSON only, with exactly one entry per job, in this shape:
+{
+  "results": [
+    { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
+  ]
+}
+
+- "index" is the job's number in the batch below.`;
+    const blocks = jobs.map((job, i) => {
+        const lines = [`${i + 1}. Category: ${job.category}`, `   Existing memory:`];
+        lines.push(...formatIndentedFieldLines("Abstract", job.existing.abstract));
+        lines.push(...formatIndentedFieldLines("Overview", job.existing.overview));
+        lines.push(...formatIndentedFieldLines("Content", job.existing.content));
+        job.additions.forEach((addition, j) => {
+            lines.push(job.additions.length > 1 ? `   New information ${j + 1}:` : `   New information:`);
+            lines.push(...formatIndentedFieldLines("Abstract", addition.abstract));
+            lines.push(...formatIndentedFieldLines("Overview", addition.overview));
+            lines.push(...formatIndentedFieldLines("Content", addition.content));
+        });
+        return lines.join("\n");
+    });
+    const user = `Merge jobs:
+
+${blocks.join("\n\n")}`;
+    return { system, user };
 }
