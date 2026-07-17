@@ -488,6 +488,87 @@ export class SmartExtractor {
         }
         return stats;
     }
+    /**
+     * Uniform-pipeline entry for candidates whose extraction AND admission
+     * already happened in another lane (the reflection writer's mapped rows:
+     * distilled by the reflection model, gated by gateMappedReflectionEntries).
+     * From here on they take exactly the extraction candidates' path --
+     * batched dedup decider, verdict handling, batched merge writer, bulk
+     * create -- so a duplicate mapped row MERGES into its target instead of
+     * landing beside it.
+     *
+     * Each item supplies its own store-entry builder: a CREATE-shaped verdict
+     * persists the caller's entry (reflection metadata intact), while
+     * merge/supersede/support/contextualize/contradict operate on existing
+     * rows through the shared machinery. Callers own persistence
+     * notifications for created rows (the returned entries), keeping their
+     * lane-specific journal labels.
+     */
+    async persistGatedCandidates(items, options) {
+        const stats = { created: 0, merged: 0, skipped: 0, boundarySkipped: 0 };
+        const sessionKey = options.sessionKey ?? "reflection";
+        const targetScope = options.targetScope;
+        const scopeFilter = options.scopeFilter ?? [targetScope];
+        const conversationText = options.conversationText ?? "";
+        for (const item of items) {
+            this.externalEntryBuilders.set(item.candidate, item.buildEntry);
+        }
+        // Admission already ran in the caller's gate; this synthetic evaluation
+        // only tells processCandidate not to score again. The caller's audit
+        // lives inside its own entry metadata, so nothing here is persisted.
+        const preGated = {
+            decision: "pass_to_dedup",
+            audit: { decision: "pass_to_dedup", reason: "pre-gated by reflection admission" },
+        };
+        const precomputedDedups = new Map();
+        const dedupLlmItems = [];
+        for (let i = 0; i < items.length; i++) {
+            const { candidate, vector } = items[i];
+            try {
+                const prefilter = await this.dedupPrefilter(candidate, vector, scopeFilter);
+                if (prefilter.shortCircuit) {
+                    precomputedDedups.set(i, prefilter.shortCircuit);
+                }
+                else {
+                    dedupLlmItems.push({ index: i, candidate, topSimilar: prefilter.topSimilar });
+                }
+            }
+            catch (err) {
+                this.log(`memory-pro: smart-extractor: gated-candidate dedup pre-filter failed, deferring to inline dedup: ${String(err)}`);
+            }
+        }
+        if (dedupLlmItems.length > 0) {
+            const verdicts = await this.llmDedupDecisionBatch(dedupLlmItems);
+            dedupLlmItems.forEach((item, i) => {
+                precomputedDedups.set(item.index, verdicts[i]);
+            });
+        }
+        const createEntries = [];
+        const pendingSupersedeInvalidations = [];
+        const pendingMerges = [];
+        for (let i = 0; i < items.length; i++) {
+            const { candidate, vector } = items[i];
+            try {
+                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, vector, createEntries, pendingSupersedeInvalidations, options.agentId, preGated, precomputedDedups.get(i), pendingMerges);
+            }
+            catch (err) {
+                this.log(`memory-pro: smart-extractor: failed to process gated candidate [${candidate.category}]: ${String(err)}`);
+            }
+        }
+        await this.flushPendingMerges(pendingMerges, stats);
+        let createdEntries = [];
+        if (createEntries.length > 0) {
+            const stored = await this.bulkStoreAndValidate(createEntries);
+            if (stored) {
+                createdEntries = stored;
+                await this.applyPendingSupersedeInvalidations(stored, pendingSupersedeInvalidations);
+            }
+            else if (pendingSupersedeInvalidations.length > 0) {
+                this.log("memory-pro: smart-extractor: gated-candidate supersede invalidation skipped because bulkStore() did not return created entries");
+            }
+        }
+        return { stats, createdEntries };
+    }
     // --------------------------------------------------------------------------
     // Embedding Noise Pre-Filter
     // --------------------------------------------------------------------------
@@ -1576,7 +1657,20 @@ export class SmartExtractor {
      * Build a memory entry from candidate data (without writing).
      * Used by batch creation to reduce lock acquisitions.
      */
+    /**
+     * Entry-shape overrides for candidates persisted on behalf of another
+     * lane (persistGatedCandidates): the reflection writer supplies its own
+     * store entry (reflection metadata, decay model, importance) while the
+     * dedup/merge pipeline stays byte-identical to extraction's. Keyed by
+     * candidate object identity, so extraction's own candidates can never
+     * collide with an external lane's builders.
+     */
+    externalEntryBuilders = new WeakMap();
     buildStoreEntry(candidate, vector, sessionKey, targetScope, admissionAudit) {
+        const external = this.externalEntryBuilders.get(candidate);
+        if (external) {
+            return external(vector);
+        }
         const storeCategory = this.mapToStoreCategory(candidate.category);
         const classifyText = candidate.content || candidate.abstract;
         const metadata = stringifySmartMetadata(buildSmartMetadata({

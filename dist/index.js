@@ -36,7 +36,7 @@ import { storeReflectionToLanceDB, loadAgentReflectionSlicesFromEntries, DEFAULT
 import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
-import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { buildReflectionMappedMetadata, getReflectionMappedMemoryCategory } from "./src/reflection-mapped-metadata.js";
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.js";
 import { createMemoryCLI } from "./cli.js";
@@ -4191,6 +4191,7 @@ const memoryLanceDBProPlugin = {
                     const MAX_MAPPED_ENTRIES = 100;
                     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
                     const mappedEntries = [];
+                    const mappedGatedItems = [];
                     // Per-row embed + near-duplicate pre-check first, collecting the
                     // gate-eligible rows so the whole burst can share one admission call.
                     const gateEligible = [];
@@ -4212,17 +4213,9 @@ const memoryLanceDBProPlugin = {
                         if (searchFailed) {
                             continue;
                         }
-                        // Near-duplicate pre-check ahead of admission gating. This is the only dedup mapped
-                        // rows get: a single vector-similarity threshold, direct skip, no LLM-mediated
-                        // merge/contextualize/contradict decision. Extraction candidates own deduplicate()
-                        // (src/smart-extractor.ts) is a genuinely different, richer pipeline (a 0.7
-                        // pre-filter feeding an LLM decision, not a single hard cutoff) - deliberately not
-                        // reused here yet. AdmissionController's "pass_to_dedup" decision for a mapped row
-                        // is therefore always treated as "admit, subject to this cheaper pre-check" below,
-                        // not "route through the same merge pipeline extraction candidates get".
-                        if (existing.length > 0 && existing[0].score > 0.95) {
-                            continue;
-                        }
+                        // Admitted rows take the SAME dedup/merge pipeline extraction
+                        // candidates get (persistGatedCandidates below), so no bespoke
+                        // similarity cutoff runs here anymore.
                         gateEligible.push({ mapped, vector });
                     }
                     // Writer-1 admission routing: mapped rows previously bypassed
@@ -4237,6 +4230,7 @@ const memoryLanceDBProPlugin = {
                         rows: gateEligible.map(({ mapped, vector }) => ({
                             text: mapped.text,
                             category: mapped.category,
+                            kind: mapped.mappedKind,
                             heading: mapped.heading,
                             vector,
                         })),
@@ -4255,7 +4249,7 @@ const memoryLanceDBProPlugin = {
                             api.logger.info(`memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`);
                             continue;
                         }
-                        const importance = mapped.category === "decision" ? 0.85 : 0.8;
+                        const importance = mapped.mappedKind === "decision" ? 0.85 : 0.8;
                         const baseMetadata = buildReflectionMappedMetadata({
                             mappedItem: mapped,
                             eventId: reflectionEventId,
@@ -4273,14 +4267,62 @@ const memoryLanceDBProPlugin = {
                             baseMetadata.admission_audit = mappedGate.auditJson;
                         }
                         const metadata = JSON.stringify(baseMetadata);
-                        mappedEntries.push({
-                            text: mapped.text,
-                            vector,
-                            importance,
-                            category: mapped.category,
-                            scope: targetScope,
-                            metadata,
+                        const mappedRowCategory = getReflectionMappedMemoryCategory(mapped.mappedKind);
+                        if (smartExtractor) {
+                            // Uniform pipeline: judge (done above) -> dedup -> merge-writer,
+                            // identical to extraction candidates. The entry builder keeps
+                            // the reflection metadata on CREATE-shaped verdicts.
+                            mappedGatedItems.push({
+                                candidate: {
+                                    category: mappedRowCategory,
+                                    abstract: mapped.text,
+                                    overview: `## ${mapped.heading}`,
+                                    content: mapped.text,
+                                },
+                                vector,
+                                buildEntry: (v) => ({
+                                    text: mapped.text,
+                                    vector: v,
+                                    importance,
+                                    category: mappedRowCategory,
+                                    scope: targetScope,
+                                    metadata,
+                                }),
+                            });
+                        }
+                        else {
+                            mappedEntries.push({
+                                text: mapped.text,
+                                vector,
+                                importance,
+                                category: mappedRowCategory,
+                                scope: targetScope,
+                                metadata,
+                            });
+                        }
+                    }
+                    if (smartExtractor && mappedGatedItems.length > 0) {
+                        const gatedResult = await smartExtractor.persistGatedCandidates(mappedGatedItems, {
+                            sessionKey,
+                            targetScope,
+                            scopeFilter: [targetScope],
+                            agentId: ownerAgentId,
+                            conversationText: conversation,
                         });
+                        api.logger.info(`memory-reflection: mapped rows through uniform pipeline: ${gatedResult.createdEntries.length} created, ${gatedResult.stats.merged} merged, ${gatedResult.stats.skipped} skipped`);
+                        if (mdMirror) {
+                            for (const stored of gatedResult.createdEntries) {
+                                let heading = "unknown";
+                                try {
+                                    const storedMeta = stored.metadata ? JSON.parse(stored.metadata) : {};
+                                    heading = storedMeta._reflectionHeading ?? "unknown";
+                                }
+                                catch {
+                                    api.logger.warn(`memory-reflection: failed to parse stored metadata for entry ${stored.id}, using "unknown"`);
+                                }
+                                await mdMirror({ text: stored.text, category: stored.category, scope: stored.scope, timestamp: stored.timestamp }, { source: `reflection:${heading}`, agentId: sourceAgentId });
+                            }
+                        }
                     }
                     if (mappedEntries.length > 0) {
                         const storedEntries = await store.bulkStore(mappedEntries);
