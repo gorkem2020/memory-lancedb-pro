@@ -39,8 +39,7 @@ import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText, capUnknownWatermarkWindow } from "./src/auto-capture-cleanup.js";
-import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
+import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -369,6 +368,7 @@ const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES = 200;
+const DEFAULT_REFLECTION_CACHE_TTL_MS = 15_000;
 // After /new or /reset, the just-closed session may have generated fresh
 // derived deltas. Keep those out of the immediately opened prompt window.
 const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
@@ -768,9 +768,14 @@ function asNonEmptyString(value) {
 function isInternalReflectionSessionKey(sessionKey) {
     return typeof sessionKey === "string" && sessionKey.trim().startsWith("temp:memory-reflection");
 }
-// Memory sub-completions (active-memory's embedded recall sub-build, and any :subagent:
-// sub-build) must not re-enter memory prompt injection: they would waste an embedding+vector
-// search per turn, and their injected block can leak into the main prompt via shared session messages.
+// Any :subagent:/:active-memory: sub-build (delegated subagents in general, not only
+// memory-internal ones) is treated as "its context comes from the parent" across every
+// memory-adjacent hook in this file: auto-recall injection, reflection injection, and
+// self-improvement reminders all skip it via this same check (each with its own "skip for
+// sub-agent sessions" comment at its call site), and auto-capture (agent_end) follows the
+// same convention. This is deliberately broader than "memory-internal only"; a subagent's
+// own task-scoped conversation is not treated as an independent, capturable/injectable
+// top-level conversation by this plugin.
 function isMemorySubsessionKey(sessionKey) {
     return typeof sessionKey === "string" && (sessionKey.includes(":subagent:") || sessionKey.includes(":active-memory:"));
 }
@@ -823,21 +828,6 @@ function pruneMapIfOver(map, maxEntries) {
         const key = iter.next().value;
         if (key !== undefined)
             map.delete(key);
-    }
-}
-/**
- * Prune a Set to stay within the given maximum number of entries.
- * Deletes the oldest (earliest-inserted) values when over the limit.
- */
-function pruneSetIfOver(set, maxEntries) {
-    if (set.size <= maxEntries)
-        return;
-    const excess = set.size - maxEntries;
-    const iter = set.values();
-    for (let i = 0; i < excess; i++) {
-        const value = iter.next().value;
-        if (value !== undefined)
-            set.delete(value);
     }
 }
 function isExplicitRememberCommand(text) {
@@ -1885,12 +1875,16 @@ function _initPluginState(api) {
     const reflectionDerivedBySession = new Map();
     const reflectionDerivedSuppressionBySession = new Map();
     const reflectionByAgentCache = new Map();
+    // Bumped on every invalidateReflectionCachesAfterDelete call. loadAgentReflectionSlices
+    // snapshots this before its awaited store.list() reads and skips caching its result if
+    // it changed mid-flight, so an in-flight read can never publish a stale pre-delete
+    // snapshot back into the cache after the delete already invalidated it.
+    const reflectionByAgentCacheGeneration = { count: 0 };
     const recallHistory = new Map();
     const turnCounter = new Map();
-    const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
+    const autoCaptureSeenTextCount = new Map();
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
-    const autoCapturePayloadShapeLoggedSessions = new Set();
     return {
         config,
         resolvedDbPath,
@@ -1912,12 +1906,12 @@ function _initPluginState(api) {
         reflectionDerivedBySession,
         reflectionDerivedSuppressionBySession,
         reflectionByAgentCache,
+        reflectionByAgentCacheGeneration,
         recallHistory,
         turnCounter,
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
         autoCaptureRecentTexts,
-        autoCapturePayloadShapeLoggedSessions,
     };
 }
 export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
@@ -2026,16 +2020,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCapturePayloadShapeLoggedSessions, } = singleton;
-        // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
-        // must also go through here so the on-disk watermark never drifts from the
-        // in-memory Map -- a process restart rehydrates from exactly what was last
-        // written here (see loadAutoCaptureWatermarks at construction, above).
-        const persistAutoCaptureWatermark = async (key, value) => {
-            autoCaptureSeenTextCount.set(key, value);
-            pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
-            await saveAutoCaptureWatermarks(resolvedDbPath, autoCaptureSeenTextCount, (message) => api.logger.debug(message));
-        };
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2198,8 +2183,9 @@ const memoryLanceDBProPlugin = {
                 : "<NO_SCOPE_FILTER>";
             const cacheKey = `${agentId}::${scopeKey}`;
             const cached = reflectionByAgentCache.get(cacheKey);
-            if (cached && Date.now() - cached.updatedAt < 15_000)
+            if (cached && Date.now() - cached.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS)
                 return cached;
+            const generationAtStart = reflectionByAgentCacheGeneration.count;
             // Prefer reflection-category rows to avoid full-table reads on bypass callers.
             // Fall back to an uncategorized scan only when the category query produced no
             // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
@@ -2228,8 +2214,49 @@ const memoryLanceDBProPlugin = {
             }
             const { invariants, derived } = slices;
             const next = { updatedAt: Date.now(), invariants, derived };
-            reflectionByAgentCache.set(cacheKey, next);
+            // Only cache if no delete invalidated this cacheKey while the awaits above were in
+            // flight (TOCTOU guard); otherwise this late-arriving, possibly-stale read would
+            // silently resurrect a cache entry the delete just cleared.
+            if (reflectionByAgentCacheGeneration.count === generationAtStart) {
+                reflectionByAgentCache.set(cacheKey, next);
+            }
             return next;
+        };
+        // Fast-path invalidation for SAME-PROCESS deletes only: CLI delete/delete-bulk
+        // commands run as a short-lived, separate process from the long-running Gateway
+        // in typical deployments, so this callback firing there does not reach (and
+        // cannot invalidate) the Gateway process own in-memory caches. It only has an
+        // effect when a delete genuinely happens inside this same plugin instance.
+        //
+        // The actual cross-process staleness bound comes from two other layers:
+        //   - DEFAULT_REFLECTION_CACHE_TTL_MS bounds how long either cache below can
+        //     serve stale content after ANY delete, same-process or not (see the read
+        //     sites in loadAgentReflectionSlices and the derived-focus injector).
+        //   - readConsistencyInterval (store config) bounds how long the underlying
+        //     LanceDB table handle can serve stale rows to a fresh query in the first
+        //     place, which is what a TTL-expired cache re-populates from.
+        //
+        // reflectionByAgentCache is keyed "<agentId>::scopes:<sorted,scopes>" (or
+        // "<agentId>::<NO_SCOPE_FILTER>"); drop any entry whose scope set intersects
+        // the deleted scopes, plus every no-scope-filter entry (it spans all scopes).
+        // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
+        // cleared in full rather than left to expire on its own TTL.
+        const invalidateReflectionCachesAfterDelete = (deletedScopes) => {
+            reflectionByAgentCacheGeneration.count++;
+            const deletedSet = new Set(deletedScopes ?? []);
+            for (const cacheKey of reflectionByAgentCache.keys()) {
+                const sepIdx = cacheKey.indexOf("::");
+                const scopePart = sepIdx === -1 ? "" : cacheKey.slice(sepIdx + 2);
+                if (scopePart === "<NO_SCOPE_FILTER>" || deletedSet.size === 0) {
+                    reflectionByAgentCache.delete(cacheKey);
+                    continue;
+                }
+                const cachedScopes = scopePart.startsWith("scopes:") ? scopePart.slice("scopes:".length).split(",") : [];
+                if (cachedScopes.some((s) => deletedSet.has(s))) {
+                    reflectionByAgentCache.delete(cacheKey);
+                }
+            }
+            reflectionDerivedBySession.clear();
         };
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
@@ -2334,6 +2361,9 @@ const memoryLanceDBProPlugin = {
             mdMirror,
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
+            // Mirrors the CLI context wiring below: keep in-process reflection caches
+            // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
+            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         }, {
             enableManagementTools: config.enableManagementTools,
             enableSelfImprovementTools: config.selfImprovement?.enabled === true,
@@ -2373,6 +2403,7 @@ const memoryLanceDBProPlugin = {
             store,
             retriever,
             scopeManager,
+            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
             migrator,
             embedder,
             llmClient: smartExtractor ? (() => {
@@ -2836,6 +2867,16 @@ const memoryLanceDBProPlugin = {
                 if (!event.success || !event.messages || event.messages.length === 0) {
                     return;
                 }
+                // Internal memory sub-sessions (the reflection distiller's embedded
+                // temp:memory-reflection run, :subagent:/:active-memory: sub-builds) emit
+                // agent_end too; capturing them would extract memory scaffolding prompts
+                // as if they were conversation. Same guard convention as the sibling
+                // reflection injection hooks.
+                const hookSessionKey = ctx?.sessionKey || event.sessionKey;
+                if (isInternalReflectionSessionKey(hookSessionKey) || isMemorySubsessionKey(hookSessionKey)) {
+                    api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 internal memory session '${hookSessionKey}'`);
+                    return;
+                }
                 // Fire-and-forget: run capture work in the background so the hook
                 // returns immediately and does not hold the session lock.  Blocking
                 // here causes downstream channel deliveries (e.g. Telegram) to be
@@ -2912,39 +2953,18 @@ const memoryLanceDBProPlugin = {
                         if (conversationKey) {
                             autoCapturePendingIngressTexts.delete(conversationKey);
                         }
-                        const minMessages = config.extractMinMessages ?? 4;
                         const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
                         let newTexts = eligibleTexts;
-                        let watermarkAdvanceOverride = null;
                         if (pendingIngressTexts.length > 0) {
                             newTexts = pendingIngressTexts;
                         }
                         else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
                             newTexts = eligibleTexts.slice(previousSeenCount);
                         }
-                        else if (previousSeenCount === 0 && eligibleTexts.length > minMessages) {
-                            // issue #417 item 5: a genuinely unknown watermark (first-ever
-                            // run, or persisted state lost) meeting a history-carrying
-                            // payload must not ingest the entire transcript in one call.
-                            // Cap to the most recent batch and forfeit the rest by marking
-                            // it seen below, rather than queueing it for a later turn.
-                            newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
-                            watermarkAdvanceOverride = eligibleTexts.length;
-                        }
                         // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
-                        const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newTexts.length);
-                        await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
-                        // Once per session per process (not persisted, not per turn): a
-                        // restart re-emits this, which is exactly when you want to
-                        // re-confirm the payload shape in the new process. This single
-                        // INFO line answers the delta-only-vs-history-carrying question
-                        // and the gate's fire/skip decision without reconstructing them
-                        // from DEBUG-only evidence across unrelated log lines.
-                        if (!autoCapturePayloadShapeLoggedSessions.has(sessionKey)) {
-                            autoCapturePayloadShapeLoggedSessions.add(sessionKey);
-                            pruneSetIfOver(autoCapturePayloadShapeLoggedSessions, AUTO_CAPTURE_MAP_MAX_ENTRIES);
-                            api.logger.info(`memory-lancedb-pro: auto-capture payload shape for agent ${agentId} (sessionKey=${sessionKey}): messages=${event.messages.length}, eligible=${eligibleTexts.length}, previousSeen=${previousSeenCount}, cumulative=${cumulativeCount}, fired=${cumulativeCount >= minMessages ? "yes" : "no"}`);
-                        }
+                        const cumulativeCount = previousSeenCount + newTexts.length;
+                        autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
+                        pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
                         let texts = newTexts;
                         if (texts.length === 1 &&
@@ -2957,6 +2977,7 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
+                        const minMessages = config.extractMinMessages ?? 4;
                         if (skippedAutoCaptureTexts > 0) {
                             api.logger.debug(`memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`);
                         }
@@ -3034,7 +3055,7 @@ const memoryLanceDBProPlugin = {
                                     // turn re-read and re-extract the entire history. Record the
                                     // consumed history length there instead, so the next turn
                                     // only sees the delta.
-                                    await persistAutoCaptureWatermark(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
+                                    autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
@@ -3046,19 +3067,6 @@ const memoryLanceDBProPlugin = {
                             }
                             else {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
-                                // For history-carrying sessions, roll the cursor back so the
-                                // next turn's slice re-includes these texts in the extraction
-                                // input -- otherwise a run of below-threshold turns would each
-                                // tentatively advance the cursor and the eventual firing turn
-                                // would only see its own last slice, silently forfeiting every
-                                // earlier deferred turn's content. Ingress-fed sessions keep
-                                // their accumulator advance: their per-turn text is not
-                                // recoverable on the next turn by design (the ingress queue
-                                // was already drained), and rolling back would keep the count
-                                // below the threshold forever.
-                                if (pendingIngressTexts.length === 0) {
-                                    await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
-                                }
                             }
                         }
                         api.logger.debug(`memory-lancedb-pro: auto-capture running regex fallback for agent ${agentId}`);
@@ -3582,7 +3590,8 @@ const memoryLanceDBProPlugin = {
                                 reflectionDerivedSuppressionBySession.delete(sessionKey);
                             const scopes = resolveScopeFilter(scopeManager, agentId);
                             const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-                            const derivedLines = derivedCache?.derived?.length
+                            const derivedCacheFresh = derivedCache && Date.now() - derivedCache.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS;
+                            const derivedLines = derivedCacheFresh && derivedCache.derived.length
                                 ? derivedCache.derived
                                 : (await loadAgentReflectionSlices(agentId, scopes)).derived;
                             if (derivedLines.length > 0) {
@@ -3662,13 +3671,7 @@ const memoryLanceDBProPlugin = {
                 const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {});
                 const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
                 let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
-                const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
-                const sourceAgentId = parsedAgentId || "main";
-                // Ownership written into persisted reflection metadata must never be minted as
-                // "main" when the sessionKey fails to resolve to a real agent, that would silently
-                // misattribute the reflection to (and make it inheritable by) an unrelated agent.
-                // isOwnedByAgent() treats an empty owner as non-inheritable.
-                const ownerAgentId = parsedAgentId || "";
+                const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
                 const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
                 if (isSessionBoundaryReflectionAction(action)) {
                     const now = Date.now();
@@ -3803,16 +3806,7 @@ const memoryLanceDBProPlugin = {
                     const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
                     const targetScope = isSystemBypassId(sourceAgentId)
                         ? config.scopes?.default ?? "global"
-                        : parsedAgentId
-                            ? scopeManager.getDefaultScope(sourceAgentId)
-                            // A session that never resolved to a real agent must not be routed into
-                            // main's default scope: ownerAgentId is already blanked for exactly this
-                            // case so the row is not inheritable via isOwnedByAgent(), but a plain
-                            // scope-filtered read (list/vectorSearch/etc. with no ownership check)
-                            // would still see it if it landed in "agent:main". Route it into a scope
-                            // no agent's getAccessibleScopes() ever grants instead, so it stays
-                            // findable by an unrestricted/admin read but invisible to every agent.
-                            : "unattributed:reflection";
+                        : scopeManager.getDefaultScope(sourceAgentId);
                     const toolErrorSignals = sessionKey
                         ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
                         : [];
@@ -3935,7 +3929,7 @@ const memoryLanceDBProPlugin = {
                         const baseMetadata = buildReflectionMappedMetadata({
                             mappedItem: mapped,
                             eventId: reflectionEventId,
-                            agentId: ownerAgentId,
+                            agentId: sourceAgentId,
                             sessionKey,
                             sessionId: currentSessionId || "unknown",
                             runAt: nowTs,
@@ -3978,7 +3972,7 @@ const memoryLanceDBProPlugin = {
                             reflectionText,
                             sessionKey,
                             sessionId: currentSessionId || "unknown",
-                            agentId: ownerAgentId,
+                            agentId: sourceAgentId,
                             command: String(event.action || "unknown"),
                             scope: targetScope,
                             toolErrorSignals,
@@ -3993,7 +3987,13 @@ const memoryLanceDBProPlugin = {
                         });
                         if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
                             reflectionDerivedBySession.set(sessionKey, {
-                                updatedAt: nowTs,
+                                // Deliberately Date.now(), not nowTs (which mirrors the host-supplied
+                                // event.timestamp and can be skewed/future-dated): this field is a TTL
+                                // bookkeeping mark, and DEFAULT_REFLECTION_CACHE_TTL_MS above compares it
+                                // against a fresh Date.now() on every read. A skewed updatedAt can make
+                                // "Date.now() - updatedAt" go negative, which is always < the TTL, so the
+                                // cache would read as fresh indefinitely until wall-clock time caught up.
+                                updatedAt: Date.now(),
                                 derived: stored.slices.derived,
                             });
                         }
