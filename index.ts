@@ -1503,11 +1503,21 @@ async function ensureDailyLogFile(dailyPath: string, dateStr: string): Promise<v
   }
 }
 
-export function buildReflectionPrompt(
+type ReflectionPromptParts = { system: string; user: string };
+
+// Slot split: system = identity + every static block (task, headings
+// contract, hard rules, section/governance rules, notes, output template),
+// delivered to the embedded runner via the fleet core's
+// systemPromptOverride; user = only the dynamically generated content
+// (tool error signals + the INPUT transcript fence). The prompt text is
+// verbatim from the previous single-slot form: joining system + blank line
+// + user reproduces it exactly, and the CLI fallback (no system slot) and
+// the prompt hash still use that combined form.
+export function buildReflectionPromptParts(
   conversation: string,
   maxInputChars: number,
   toolErrorSignals: ReflectionErrorSignal[] = []
-): { system: string; user: string } {
+): ReflectionPromptParts {
   const clipped = conversation.slice(-maxInputChars);
   const errorHints = toolErrorSignals.length > 0
     ? toolErrorSignals
@@ -1515,7 +1525,7 @@ export function buildReflectionPrompt(
       .join("\n")
     : "- (none)";
   const system = [
-    "You are a memory reflection distiller. Generate a durable MEMORY REFLECTION entry for an AI assistant system.",
+    "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
     "",
     "Output Markdown only. No intro text. No outro text. No extra headings.",
     "",
@@ -1624,6 +1634,18 @@ export function buildReflectionPrompt(
   return { system, user };
 }
 
+// Combined single-slot form of the distiller prompt. Exported for tests
+// that assert on the full prompt text (PR #931 adds one); the embedded
+// runner itself consumes the split parts above.
+export function buildReflectionPrompt(
+  conversation: string,
+  maxInputChars: number,
+  toolErrorSignals: ReflectionErrorSignal[] = []
+): string {
+  const parts = buildReflectionPromptParts(conversation, maxInputChars, toolErrorSignals);
+  return `${parts.system}\n\n${parts.user}`;
+}
+
 function buildReflectionFallbackText(): string {
   return [
     "## Context (session background)",
@@ -1725,12 +1747,14 @@ export async function generateReflectionText(
 async function generateReflectionTextUnbounded(
   params: GenerateReflectionTextParams
 ): Promise<GenerateReflectionTextResult> {
-  const { system: reflectionSystemPrompt, user: reflectionUserPrompt } = buildReflectionPrompt(
+  const promptParts = buildReflectionPromptParts(
     params.conversation,
     params.maxInputChars,
     params.toolErrorSignals ?? []
   );
-  const prompt = `${reflectionSystemPrompt}\n\n${reflectionUserPrompt}`;
+  // The combined single-slot form: hashed for change detection and sent
+  // as-is by the CLI fallback runner, which has no system-prompt slot.
+  const prompt = `${promptParts.system}\n\n${promptParts.user}`;
   const promptHash = sha256Hex(prompt);
   const tempSessionFile = join(
     tmpdir(),
@@ -1778,7 +1802,12 @@ async function generateReflectionTextUnbounded(
             sessionFile: tempSessionFile,
             workspaceDir: params.workspaceDir,
             config: params.cfg,
-            prompt,
+            prompt: promptParts.user,
+            // Fleet core replaces the built system prompt with the static
+            // distiller block; stock core silently ignores unknown params
+            // (and would drop the static block entirely), which is why
+            // this split ships on the fleet branch only.
+            systemPromptOverride: promptParts.system,
             promptMode: "minimal",
             disableTools: true,
             disableMessageTool: true,

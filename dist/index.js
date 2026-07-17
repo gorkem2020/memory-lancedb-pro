@@ -37,7 +37,6 @@ import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
-import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
@@ -1014,14 +1013,22 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
         await writeFile(dailyPath, `# ${dateStr}\n\n`, "utf-8");
     }
 }
-export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
+// Slot split: system = identity + every static block (task, headings
+// contract, hard rules, section/governance rules, notes, output template),
+// delivered to the embedded runner via the fleet core's
+// systemPromptOverride; user = only the dynamically generated content
+// (tool error signals + the INPUT transcript fence). The prompt text is
+// verbatim from the previous single-slot form: joining system + blank line
+// + user reproduces it exactly, and the CLI fallback (no system slot) and
+// the prompt hash still use that combined form.
+export function buildReflectionPromptParts(conversation, maxInputChars, toolErrorSignals = []) {
     const clipped = conversation.slice(-maxInputChars);
     const errorHints = toolErrorSignals.length > 0
         ? toolErrorSignals
             .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
             .join("\n")
         : "- (none)";
-    return [
+    const system = [
         "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
         "",
         "Output Markdown only. No intro text. No outro text. No extra headings.",
@@ -1045,7 +1052,6 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         "- Do not wrap one bullet across multiple lines.",
         "- If a bullet section is empty, write exactly: '- (none captured)'",
         "- Do not paste raw transcript.",
-        "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
         "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
         "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
         "",
@@ -1118,7 +1124,8 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         "",
         "## Derived",
         "- This run showed ...",
-        "",
+    ].join("\n");
+    const user = [
         "Recent tool error signals:",
         errorHints,
         "",
@@ -1127,6 +1134,14 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         clipped,
         "```",
     ].join("\n");
+    return { system, user };
+}
+// Combined single-slot form of the distiller prompt. Exported for tests
+// that assert on the full prompt text (PR #931 adds one); the embedded
+// runner itself consumes the split parts above.
+export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
+    const parts = buildReflectionPromptParts(conversation, maxInputChars, toolErrorSignals);
+    return `${parts.system}\n\n${parts.user}`;
 }
 function buildReflectionFallbackText() {
     return [
@@ -1202,7 +1217,10 @@ export async function generateReflectionText(params) {
     }
 }
 async function generateReflectionTextUnbounded(params) {
-    const prompt = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    const promptParts = buildReflectionPromptParts(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
+    // The combined single-slot form: hashed for change detection and sent
+    // as-is by the CLI fallback runner, which has no system-prompt slot.
+    const prompt = `${promptParts.system}\n\n${promptParts.user}`;
     const promptHash = sha256Hex(prompt);
     const tempSessionFile = join(tmpdir(), `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
     let reflectionText = null;
@@ -1243,7 +1261,12 @@ async function generateReflectionTextUnbounded(params) {
                     sessionFile: tempSessionFile,
                     workspaceDir: params.workspaceDir,
                     config: params.cfg,
-                    prompt,
+                    prompt: promptParts.user,
+                    // Fleet core replaces the built system prompt with the static
+                    // distiller block; stock core silently ignores unknown params
+                    // (and would drop the static block entirely), which is why
+                    // this split ships on the fleet branch only.
+                    systemPromptOverride: promptParts.system,
                     promptMode: "minimal",
                     disableTools: true,
                     disableMessageTool: true,
@@ -3852,11 +3875,8 @@ const memoryLanceDBProPlugin = {
                     const MAX_MAPPED_ENTRIES = 100;
                     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
                     const mappedEntries = [];
-                    // Per-row embed + near-duplicate pre-check first, collecting the
-                    // gate-eligible rows so the whole burst can share one admission call.
-                    const gateEligible = [];
                     for (const mapped of mappedReflectionMemories) {
-                        if (gateEligible.length >= MAX_MAPPED_ENTRIES) {
+                        if (mappedEntries.length >= MAX_MAPPED_ENTRIES) {
                             api.logger.warn(`memory-reflection: mapped entries cap (${MAX_MAPPED_ENTRIES}) reached, skipping remaining items`);
                             break;
                         }
@@ -3873,47 +3893,7 @@ const memoryLanceDBProPlugin = {
                         if (searchFailed) {
                             continue;
                         }
-                        // Near-duplicate pre-check ahead of admission gating. This is the only dedup mapped
-                        // rows get: a single vector-similarity threshold, direct skip, no LLM-mediated
-                        // merge/contextualize/contradict decision. Extraction candidates own deduplicate()
-                        // (src/smart-extractor.ts) is a genuinely different, richer pipeline (a 0.7
-                        // pre-filter feeding an LLM decision, not a single hard cutoff) - deliberately not
-                        // reused here yet. AdmissionController's "pass_to_dedup" decision for a mapped row
-                        // is therefore always treated as "admit, subject to this cheaper pre-check" below,
-                        // not "route through the same merge pipeline extraction candidates get".
                         if (existing.length > 0 && existing[0].score > 0.95) {
-                            continue;
-                        }
-                        gateEligible.push({ mapped, vector });
-                    }
-                    // Writer-1 admission routing: mapped rows previously bypassed
-                    // admission control entirely. Gate the whole burst through the same
-                    // AdmissionController as extraction candidates: one batched judge
-                    // call per burst when the controller supports evaluateBatch, the
-                    // historical per-row path otherwise; passthrough when admission
-                    // control (or smart extraction) is disabled.
-                    const mappedGateResults = await gateMappedReflectionEntries({
-                        admissionController: smartExtractor?.getAdmissionController() ?? null,
-                        attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
-                        rows: gateEligible.map(({ mapped, vector }) => ({
-                            text: mapped.text,
-                            category: mapped.category,
-                            heading: mapped.heading,
-                            vector,
-                        })),
-                        // The real transcript, not reflectionText (the distiller's own generated
-                        // output mapped rows are parsed FROM): using the distillate as its own
-                        // grounding evidence would let a hallucinated line appear self-grounded.
-                        conversationText: conversation,
-                        scopeFilter: [targetScope],
-                        warnLog: (msg) => api.logger.warn(msg),
-                    });
-                    // Consume the per-row gate results in input order.
-                    for (let gateIndex = 0; gateIndex < gateEligible.length; gateIndex++) {
-                        const { mapped, vector } = gateEligible[gateIndex];
-                        const mappedGate = mappedGateResults[gateIndex];
-                        if (!mappedGate.admit) {
-                            api.logger.info(`memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`);
                             continue;
                         }
                         const importance = mapped.category === "decision" ? 0.85 : 0.8;
@@ -3930,9 +3910,6 @@ const memoryLanceDBProPlugin = {
                         });
                         // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
                         baseMetadata._reflectionHeading = mapped.heading;
-                        if (mappedGate.auditJson) {
-                            baseMetadata.admission_audit = mappedGate.auditJson;
-                        }
                         const metadata = JSON.stringify(baseMetadata);
                         mappedEntries.push({
                             text: mapped.text,
