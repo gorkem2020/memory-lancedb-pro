@@ -37,10 +37,10 @@ import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
-import { gateMappedReflectionEntry } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import { normalizeAutoCaptureText, capUnknownWatermarkWindow } from "./src/auto-capture-cleanup.js";
+import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -52,7 +52,7 @@ import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, toLifecycleMemory, } from "./src/smart-metadata.js";
 import { computeTier1Patch, isSuppressed as isTier1Suppressed, TIER1_DEFAULT_BAD_RECALL_DECAY_MS, TIER1_DEFAULT_SUPPRESSION_DURATION_MS, } from "./src/auto-recall-tier1.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./src/workspace-boundary.js";
-import { normalizeAdmissionControlConfig, resolveAdmissionModel, createAdmissionController, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
+import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
@@ -759,17 +759,6 @@ export function inferProviderFromBaseURL(baseURL) {
         return undefined;
     }
 }
-/**
- * Feature-detect the OpenClaw host-managed runtime LLM completion surface
- * (api.runtime.llm.complete). Returns undefined on older hosts that do not
- * expose it yet, so callers can fall back to the direct/oauth transport.
- */
-export function resolveRuntimeLlmComplete(api) {
-    const runtimeLlm = api.runtime?.llm;
-    return typeof runtimeLlm?.complete === "function"
-        ? runtimeLlm.complete.bind(runtimeLlm)
-        : undefined;
-}
 function asNonEmptyString(value) {
     if (typeof value !== "string")
         return undefined;
@@ -834,6 +823,21 @@ function pruneMapIfOver(map, maxEntries) {
         const key = iter.next().value;
         if (key !== undefined)
             map.delete(key);
+    }
+}
+/**
+ * Prune a Set to stay within the given maximum number of entries.
+ * Deletes the oldest (earliest-inserted) values when over the limit.
+ */
+function pruneSetIfOver(set, maxEntries) {
+    if (set.size <= maxEntries)
+        return;
+    const excess = set.size - maxEntries;
+    const iter = set.values();
+    for (let i = 0; i < excess; i++) {
+        const value = iter.next().value;
+        if (value !== undefined)
+            set.delete(value);
     }
 }
 function isExplicitRememberCommand(text) {
@@ -1020,7 +1024,7 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
         await writeFile(dailyPath, `# ${dateStr}\n\n`, "utf-8");
     }
 }
-export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
+function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
     const clipped = conversation.slice(-maxInputChars);
     const errorHints = toolErrorSignals.length > 0
         ? toolErrorSignals
@@ -1051,7 +1055,6 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         "- Do not wrap one bullet across multiple lines.",
         "- If a bullet section is empty, write exactly: '- (none captured)'",
         "- Do not paste raw transcript.",
-        "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
         "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
         "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
         "",
@@ -1818,32 +1821,19 @@ function _initPluginState(api) {
     // callback below closes over it.
     const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
-    let admissionController = null;
-    let admissionControllerReflectionLane = null;
     if (config.smartExtraction !== false) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
-            // A host-transport setup should never silently fall back to the
-            // embedding lane's credentials if the runtime.llm.complete surface
-            // turns out to be unavailable and createLlmClient falls back to a
-            // direct client -- that talks to the wrong provider with the wrong
-            // key on a split-provider setup. Leave apiKey/baseURL unset in that
-            // case; createLlmClient throws a clear error / defaults the baseURL.
-            const llmIsHostTransport = config.llm?.transport === "host";
             const llmApiKey = llmAuth === "oauth"
                 ? undefined
                 : config.llm?.apiKey
                     ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-                    : llmIsHostTransport
-                        ? undefined
-                        : resolveFirstApiKey(api, config.embedding.apiKey);
+                    : resolveFirstApiKey(api, config.embedding.apiKey);
             const llmBaseURL = llmAuth === "oauth"
                 ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                 : config.llm?.baseURL
                     ? resolveEnvVars(config.llm.baseURL)
-                    : llmIsHostTransport
-                        ? undefined
-                        : config.embedding.baseURL;
+                    : config.embedding.baseURL;
             const llmModel = config.llm?.model || "openai/gpt-oss-120b";
             const llmOauthPath = llmAuth === "oauth"
                 ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
@@ -1858,50 +1848,12 @@ function _initPluginState(api) {
                 oauthProvider: llmOauthProvider,
                 oauthPath: llmOauthPath,
                 timeoutMs: llmTimeoutMs,
-                transport: config.llm?.transport,
-                thinkLevel: config.llm?.thinkLevel,
-                reasoningEffort: config.llm?.reasoningEffort,
-                runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
             });
             const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
             noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
             const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
-            // Model resolution for admission calls: explicit admissionControl.model
-            // override > lane affinity (reflection lane resolves the
-            // memoryReflection model) > global default. See resolveAdmissionModel().
-            const reflectionModelForAdmission = asNonEmptyString(config.memoryReflection?.model);
-            const admissionModelExtraction = resolveAdmissionModel({
-                admissionControl: config.admissionControl,
-                lane: "other",
-                globalModel: llmModel,
-                reflectionModel: reflectionModelForAdmission,
-            });
-            const admissionModelReflection = resolveAdmissionModel({
-                admissionControl: config.admissionControl,
-                lane: "reflection",
-                globalModel: llmModel,
-                reflectionModel: reflectionModelForAdmission,
-            });
-            const buildAdmissionLlmClient = (model) => model === llmModel
-                ? llmClient
-                : createLlmClient({
-                    auth: llmAuth,
-                    apiKey: llmApiKey,
-                    model,
-                    baseURL: llmBaseURL,
-                    oauthProvider: llmOauthProvider,
-                    oauthPath: llmOauthPath,
-                    timeoutMs: llmTimeoutMs,
-                    log: (msg) => api.logger.debug(msg),
-                    warnLog: (msg) => api.logger.warn(msg),
-                });
-            admissionController = createAdmissionController(store, buildAdmissionLlmClient(admissionModelExtraction), config.admissionControl, (msg) => api.logger.debug(msg));
-            admissionControllerReflectionLane =
-                admissionModelReflection === admissionModelExtraction
-                    ? admissionController
-                    : createAdmissionController(store, buildAdmissionLlmClient(admissionModelReflection), config.admissionControl, (msg) => api.logger.debug(msg));
             smartExtractor = new SmartExtractor(store, embedder, llmClient, {
                 user: "User",
                 extractMinMessages: config.extractMinMessages ?? 4,
@@ -1909,7 +1861,6 @@ function _initPluginState(api) {
                 defaultScope: config.scopes?.default ?? "global",
                 workspaceBoundary: config.workspaceBoundary,
                 admissionControl: config.admissionControl,
-                admissionController,
                 onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
                 onPersisted: mdMirror ?? undefined,
                 log: (msg) => api.logger.info(msg),
@@ -1936,9 +1887,10 @@ function _initPluginState(api) {
     const reflectionByAgentCache = new Map();
     const recallHistory = new Map();
     const turnCounter = new Map();
-    const autoCaptureSeenTextCount = new Map();
+    const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
+    const autoCapturePayloadShapeLoggedSessions = new Set();
     return {
         config,
         resolvedDbPath,
@@ -1954,8 +1906,6 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
-        admissionController,
-        admissionControllerReflectionLane,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
@@ -1967,6 +1917,7 @@ function _initPluginState(api) {
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
         autoCaptureRecentTexts,
+        autoCapturePayloadShapeLoggedSessions,
     };
 }
 export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
@@ -1999,9 +1950,6 @@ export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
     return false;
 }
 const _channelPluginDiagnosticWarnings = new Set();
-export function resolveMappedRowAdmissionController(reflectionLane, extractionLane) {
-    return reflectionLane ?? extractionLane;
-}
 function readRecord(value) {
     return value && typeof value === "object" && !Array.isArray(value)
         ? value
@@ -2078,7 +2026,16 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, admissionControllerReflectionLane, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCapturePayloadShapeLoggedSessions, } = singleton;
+        // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
+        // must also go through here so the on-disk watermark never drifts from the
+        // in-memory Map -- a process restart rehydrates from exactly what was last
+        // written here (see loadAutoCaptureWatermarks at construction, above).
+        const persistAutoCaptureWatermark = async (key, value) => {
+            autoCaptureSeenTextCount.set(key, value);
+            pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            await saveAutoCaptureWatermarks(resolvedDbPath, autoCaptureSeenTextCount, (message) => api.logger.debug(message));
+        };
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2418,25 +2375,19 @@ const memoryLanceDBProPlugin = {
             scopeManager,
             migrator,
             embedder,
-            mdMirror,
             llmClient: smartExtractor ? (() => {
                 try {
                     const llmAuth = config.llm?.auth || "api-key";
-                    const llmIsHostTransport = config.llm?.transport === "host";
                     const llmApiKey = llmAuth === "oauth"
                         ? undefined
                         : config.llm?.apiKey
                             ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-                            : llmIsHostTransport
-                                ? undefined
-                                : resolveFirstApiKey(api, config.embedding.apiKey);
+                            : resolveFirstApiKey(api, config.embedding.apiKey);
                     const llmBaseURL = llmAuth === "oauth"
                         ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                         : config.llm?.baseURL
                             ? resolveEnvVars(config.llm.baseURL)
-                            : llmIsHostTransport
-                                ? undefined
-                                : config.embedding.baseURL;
+                            : config.embedding.baseURL;
                     const llmOauthPath = llmAuth === "oauth"
                         ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
                         : undefined;
@@ -2452,10 +2403,6 @@ const memoryLanceDBProPlugin = {
                         oauthProvider: llmOauthProvider,
                         oauthPath: llmOauthPath,
                         timeoutMs: llmTimeoutMs,
-                        transport: config.llm?.transport,
-                        thinkLevel: config.llm?.thinkLevel,
-                        reasoningEffort: config.llm?.reasoningEffort,
-                        runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                         log: (msg) => api.logger.debug(msg),
                     });
                 }
@@ -2965,18 +2912,39 @@ const memoryLanceDBProPlugin = {
                         if (conversationKey) {
                             autoCapturePendingIngressTexts.delete(conversationKey);
                         }
+                        const minMessages = config.extractMinMessages ?? 4;
                         const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
                         let newTexts = eligibleTexts;
+                        let watermarkAdvanceOverride = null;
                         if (pendingIngressTexts.length > 0) {
                             newTexts = pendingIngressTexts;
                         }
                         else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
                             newTexts = eligibleTexts.slice(previousSeenCount);
                         }
+                        else if (previousSeenCount === 0 && eligibleTexts.length > minMessages) {
+                            // issue #417 item 5: a genuinely unknown watermark (first-ever
+                            // run, or persisted state lost) meeting a history-carrying
+                            // payload must not ingest the entire transcript in one call.
+                            // Cap to the most recent batch and forfeit the rest by marking
+                            // it seen below, rather than queueing it for a later turn.
+                            newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
+                            watermarkAdvanceOverride = eligibleTexts.length;
+                        }
                         // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
-                        const cumulativeCount = previousSeenCount + newTexts.length;
-                        autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
-                        pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newTexts.length);
+                        await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
+                        // Once per session per process (not persisted, not per turn): a
+                        // restart re-emits this, which is exactly when you want to
+                        // re-confirm the payload shape in the new process. This single
+                        // INFO line answers the delta-only-vs-history-carrying question
+                        // and the gate's fire/skip decision without reconstructing them
+                        // from DEBUG-only evidence across unrelated log lines.
+                        if (!autoCapturePayloadShapeLoggedSessions.has(sessionKey)) {
+                            autoCapturePayloadShapeLoggedSessions.add(sessionKey);
+                            pruneSetIfOver(autoCapturePayloadShapeLoggedSessions, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                            api.logger.info(`memory-lancedb-pro: auto-capture payload shape for agent ${agentId} (sessionKey=${sessionKey}): messages=${event.messages.length}, eligible=${eligibleTexts.length}, previousSeen=${previousSeenCount}, cumulative=${cumulativeCount}, fired=${cumulativeCount >= minMessages ? "yes" : "no"}`);
+                        }
                         const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
                         let texts = newTexts;
                         if (texts.length === 1 &&
@@ -2989,7 +2957,6 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
-                        const minMessages = config.extractMinMessages ?? 4;
                         if (skippedAutoCaptureTexts > 0) {
                             api.logger.debug(`memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`);
                         }
@@ -3058,18 +3025,20 @@ const memoryLanceDBProPlugin = {
                                 extractionRateLimiter.recordExtraction();
                                 if (stats.created > 0 || stats.merged > 0) {
                                     api.logger.info(`memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped for agent ${agentId}`);
-                                    // issue #417 Fix #5: reset counter after successful extraction
-                                    autoCaptureSeenTextCount.set(sessionKey, 0);
+                                    // issue #417 Fix #9 windowing applies to ingress-fed sessions:
+                                    // their counter is a pure accumulator of new texts toward
+                                    // minMessages, so it restarts at 0 after a successful
+                                    // extraction. For history-carrying sessions (agent_end
+                                    // delivers the whole session each turn) the same counter is
+                                    // also the slice cursor; resetting it to 0 made the next
+                                    // turn re-read and re-extract the entire history. Record the
+                                    // consumed history length there instead, so the next turn
+                                    // only sees the delta.
+                                    await persistAutoCaptureWatermark(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
                                     api.logger.info(`memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`);
-                                    // A valid-empty result (the LLM genuinely ran and confirmed
-                                    // nothing worth storing) is just as conclusive as a
-                                    // successful extraction for watermark purposes -- reset the
-                                    // same way (issue #417 Fix #5), or the next turn re-fires on
-                                    // just one new message instead of waiting for a fresh window.
-                                    autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
                                     return;
                                 }
                                 api.logger.info(`memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`);
@@ -3077,6 +3046,19 @@ const memoryLanceDBProPlugin = {
                             }
                             else {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
+                                // For history-carrying sessions, roll the cursor back so the
+                                // next turn's slice re-includes these texts in the extraction
+                                // input -- otherwise a run of below-threshold turns would each
+                                // tentatively advance the cursor and the eventual firing turn
+                                // would only see its own last slice, silently forfeiting every
+                                // earlier deferred turn's content. Ingress-fed sessions keep
+                                // their accumulator advance: their per-turn text is not
+                                // recoverable on the next turn by design (the ingress queue
+                                // was already drained), and rolling back would keep the count
+                                // below the threshold forever.
+                                if (pendingIngressTexts.length === 0) {
+                                    await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
+                                }
                             }
                         }
                         api.logger.debug(`memory-lancedb-pro: auto-capture running regex fallback for agent ${agentId}`);
@@ -3934,25 +3916,6 @@ const memoryLanceDBProPlugin = {
                         if (existing.length > 0 && existing[0].score > 0.95) {
                             continue;
                         }
-                        // Writer-1 admission routing: mapped rows previously bypassed
-                        // admission control entirely. Gate each row through the same
-                        // AdmissionController as extraction candidates; passthrough when
-                        // admission control (or smart extraction) is disabled.
-                        const mappedGate = await gateMappedReflectionEntry({
-                            admissionController: resolveMappedRowAdmissionController(admissionControllerReflectionLane, smartExtractor?.getAdmissionController() ?? null),
-                            attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
-                            text: mapped.text,
-                            category: mapped.category,
-                            heading: mapped.heading,
-                            vector,
-                            reflectionText,
-                            scopeFilter: [targetScope],
-                            warnLog: (msg) => api.logger.warn(msg),
-                        });
-                        if (!mappedGate.admit) {
-                            api.logger.info(`memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`);
-                            continue;
-                        }
                         const importance = mapped.category === "decision" ? 0.85 : 0.8;
                         const baseMetadata = buildReflectionMappedMetadata({
                             mappedItem: mapped,
@@ -3967,9 +3930,6 @@ const memoryLanceDBProPlugin = {
                         });
                         // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
                         baseMetadata._reflectionHeading = mapped.heading;
-                        if (mappedGate.auditJson) {
-                            baseMetadata.admission_audit = mappedGate.auditJson;
-                        }
                         const metadata = JSON.stringify(baseMetadata);
                         mappedEntries.push({
                             text: mapped.text,
@@ -4015,14 +3975,6 @@ const memoryLanceDBProPlugin = {
                             embedPassage: (text) => embedder.embedPassage(text),
                             vectorSearch: (vector, limit, minScore, scopeFilter) => store.vectorSearch(vector, limit, minScore, scopeFilter),
                             store: (entry) => store.store(entry),
-                            onPersisted: mdMirror
-                                ? async (entry, kind) => {
-                                    const source = kind === "event" ? "reflection-slice:event"
-                                        : kind === "item-invariant" ? "reflection-slice:invariant"
-                                            : "reflection-slice:derived";
-                                    await mdMirror({ text: entry.text, category: entry.category, scope: entry.scope, timestamp: entry.timestamp }, { source, agentId: sourceAgentId });
-                                }
-                                : undefined,
                         });
                         if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
                             reflectionDerivedBySession.set(sessionKey, {
@@ -4227,10 +4179,7 @@ const memoryLanceDBProPlugin = {
                     return;
                 }
                 await mkdir(backupDir, { recursive: true });
-                // excludeInactive:false -- this is the automated backup dump and must
-                // keep full-dump semantics, including invalidated/superseded rows
-                // (item 6, PR #946).
-                const allMemories = await store.list(undefined, undefined, 10000, 0, { excludeInactive: false });
+                const allMemories = await store.list(undefined, undefined, 10000, 0);
                 if (allMemories.length === 0)
                     return;
                 const dateStr = new Date().toISOString().split("T")[0];
