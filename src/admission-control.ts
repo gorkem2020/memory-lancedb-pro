@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { formatCandidateBlock } from "./extraction-prompts.js";
 import type { LlmClient } from "./llm-client.js";
-import type { CandidateMemory, MemoryCategory } from "./memory-categories.js";
+import { DURABLE_CATEGORIES, type CandidateMemory, type MemoryCategory } from "./memory-categories.js";
 import type { MemorySearchResult, MemoryStore } from "./store.js";
 import { parseSmartMetadata } from "./smart-metadata.js";
 
@@ -80,6 +80,10 @@ export interface AdmissionAuditRecord {
   compared_existing_memory_ids: string[];
   max_similarity: number;
   evaluated_at: number;
+  /** Candidate's extraction-time grounding self-tag; absent on legacy payloads. */
+  grounding?: "real" | "constructed";
+  /** Batch register the candidate was extracted under; absent on legacy payloads. */
+  conversation_register?: "real" | "mixed" | "fiction";
 }
 
 export interface AdmissionEvaluation {
@@ -483,6 +487,22 @@ function cosineSimilarity(left: number[], right: number[]): number {
 // through the one shared formatter (imported above).
 
 /**
+ * Admission-judge view of a candidate block: the shared formatCandidateBlock
+ * shape plus the candidate's extraction-time grounding self-tag and batch
+ * conversation register, rendered with explicit legacy fallbacks so the
+ * judge can apply the grounding rule even to rows extracted before those
+ * fields existed. Used by BOTH the standalone and batch utility prompts so
+ * the two paths always share one block shape.
+ */
+function formatAdmissionCandidateBlock(n: number, candidate: CandidateMemory): string {
+  return [
+    formatCandidateBlock(n, candidate),
+    `   Grounding: ${candidate.grounding ?? "unknown (legacy payload, treat as real)"}`,
+    `   Conversation register: ${candidate.conversationRegister ?? "unknown (legacy payload)"}`,
+  ].join("\n");
+}
+
+/**
  * The admission judge scores solely on what extraction provided (the
  * candidate's own category/abstract/overview/content) plus, elsewhere in
  * AdmissionController, the store's existing rows via the separate
@@ -498,12 +518,17 @@ function buildUtilityPrompt(candidate: CandidateMemory): string {
 
 Candidate memory:
 
-${formatCandidateBlock(1, candidate)}
+${formatAdmissionCandidateBlock(1, candidate)}
 
 Score future usefulness on a 0.0-1.0 scale.
 
-Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
+The memory system stores six categories: profile (user identity), preferences (user tendencies), entities (long-lived project/entity state), events (things that happened), cases (problem + solution pairs), and patterns (reusable procedures).
+
+Use higher scores for durable profile facts, preferences, entity state, patterns, and genuinely reusable cases.
+Use moderate scores for events worth an episodic record.
 Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
+
+Grounding rule: content asserted only inside roleplay, a game, fiction, a hypothetical, or a simulation is not a fact about the real user. If the candidate's own grounding tag (or its content) shows its claim lives inside a constructed frame (game rules, personas, "let's play", "suppose", canon of an invented world), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity may still score moderately.
 
 --- EXAMPLE (not part of the live data) ---
 Candidate memory:
@@ -581,7 +606,7 @@ export function buildBatchUtilityPrompt(
   candidates: CandidateMemory[],
 ): { system: string; user: string } {
   const exampleCandidateBlocks = BATCH_UTILITY_EXAMPLE_CANDIDATES.map((candidate, i) =>
-    formatCandidateBlock(i + 1, candidate),
+    formatAdmissionCandidateBlock(i + 1, candidate),
   ).join("\n\n");
 
   const system = `You are an admission judge. Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
@@ -590,6 +615,8 @@ Score each candidate's future usefulness independently on a 0.0-1.0 scale. Score
 
 Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
 Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
+
+Grounding rule: content asserted only inside roleplay, a game, fiction, a hypothetical, or a simulation is not a fact about the real user. If a candidate's own grounding tag (or its content) shows its claim lives inside a constructed frame (game rules, personas, "let's play", "suppose", canon of an invented world), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity may still score moderately.
 
 --- EXAMPLE (not your current batch) ---
 Example of absolute scoring across a mixed-quality batch:
@@ -612,7 +639,7 @@ Return JSON only, with exactly one entry per candidate, in this shape:
 }`;
 
   const candidateBlocks = candidates
-    .map((candidate, i) => formatCandidateBlock(i + 1, candidate))
+    .map((candidate, i) => formatAdmissionCandidateBlock(i + 1, candidate))
     .join("\n\n");
 
   const user = `Candidates:
@@ -744,6 +771,28 @@ export function scoreTypePrior(
   typePriors: AdmissionTypePriors,
 ): number {
   return clamp01(typePriors[category], DEFAULT_TYPE_PRIORS[category]);
+}
+
+/**
+ * Grounding-aware type prior. The raw prior gives durable registers a large
+ * head start (default weights put 0.6 on this single feature); when the batch
+ * register says the conversation was fiction, that head start would launder a
+ * mislabeled in-fiction claim into profile/preferences. Cap the prior for
+ * durable categories at the events prior in that case; every other input
+ * keeps the raw prior untouched.
+ */
+export function scoreGroundedTypePrior(
+  candidate: CandidateMemory,
+  typePriors: AdmissionTypePriors,
+): number {
+  const raw = scoreTypePrior(candidate.category, typePriors);
+  if (
+    candidate.conversationRegister === "fiction" &&
+    DURABLE_CATEGORIES.has(candidate.category)
+  ) {
+    return Math.min(raw, clamp01(typePriors.events, DEFAULT_TYPE_PRIORS.events));
+  }
+  return raw;
 }
 
 export function scoreConfidenceSupport(
@@ -885,6 +934,42 @@ export class AdmissionController {
     private readonly debugLog: (msg: string) => void = () => {},
   ) {}
 
+  private rejectConstructedDurable(
+    candidate: CandidateMemory,
+    now: number,
+  ): AdmissionEvaluation {
+    const featureScores: AdmissionFeatureScores = {
+      utility: 0,
+      confidence: 0,
+      novelty: 0,
+      recency: 0,
+      typePrior: 0,
+    };
+    const reason = `Admission rejected (constructed-grounding candidate targeting durable category "${candidate.category}"; deterministic pre-admission short-circuit, no LLM call).`;
+    const audit: AdmissionAuditRecord = {
+      version: "amac-v1",
+      decision: "reject",
+      score: 0,
+      reason,
+      thresholds: {
+        reject: this.config.rejectThreshold,
+        admit: this.config.admitThreshold,
+      },
+      weights: this.config.weights,
+      feature_scores: featureScores,
+      matched_existing_memory_ids: [],
+      compared_existing_memory_ids: [],
+      max_similarity: 0,
+      evaluated_at: now,
+      grounding: candidate.grounding,
+      conversation_register: candidate.conversationRegister,
+    };
+    this.debugLog(
+      `memory-lancedb-pro: admission-control: decision=reject (constructed durable short-circuit) candidate=${JSON.stringify(candidate.abstract.slice(0, 80))}`,
+    );
+    return { decision: "reject", audit };
+  }
+
   private async loadRelevantMatches(
     candidate: CandidateMemory,
     candidateVector: number[],
@@ -942,6 +1027,19 @@ export class AdmissionController {
     utility: { score: number; reason?: string },
   ): Promise<AdmissionEvaluation> {
     const now = params.now ?? Date.now();
+
+    // Deterministic pre-admission short-circuit: a candidate tagged
+    // "constructed" must never occupy a durable register, no matter how any
+    // downstream score would blend. Reject before any LLM call. Candidates
+    // without grounding metadata (legacy payloads) fall through to normal
+    // scoring.
+    if (
+      params.candidate.grounding === "constructed" &&
+      DURABLE_CATEGORIES.has(params.candidate.category)
+    ) {
+      return this.rejectConstructedDurable(params.candidate, now);
+    }
+
     const relevantMatches = await this.loadRelevantMatches(
       params.candidate,
       params.candidateVector,
@@ -951,7 +1049,7 @@ export class AdmissionController {
     const confidence = scoreConfidenceSupport(params.candidate, params.conversationText);
     const novelty = scoreNoveltyFromMatches(params.candidateVector, relevantMatches);
     const recency = scoreRecencyGap(now, relevantMatches, this.config.recency.halfLifeDays);
-    const typePrior = scoreTypePrior(params.candidate.category, this.config.typePriors);
+    const typePrior = scoreGroundedTypePrior(params.candidate, this.config.typePriors);
 
     const featureScores: AdmissionFeatureScores = {
       utility: utility.score,
@@ -1002,6 +1100,8 @@ export class AdmissionController {
       compared_existing_memory_ids: novelty.comparedIds,
       max_similarity: novelty.maxSimilarity,
       evaluated_at: now,
+      grounding: params.candidate.grounding,
+      conversation_register: params.candidate.conversationRegister,
     };
 
     this.debugLog(
