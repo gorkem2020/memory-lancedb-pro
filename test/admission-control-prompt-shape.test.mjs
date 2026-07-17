@@ -415,3 +415,77 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
     assert.match(capturedPrompt, /^ {3}Doubled marker line\n\n2\. Category: events$/m);
   });
 });
+
+// Prompt-architecture slot conformance for the batched prompts: every static
+// block (identity, task framing, rules, few-shot examples, the JSON output
+// contract) lives in the SYSTEM slot; the USER slot carries only the numbered
+// candidate/job blocks and other per-call data. On this branch the two slots
+// are concatenated at the completeJson call sites (the client has no system
+// param yet); these tests pin the builder-level split so the eventual
+// transport change is a pure call-site move.
+describe("batched prompt slot conformance (system = static, user = per-call data)", () => {
+  const { buildBatchUtilityPrompt } = jiti("../src/admission-control.ts");
+  const { buildBatchDedupPrompt, buildBatchMergePrompt } = jiti("../src/extraction-prompts.ts");
+
+  function assertSlotSplit({ system, user }, { staticSentinels, userOpener }) {
+    for (const sentinel of staticSentinels) {
+      assert.ok(system.includes(sentinel), `system must carry static sentinel: ${sentinel}`);
+      assert.ok(!user.includes(sentinel), `user must NOT carry static sentinel: ${sentinel}`);
+    }
+    assert.ok(user.startsWith(userOpener), `user must open with the data header ${JSON.stringify(userOpener)}`);
+  }
+
+  it("admission-utility-batch: identity, scoring rules, few-shot example, and output contract are system-only", () => {
+    const prompt = buildBatchUtilityPrompt([makeCandidate(1), makeCandidate(2)]);
+    assertSlotSplit(prompt, {
+      staticSentinels: [
+        "You are an admission judge.",
+        "Score each candidate's future usefulness independently",
+        "--- EXAMPLE (not your current batch) ---",
+        "Return JSON only, with exactly one entry per candidate",
+      ],
+      userOpener: "Candidates:",
+    });
+    assert.match(prompt.user, /1\. Category: events/);
+    assert.match(prompt.user, /2\. Category: events/);
+  });
+
+  it("dedup-decision-batch: verdict vocabulary, rules, and output contract are system-only", () => {
+    const prompt = buildBatchDedupPrompt([
+      { candidate: makeCandidate(1), existingMemories: "1. [preferences] existing memory one" },
+    ]);
+    assertSlotSplit(prompt, {
+      staticSentinels: [
+        "Determine how to handle each numbered candidate memory in this batch.",
+        "- SKIP: Candidate memory duplicates existing memories",
+        "IMPORTANT:",
+        "Return JSON only, with exactly one entry per candidate",
+      ],
+      userOpener: "Candidates:",
+    });
+    assert.match(prompt.user, /1\. Category: events/);
+    assert.ok(prompt.user.includes("existing memory one"), "per-candidate neighbor lists are per-call data and belong in user");
+    assert.ok(!prompt.system.includes("existing memory one"));
+  });
+
+  it("merge-memory-batch: merge requirements and output contract are system-only", () => {
+    const prompt = buildBatchMergePrompt([
+      {
+        category: "preferences",
+        existing: { abstract: "existing abstract", overview: "existing overview", content: "existing content" },
+        additions: [{ abstract: "new abstract", overview: "new overview", content: "new content" }],
+      },
+    ]);
+    assertSlotSplit(prompt, {
+      staticSentinels: [
+        "Merge each numbered job below into a single coherent record",
+        "Requirements:",
+        "Return JSON only, with exactly one entry per job",
+      ],
+      userOpener: "Merge jobs:",
+    });
+    assert.ok(prompt.user.includes("existing abstract"));
+    assert.ok(prompt.user.includes("new content"));
+    assert.ok(!prompt.system.includes("existing abstract"), "job payloads must never leak into system");
+  });
+});

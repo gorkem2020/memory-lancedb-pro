@@ -548,8 +548,11 @@ const BATCH_UTILITY_EXAMPLE_CANDIDATES: CandidateMemory[] = [
  * candidate through formatCandidateBlock — number inline on the Category
  * line, fields indented under it, content-carried list markers stripped —
  * so the few-shot example and the live batch always share one shape.
+ *
+ * Exported for the slot-conformance tests (system = static blocks, user =
+ * per-call candidate data); production callers stay inside this module.
  */
-function buildBatchUtilityPrompt(
+export function buildBatchUtilityPrompt(
   candidates: CandidateMemory[],
 ): { system: string; user: string } {
   const exampleCandidateBlocks = BATCH_UTILITY_EXAMPLE_CANDIDATES.map((candidate, i) =>

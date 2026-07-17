@@ -396,3 +396,52 @@ describe("AdmissionController.evaluateBatch: cost-preview call accounting", () =
     assert.ok(twoLine, `expected a per-chunk line for the 2-candidate chunk, got: ${JSON.stringify(debugLines)}`);
   });
 });
+
+// A lane that routes its whole burst through evaluateBatch (e.g. reflection
+// mapped rows) must not change behavior when batch mode is off: the
+// controller itself owns the utilityMode decision and degrades to the
+// historical per-candidate topology internally.
+describe("AdmissionController.evaluateBatch honors non-batch utilityMode", () => {
+  it("utilityMode standalone: one admission-utility call per candidate, no batch call", async () => {
+    let standaloneCallCount = 0;
+    let batchCallCount = 0;
+    const llm = {
+      async completeJson(_prompt, label) {
+        if (label === "admission-utility-batch") {
+          batchCallCount++;
+          return { results: [] };
+        }
+        standaloneCallCount++;
+        return { utility: 0.9, reason: "scored per candidate" };
+      },
+    };
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "standalone" });
+    const controller = new AdmissionController(makeStore(), llm, config);
+
+    const results = await controller.evaluateBatch(makeMappedRowBatchItems(3));
+
+    assert.equal(batchCallCount, 0, "standalone mode must never issue a batched utility call");
+    assert.equal(standaloneCallCount, 3, "standalone mode keeps one utility call per candidate");
+    assert.equal(results.length, 3);
+    for (const result of results) {
+      assert.ok(result.audit, "per-candidate audits are unchanged in the fallback topology");
+    }
+  });
+
+  it("utilityMode off: zero utility LLM calls for the whole batch", async () => {
+    let llmCalls = 0;
+    const llm = {
+      async completeJson() {
+        llmCalls++;
+        return null;
+      },
+    };
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "off" });
+    const controller = new AdmissionController(makeStore(), llm, config);
+
+    const results = await controller.evaluateBatch(makeMappedRowBatchItems(3));
+
+    assert.equal(llmCalls, 0, "utilityMode off must not spend any utility LLM calls");
+    assert.equal(results.length, 3);
+  });
+});
