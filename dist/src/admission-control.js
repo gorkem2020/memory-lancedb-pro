@@ -390,8 +390,11 @@ const BATCH_UTILITY_EXAMPLE_CANDIDATES = [
  * candidate through formatCandidateBlock — number inline on the Category
  * line, fields indented under it, content-carried list markers stripped —
  * so the few-shot example and the live batch always share one shape.
+ *
+ * Exported for the slot-conformance tests (system = static blocks, user =
+ * per-call candidate data); production callers stay inside this module.
  */
-function buildBatchUtilityPrompt(candidates) {
+export function buildBatchUtilityPrompt(candidates) {
     const exampleCandidateBlocks = BATCH_UTILITY_EXAMPLE_CANDIDATES.map((candidate, i) => formatCandidateBlock(i + 1, candidate)).join("\n\n");
     const system = `You are an admission judge. Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
 
