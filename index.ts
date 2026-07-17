@@ -74,7 +74,9 @@ import {
   normalizeAutoCaptureText,
   type ConversationTurn,
   buildConversationTurnsForExtraction,
+  capUnknownWatermarkWindow,
 } from "./src/auto-capture-cleanup.js";
+import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
@@ -1287,6 +1289,20 @@ function pruneMapIfOver<K, V>(map: Map<K, V>, maxEntries: number): void {
   }
 }
 
+/**
+ * Prune a Set to stay within the given maximum number of entries.
+ * Deletes the oldest (earliest-inserted) values when over the limit.
+ */
+function pruneSetIfOver<T>(set: Set<T>, maxEntries: number): void {
+  if (set.size <= maxEntries) return;
+  const excess = set.size - maxEntries;
+  const iter = set.values();
+  for (let i = 0; i < excess; i++) {
+    const value = iter.next().value;
+    if (value !== undefined) set.delete(value);
+  }
+}
+
 function isExplicitRememberCommand(text: string): boolean {
   return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
 }
@@ -2379,6 +2395,8 @@ interface PluginSingletonState {
   autoCapturePendingIngressTexts: Map<string, string[]>;
   autoCaptureRecentTexts: Map<string, string[]>;
   autoCaptureRecentAssistantTexts: Map<string, string[]>;
+  autoCapturePayloadShapeLoggedSessions: Set<string>;
+  autoCaptureLastEligibleLength: Map<string, number>;
 }
 
 interface DreamingSchedulerState {
@@ -2651,10 +2669,12 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
   const recallHistory = new Map<string, Map<string, number>>();
   const turnCounter = new Map<string, number>();
-  const autoCaptureSeenTextCount = new Map<string, number>();
+  const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
   const autoCaptureRecentAssistantTexts = new Map<string, string[]>();
+  const autoCapturePayloadShapeLoggedSessions = new Set<string>();
+  const autoCaptureLastEligibleLength = new Map<string, number>();
 
   return {
     config,
@@ -2685,6 +2705,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCapturePendingIngressTexts,
     autoCaptureRecentTexts,
     autoCaptureRecentAssistantTexts,
+    autoCapturePayloadShapeLoggedSessions,
+    autoCaptureLastEligibleLength,
   };
 }
 
@@ -2847,7 +2869,19 @@ const memoryLanceDBProPlugin = {
       autoCapturePendingIngressTexts,
       autoCaptureRecentTexts,
       autoCaptureRecentAssistantTexts,
+      autoCapturePayloadShapeLoggedSessions,
+      autoCaptureLastEligibleLength,
     } = singleton;
+
+    // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
+    // must also go through here so the on-disk watermark never drifts from the
+    // in-memory Map -- a process restart rehydrates from exactly what was last
+    // written here (see loadAutoCaptureWatermarks at construction, above).
+    const persistAutoCaptureWatermark = async (key: string, value: number): Promise<void> => {
+      autoCaptureSeenTextCount.set(key, value);
+      pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+      await saveAutoCaptureWatermarks(resolvedDbPath, autoCaptureSeenTextCount, (message) => api.logger.debug(message));
+    };
 
     warnForDisabledChannelPlugin(
       (api as OpenClawPluginApi & { config?: unknown }).config,
@@ -3947,17 +3981,48 @@ const memoryLanceDBProPlugin = {
             autoCapturePendingIngressTexts.delete(conversationKey);
           }
 
+          const minMessages = config.extractMinMessages ?? 4;
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
           let newTexts = eligibleTexts;
+          let watermarkAdvanceOverride: number | null = null;
           if (pendingIngressTexts.length > 0) {
             newTexts = pendingIngressTexts;
           } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
             newTexts = eligibleTexts.slice(previousSeenCount);
+          } else if (previousSeenCount === 0 && eligibleTexts.length > minMessages) {
+            // issue #417 item 5: a genuinely unknown watermark (first-ever
+            // run, or persisted state lost) meeting a history-carrying
+            // payload must not ingest the entire transcript in one call.
+            // Cap to the most recent batch and forfeit the rest by marking
+            // it seen below, rather than queueing it for a later turn.
+            newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
+            watermarkAdvanceOverride = eligibleTexts.length;
           }
           // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
-          const cumulativeCount = previousSeenCount + newTexts.length;
-          autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
-          pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newTexts.length);
+          await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
+
+          // Payload-shape memory for the deferral decision below: a
+          // history-carrying agent_end payload grows its eligible-text list
+          // every turn; a delta-only payload does not. Read BEFORE this
+          // turn's update so the comparison is against the previous turn.
+          const lastEligibleLength = autoCaptureLastEligibleLength.get(sessionKey);
+          autoCaptureLastEligibleLength.set(sessionKey, eligibleTexts.length);
+          pruneMapIfOver(autoCaptureLastEligibleLength, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+
+          // Once per session per process (not persisted, not per turn): a
+          // restart re-emits this, which is exactly when you want to
+          // re-confirm the payload shape in the new process. This single
+          // INFO line answers the delta-only-vs-history-carrying question
+          // and the gate's fire/skip decision without reconstructing them
+          // from DEBUG-only evidence across unrelated log lines.
+          if (!autoCapturePayloadShapeLoggedSessions.has(sessionKey)) {
+            autoCapturePayloadShapeLoggedSessions.add(sessionKey);
+            pruneSetIfOver(autoCapturePayloadShapeLoggedSessions, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            api.logger.info(
+              `memory-lancedb-pro: auto-capture payload shape for agent ${agentId} (sessionKey=${sessionKey}): messages=${event.messages.length}, eligible=${eligibleTexts.length}, previousSeen=${previousSeenCount}, cumulative=${cumulativeCount}, fired=${cumulativeCount >= minMessages ? "yes" : "no"}`,
+            );
+          }
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
@@ -3982,7 +4047,6 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentAssistantTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          const minMessages = config.extractMinMessages ?? 4;
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
               `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
@@ -4096,7 +4160,7 @@ const memoryLanceDBProPlugin = {
                 // turn re-read and re-extract the entire history. Record the
                 // consumed history length there instead, so the next turn
                 // only sees the delta.
-                autoCaptureSeenTextCount.set(
+                await persistAutoCaptureWatermark(
                   sessionKey,
                   pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
                 );
@@ -4131,6 +4195,32 @@ const memoryLanceDBProPlugin = {
               api.logger.debug(
                 `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
+              // For history-carrying sessions, roll the cursor back so the
+              // next turn's slice re-includes these texts in the extraction
+              // input -- otherwise a run of below-threshold turns would each
+              // tentatively advance the cursor and the eventual firing turn
+              // would only see its own last slice, silently forfeiting every
+              // earlier deferred turn's content. Ingress-fed sessions keep
+              // their accumulator advance: their per-turn text is not
+              // recoverable on the next turn by design (the ingress queue
+              // was already drained), and rolling back would keep the count
+              // below the threshold forever.
+              if (pendingIngressTexts.length === 0) {
+                if (lastEligibleLength !== undefined && eligibleTexts.length <= lastEligibleLength) {
+                  // Delta-shaped payload (the eligible-text list did not grow
+                  // past the previous turn's): the transcript is NOT
+                  // re-delivered next turn, so rolling the cursor back would
+                  // pin the count below the threshold forever. Keep the
+                  // tentative advance persisted above instead; the deferred
+                  // turn's content is forfeited, exactly as it was before the
+                  // rollback existed.
+                  api.logger.debug(
+                    `memory-lancedb-pro: auto-capture deferral kept the accumulator advance for agent ${agentId} (delta-shaped payload, eligible=${eligibleTexts.length} <= lastEligible=${lastEligibleLength})`,
+                  );
+                } else {
+                  await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
+                }
+              }
             }
           }
 

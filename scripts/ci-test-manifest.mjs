@@ -146,6 +146,11 @@ export const CI_TEST_MANIFEST = [
   // Valid-empty extraction must reset the auto-capture watermark the same way a successful extraction does
   { group: "core-regression", runner: "node", file: "test/autocapture-reset-on-valid-empty-extraction.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-metadata-source-classification.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/auto-capture-watermark-store.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-watermark-restart-survival.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/auto-capture-unknown-watermark-window.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-unknown-watermark-injection.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/autocapture-payload-shape-observability.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
