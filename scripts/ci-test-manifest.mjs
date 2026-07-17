@@ -42,6 +42,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/assistant-context-capture-counting-symmetry.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-noise-gating.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/extraction-grounding-register.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-capability-runtime.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/dreaming-engine.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-governance-tools.test.mjs", args: ["--test"] },

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { DURABLE_CATEGORIES } from "./memory-categories.js";
 import { parseSmartMetadata } from "./smart-metadata.js";
 import { ADMISSION_JUDGE_IDENTITY, CATEGORY_TAXONOMY, SCORE_TIER_RUBRIC, formatCandidateBlock, jsonBlock, } from "./prompt-blocks.js";
 const DEFAULT_WEIGHTS = {
@@ -341,14 +342,7 @@ Score future usefulness on a 0.0-1.0 scale.
 
 ${SCORE_TIER_RUBRIC}
 
---- EXAMPLE (not part of the live data) ---
-Candidate memory:
-- Category: preferences
-- Abstract: User's preferred name is Alex
-
-Example response:
-{"utility": 0.9, "reason": "durable identity fact"}
---- END EXAMPLE ---
+Grounding rule: this candidate's own grounding tag already passed the deterministic pre-admission check (a "constructed" tag targeting a durable category is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If the candidate's own content shows such a constructed frame and its claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
 
 Return JSON only:
 ${jsonBlock(`{
@@ -545,6 +539,22 @@ function buildReason(details) {
 export function scoreTypePrior(category, typePriors) {
     return clamp01(typePriors[category], DEFAULT_TYPE_PRIORS[category]);
 }
+/**
+ * Grounding-aware type prior. The raw prior gives durable registers a large
+ * head start (default weights put 0.6 on this single feature); when the batch
+ * register says the conversation was fiction, that head start would launder a
+ * mislabeled in-fiction claim into profile/preferences. Cap the prior for
+ * durable categories at the events prior in that case; every other input
+ * keeps the raw prior untouched.
+ */
+export function scoreGroundedTypePrior(candidate, typePriors) {
+    const raw = scoreTypePrior(candidate.category, typePriors);
+    if (candidate.conversationRegister === "fiction" &&
+        DURABLE_CATEGORIES.has(candidate.category)) {
+        return Math.min(raw, clamp01(typePriors.events, DEFAULT_TYPE_PRIORS.events));
+    }
+    return raw;
+}
 export function scoreConfidenceSupport(candidate, conversationText) {
     const candidateText = `${candidate.abstract}\n${candidate.content}`.trim();
     const candidateTokens = tokenizeText(candidateText);
@@ -647,6 +657,36 @@ export class AdmissionController {
         this.config = config;
         this.debugLog = debugLog;
     }
+    rejectConstructedDurable(candidate, now) {
+        const featureScores = {
+            utility: 0,
+            confidence: 0,
+            novelty: 0,
+            recency: 0,
+            typePrior: 0,
+        };
+        const reason = `Admission rejected (constructed-grounding candidate targeting durable category "${candidate.category}"; deterministic pre-admission short-circuit, no LLM call).`;
+        const audit = {
+            version: "amac-v1",
+            decision: "reject",
+            score: 0,
+            reason,
+            thresholds: {
+                reject: this.config.rejectThreshold,
+                admit: this.config.admitThreshold,
+            },
+            weights: this.config.weights,
+            feature_scores: featureScores,
+            matched_existing_memory_ids: [],
+            compared_existing_memory_ids: [],
+            max_similarity: 0,
+            evaluated_at: now,
+            grounding: candidate.grounding,
+            conversation_register: candidate.conversationRegister,
+        };
+        this.debugLog(`memory-lancedb-pro: admission-control: decision=reject (constructed durable short-circuit) candidate=${JSON.stringify(candidate.abstract.slice(0, 80))}`);
+        return { decision: "reject", audit };
+    }
     async loadRelevantMatches(candidate, candidateVector, scopeFilter) {
         if (!Array.isArray(candidateVector) || candidateVector.length === 0) {
             return [];
@@ -662,6 +702,12 @@ export class AdmissionController {
         return sameCategoryMatches.length > 0 ? sameCategoryMatches : rawMatches;
     }
     async evaluate(params) {
+        // Constructed-grounding candidates targeting a durable category are
+        // rejected deterministically BEFORE any utility LLM call is spent.
+        if (params.candidate.grounding === "constructed" &&
+            DURABLE_CATEGORIES.has(params.candidate.category)) {
+            return this.rejectConstructedDurable(params.candidate, params.now ?? Date.now());
+        }
         const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate);
         return this.evaluateWithUtility(params, utility);
     }
@@ -674,11 +720,20 @@ export class AdmissionController {
      */
     async evaluateWithUtility(params, utility) {
         const now = params.now ?? Date.now();
+        // Deterministic pre-admission short-circuit: a candidate tagged
+        // "constructed" must never occupy a durable register, no matter how any
+        // downstream score would blend. Reject before any LLM call. Candidates
+        // without grounding metadata (legacy payloads) fall through to normal
+        // scoring.
+        if (params.candidate.grounding === "constructed" &&
+            DURABLE_CATEGORIES.has(params.candidate.category)) {
+            return this.rejectConstructedDurable(params.candidate, now);
+        }
         const relevantMatches = await this.loadRelevantMatches(params.candidate, params.candidateVector, params.scopeFilter);
         const confidence = scoreConfidenceSupport(params.candidate, params.conversationText);
         const novelty = scoreNoveltyFromMatches(params.candidateVector, relevantMatches);
         const recency = scoreRecencyGap(now, relevantMatches, this.config.recency.halfLifeDays);
-        const typePrior = scoreTypePrior(params.candidate.category, this.config.typePriors);
+        const typePrior = scoreGroundedTypePrior(params.candidate, this.config.typePriors);
         const featureScores = {
             utility: utility.score,
             confidence: confidence.score,
@@ -722,6 +777,8 @@ export class AdmissionController {
             compared_existing_memory_ids: novelty.comparedIds,
             max_similarity: novelty.maxSimilarity,
             evaluated_at: now,
+            grounding: params.candidate.grounding,
+            conversation_register: params.candidate.conversationRegister,
         };
         this.debugLog(`memory-lancedb-pro: admission-control: decision=${audit.decision} hint=${audit.hint ?? "n/a"} score=${audit.score.toFixed(3)} candidate=${JSON.stringify(params.candidate.abstract.slice(0, 80))}`);
         return { decision, hint, audit };
@@ -768,10 +825,22 @@ export class AdmissionController {
             }
             return out;
         }
-        const utilities = await this.scoreUtilityBatch(chunk.map((item) => item.candidate));
+        // Constructed-grounding candidates targeting a durable category never
+        // spend a batch slot: they are rejected deterministically here, and only
+        // the remaining candidates go into the (at most one per chunk) batch
+        // utility call.
+        const scorable = chunk.filter((item) => !(item.candidate.grounding === "constructed" && DURABLE_CATEGORIES.has(item.candidate.category)));
+        const utilities = scorable.length > 0
+            ? await this.scoreUtilityBatch(scorable.map((item) => item.candidate))
+            : [];
+        const utilityByItem = new Map(scorable.map((item, i) => [item, utilities[i]]));
         const out = [];
-        for (let i = 0; i < chunk.length; i++) {
-            out.push(await this.evaluateWithUtility(chunk[i], utilities[i]));
+        for (const item of chunk) {
+            if (item.candidate.grounding === "constructed" && DURABLE_CATEGORIES.has(item.candidate.category)) {
+                out.push(this.rejectConstructedDurable(item.candidate, item.now ?? Date.now()));
+                continue;
+            }
+            out.push(await this.evaluateWithUtility(item, utilityByItem.get(item) ?? { score: 0.5 }));
         }
         return out;
     }

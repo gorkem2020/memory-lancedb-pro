@@ -399,39 +399,6 @@ describe("AdmissionController buildUtilityPrompt (candidate formatting)", () => 
     );
   });
 
-  it("wraps a clearly labeled, fenced few-shot example in the system prompt that cannot be mistaken for live candidate data", async () => {
-    const llm = makeAdmissionLlm();
-    const controller = new AdmissionController(admissionStore, llm, balanced);
-
-    await controller.evaluate({
-      candidate: {
-        category: "preferences",
-        abstract: "User prefers dark mode",
-        overview: "",
-        content: "User prefers dark mode.",
-      },
-      candidateVector: [1, 0, 0],
-      conversationText: "some real conversation text",
-      scopeFilter: ["global"],
-    });
-
-    const { systemPrompt } = llm.prompts[0];
-    const startIndex = systemPrompt.indexOf("--- EXAMPLE");
-    const endIndex = systemPrompt.indexOf("--- END EXAMPLE ---");
-    assert.ok(startIndex !== -1, "system prompt must fence the few-shot example with a clear start marker");
-    assert.ok(endIndex !== -1, "system prompt must fence the few-shot example with a clear end marker");
-    assert.ok(startIndex < endIndex, "the end marker must close the example after the start marker");
-    assert.match(
-      systemPrompt.slice(startIndex, endIndex),
-      /Example response:/,
-      "the example's sample output must be labeled so it reads as illustrative, not a live instruction"
-    );
-    const contractIndex = systemPrompt.indexOf("Return JSON only:");
-    assert.ok(
-      endIndex < contractIndex,
-      "the fenced example must close before the live output-format contract"
-    );
-  });
 });
 
 // ============================================================================
