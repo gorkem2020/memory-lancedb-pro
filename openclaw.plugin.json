@@ -502,6 +502,19 @@
             "type": "string",
             "description": "Optional JSONL file path for durable admission reject audit records. Defaults to a file beside the plugin memory data directory."
           },
+          "model": {
+            "type": "string",
+            "description": "Optional absolute override: when set, every admission LLM call uses this model, regardless of modelAffinity."
+          },
+          "modelAffinity": {
+            "type": "string",
+            "enum": [
+              "global",
+              "lane"
+            ],
+            "default": "global",
+            "description": "lane routes reflection-mapped admission calls to memoryReflection.model instead of the global llm model; global uses the plugin's global llm model for every lane."
+          },
           "recency": {
             "type": "object",
             "additionalProperties": false,
