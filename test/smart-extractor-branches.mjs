@@ -1537,37 +1537,22 @@ async function runAssistantContextModeScenario() {
       { agentId: "main", sessionKey },
     );
 
-    // NOTE (2026-07-15): this turn intentionally sends only THIS turn's
-    // delta messages, not the full accumulated session history. That is
-    // correct and required on this branch as it stands today: the counter
-    // model here (issue #417 Fix #4/#5) only resets to 0 on a *successful*
-    // extraction, never rolls back on a skip, so per-turn deltas accumulate
-    // correctly turn-over-turn (verified: cumulative=1 after turn 1,
-    // cumulative=1+1=2 after this turn).
-    //
-    // If this branch is ever rebased onto (or merged alongside)
-    // fix/autocapture-reset-on-valid-empty-extraction (issue #417 Fix #9,
-    // which rolls the counter back to its pre-turn value when a turn is
-    // skipped, so the *next* agent_end redelivers the full history and the
-    // slice-by-previousSeenCount logic recovers the skipped turn's texts),
-    // this fixture MUST switch to sending the FULL accumulated history each
-    // turn -- i.e. this second runAgentEndHook call's `messages` should be
-    // turn 1's two messages PLUS turn 2's two messages, matching the
-    // established agent_end simulation pattern in
-    // test/autocapture-watermark-reset.test.mjs ("Turn 2: agent_end again
-    // carries the FULL history"). Sending only the delta at that point would
-    // make turn 2 look like a fresh 1-message turn (cumulative stays at 1)
-    // instead of the correct accumulated 2, and this test would fail with
-    // "Turn 2 should trigger with cumulative=2, not 4" pointing at a
-    // regression that is actually just this fixture being stale -- this
-    // exact failure mode was hit and root-caused during an internal
-    // integration test where this branch's code was combined with
-    // issue #417 Fix #9 (see above).
+    // NOTE (2026-07-17, assembly): the deferred-turn cursor rollback (issue
+    // #417 Fix #9 family, composed here with the fallback-gating defer) is in
+    // this tree, so turn 2 sends the FULL accumulated history — exactly the
+    // switch the previous revision of this note prescribed for that case
+    // (matching test/autocapture-watermark-reset.test.mjs's "Turn 2:
+    // agent_end again carries the FULL history" pattern). With the rollback,
+    // turn 1's below-threshold defer keeps the cursor at 0 and the next
+    // turn's full-history slice re-includes the deferred text: cumulative=2,
+    // counting only the two user turns, never the assistant turns.
     await runAgentEndHook(
       api,
       {
         success: true,
         messages: [
+          { role: "user", content: "我的名字是小明" },
+          { role: "assistant", content: "很高兴认识你，小明！你喜欢什么运动？" },
           { role: "user", content: "我喜歡游泳" },
           { role: "assistant", content: "游泳是很好的运动！" },
         ],
@@ -1605,7 +1590,7 @@ assert.ok(
   assistantContextResult.logs.map((e) => e[1]).join(" | "),
 );
 assert.ok(
-  assistantContextResult.capturedPrompts.some((p) => p.includes("## Recent conversation turns")),
+  assistantContextResult.capturedPrompts.some((p) => p.includes("## Recent Conversation")),
   "extraction prompt should include the single conversation-turns transcript header",
 );
 assert.ok(

@@ -170,7 +170,10 @@ function turnMessages(turnIndex) {
  * carries only that turn's own two messages.
  */
 async function runScenario({ captureAssistant, payloadShape, embeddingPort, llmPort, resolveRoot, extractMinMessages }) {
-  const dbPath = path.join(resolveRoot, `db-${captureAssistant}-${payloadShape}`);
+  // Nest each cell's db one level down: the watermark sidecar persists next
+  // to the db's PARENT directory, so sibling cells sharing one parent would
+  // otherwise leak watermark state into each other across scenario runs.
+  const dbPath = path.join(resolveRoot, `cell-${captureAssistant}-${payloadShape}`, "db");
   const harnessConfig = {
     dbPath,
     autoCapture: true,

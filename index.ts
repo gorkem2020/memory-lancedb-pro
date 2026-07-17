@@ -2429,6 +2429,7 @@ interface PluginSingletonState {
   autoCaptureRecentTexts: Map<string, string[]>;
   autoCaptureRecentAssistantTexts: Map<string, string[]>;
   autoCapturePayloadShapeLoggedSessions: Set<string>;
+  autoCaptureLastEligibleLength: Map<string, number>;
 }
 
 interface DreamingSchedulerState {
@@ -2708,6 +2709,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureRecentTexts = new Map<string, string[]>();
   const autoCaptureRecentAssistantTexts = new Map<string, string[]>();
   const autoCapturePayloadShapeLoggedSessions = new Set<string>();
+  const autoCaptureLastEligibleLength = new Map<string, number>();
 
   return {
     config,
@@ -2740,6 +2742,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureRecentTexts,
     autoCaptureRecentAssistantTexts,
     autoCapturePayloadShapeLoggedSessions,
+    autoCaptureLastEligibleLength,
   };
 }
 
@@ -2904,6 +2907,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureRecentTexts,
       autoCaptureRecentAssistantTexts,
       autoCapturePayloadShapeLoggedSessions,
+      autoCaptureLastEligibleLength,
     } = singleton;
 
     // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
@@ -4082,6 +4086,13 @@ const memoryLanceDBProPlugin = {
           // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
           const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newTexts.length);
           await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
+          // Payload-shape memory for the deferral decision below: a
+          // history-carrying agent_end payload grows its eligible-text list
+          // every turn; a delta-only payload does not. Read BEFORE this
+          // turn's update so the comparison is against the previous turn.
+          const lastEligibleLength = autoCaptureLastEligibleLength.get(sessionKey);
+          autoCaptureLastEligibleLength.set(sessionKey, eligibleTexts.length);
+          pruneMapIfOver(autoCaptureLastEligibleLength, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
           // Once per session per process (not persisted, not per turn): a
           // restart re-emits this, which is exactly when you want to
@@ -4281,7 +4292,20 @@ const memoryLanceDBProPlugin = {
               // minMessages on a later turn, every earlier deferred turn's text was
               // already gone.
               if (pendingIngressTexts.length === 0) {
-                await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
+                if (lastEligibleLength !== undefined && eligibleTexts.length <= lastEligibleLength) {
+                  // Delta-shaped payload (the eligible-text list did not grow
+                  // past the previous turn's): the transcript is NOT
+                  // re-delivered next turn, so rolling the cursor back would
+                  // pin the count below the threshold forever. Keep the
+                  // tentative advance persisted above instead; the deferred
+                  // turn's content is forfeited, exactly as it was before the
+                  // rollback existed.
+                  api.logger.debug(
+                    `memory-lancedb-pro: auto-capture deferral kept the accumulator advance for agent ${agentId} (delta-shaped payload, eligible=${eligibleTexts.length} <= lastEligible=${lastEligibleLength})`,
+                  );
+                } else {
+                  await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
+                }
               } else if (conversationKey) {
                 const requeuedIngressTexts = [
                   ...pendingIngressTexts,

@@ -99,7 +99,7 @@ describe("SmartExtractor assistant-context marking", () => {
 
     const extractCall = llm.calls.find((c) => c.label === "extract-candidates");
     assert.ok(extractCall, "extract-candidates call should have happened");
-    assert.match(extractCall.prompt, /## Recent conversation turns/);
+    assert.match(extractCall.prompt, /## Recent Conversation/);
     assert.match(extractCall.prompt, /Assistant: I found two options: the blue mug and the red mug\./);
     assert.match(extractCall.prompt, /blue mug and the red mug/);
   });
@@ -126,7 +126,8 @@ describe("SmartExtractor assistant-context marking", () => {
   });
 
   it("buildExtractionPrompt documents the assistant-context rule (structural check)", () => {
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const parts = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = `${parts.system}\n\n${parts.user}`;
     assert.match(prompt, /"Assistant:" lines/);
     assert.match(prompt, /grounded in a user-authored line/i);
   });
@@ -142,11 +143,11 @@ describe("SmartExtractor assistant-context marking", () => {
     );
 
     const extractCall = llm.calls.find((c) => c.label === "extract-candidates");
-    const headerMatches = extractCall.prompt.match(/## Recent conversation turns/g) || [];
+    const headerMatches = extractCall.prompt.match(/## Recent Conversation/g) || [];
     assert.equal(headerMatches.length, 1, "the header must appear exactly once");
     assert.match(
       extractCall.prompt,
-      /## Recent conversation turns\nContext for extraction\. Extract memory candidates ONLY from user turns\. Assistant turns are included so you can resolve references and understand what the user meant; never treat assistant statements as the user's facts, preferences, or decisions\.\n/,
+      /## Recent Conversation\nContext for extraction\. Extract memory candidates ONLY from user turns\. Assistant turns are included so you can resolve references and understand what the user meant; never treat assistant statements as the user's facts, preferences, or decisions\.\n/,
     );
   });
 
