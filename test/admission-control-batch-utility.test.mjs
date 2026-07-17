@@ -275,11 +275,13 @@ describe("AdmissionController.evaluateBatch", () => {
   });
 
   it("fences the batch few-shot example so it cannot be misread as an instruction for the live batch", async () => {
+    // The example is a static block, so it rides the system slot; capture
+    // system + user combined so the assertions see the full prompt text.
     let capturedPrompt;
     const llm = {
-      async completeJson(prompt, label) {
+      async completeJson(prompt, label, systemPrompt) {
         if (label === "admission-utility-batch") {
-          capturedPrompt = prompt;
+          capturedPrompt = `${systemPrompt}\n\n${prompt}`;
           return {
             results: [{ index: 1, utility: 0.5, reason: "r" }],
           };

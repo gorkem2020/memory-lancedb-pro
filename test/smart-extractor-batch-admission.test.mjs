@@ -5,7 +5,7 @@ import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { SmartExtractor } = jiti("../src/smart-extractor.ts");
-const { normalizeAdmissionControlConfig } = jiti("../src/admission-control.ts");
+const { normalizeAdmissionControlConfig, createAdmissionController } = jiti("../src/admission-control.ts");
 
 function makeStore() {
   return {
@@ -76,12 +76,17 @@ describe("SmartExtractor batch admission integration", () => {
     const batchCalls = [];
     const llm = makeExtractionLlm(batchCalls, 3);
 
-    const extractor = new SmartExtractor(makeStore(), makeEmbedder(), llm, {
+    const store = makeStore();
+    const admissionConfig = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const extractor = new SmartExtractor(store, makeEmbedder(), llm, {
       user: "User",
       extractMinMessages: 1,
       extractMaxChars: 8000,
       defaultScope: "global",
-      admissionControl: normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" }),
+      admissionControl: admissionConfig,
+      // Since the AdmissionController decoupling, SmartExtractor never builds
+      // its own controller from config alone — inject one explicitly.
+      admissionController: createAdmissionController(store, llm, admissionConfig),
       log() {},
       debugLog() {},
     });
@@ -205,7 +210,7 @@ function candidateFixture(i, overrides = {}) {
 }
 
 function makeExtractor(store, llm, extraConfig = {}) {
-  return new SmartExtractor(store, makeEmbedder(), llm, {
+  const config = {
     user: "User",
     extractMinMessages: 1,
     extractMaxChars: 8000,
@@ -213,7 +218,13 @@ function makeExtractor(store, llm, extraConfig = {}) {
     log() {},
     debugLog() {},
     ...extraConfig,
-  });
+  };
+  // Since the AdmissionController decoupling, SmartExtractor never builds its
+  // own controller from config alone — inject one explicitly when gating is on.
+  if (config.admissionControl && !config.admissionController) {
+    config.admissionController = createAdmissionController(store, llm, config.admissionControl);
+  }
+  return new SmartExtractor(store, makeEmbedder(), llm, config);
 }
 
 function dedupResults(entries) {

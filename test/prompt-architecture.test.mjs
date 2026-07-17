@@ -36,7 +36,7 @@ const { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt } = jiti(
 );
 const { createLlmClient } = jiti("../src/llm-client.ts");
 const { formatExistingMemoryForDedupPrompt } = jiti("../src/smart-extractor.ts");
-const { buildReflectionPrompt } = jiti("../index.ts");
+const { buildReflectionPromptParts } = jiti("../index.ts");
 
 // ============================================================================
 // buildExtractionPrompt — system/user split
@@ -330,169 +330,27 @@ describe("LlmClient system-message threading (OAuth path)", () => {
 // admission-control.ts buildUtilityPrompt — identity, split, reflection framing
 // ============================================================================
 
-describe("AdmissionController buildUtilityPrompt (source-kind framing)", () => {
-  const { AdmissionController, ADMISSION_CONTROL_PRESETS } = jiti("../src/admission-control.ts");
-  const balanced = ADMISSION_CONTROL_PRESETS.balanced;
-  const admissionStore = { async vectorSearch() { return []; } };
+// The buildUtilityPrompt source-kind/excerpt framing tests that used to live
+// here were removed at assembly time: the admission-prompt formatting round
+// (feat/admission-batch-utility) deliberately made the utility prompt
+// transcript-free and standardized the candidate block on
+// formatCandidateBlock, superseding the excerpt + source-kind framing this
+// block pinned. The replacement contract is pinned by
+// test/admission-control-prompt-shape.test.mjs.
 
-  function makeAdmissionLlm() {
-    const prompts = [];
-    return {
-      prompts,
-      async completeJson(userPrompt, mode, systemPrompt) {
-        if (mode === "admission-utility") {
-          prompts.push({ userPrompt, systemPrompt });
-          return { utility: 0.5, reason: "mock" };
-        }
-        return null;
-      },
-    };
-  }
-
-  it("system carries the admission judge identity; user defaults to a Conversation excerpt framing", async () => {
-    const llm = makeAdmissionLlm();
-    const controller = new AdmissionController(admissionStore, llm, balanced);
-
-    await controller.evaluate({
-      candidate: {
-        category: "preferences",
-        abstract: "User prefers dark mode",
-        overview: "",
-        content: "User prefers dark mode.",
-      },
-      candidateVector: [1, 0, 0],
-      conversationText: "some real conversation text",
-      scopeFilter: ["global"],
-    });
-
-    assert.equal(llm.prompts.length, 1);
-    const { userPrompt, systemPrompt } = llm.prompts[0];
-    assert.match(systemPrompt, /admission judge/i);
-    assert.match(userPrompt, /Conversation excerpt:/);
-    assert.doesNotMatch(userPrompt, /Source document/i);
-  });
-
-  it("frames a reflection-sourced excerpt as a source document, not a conversation", async () => {
-    const llm = makeAdmissionLlm();
-    const controller = new AdmissionController(admissionStore, llm, balanced);
-
-    await controller.evaluate({
-      candidate: {
-        category: "cases",
-        abstract: "Lesson learned about retries",
-        overview: "",
-        content: "Always add jitter to retry backoff.",
-      },
-      candidateVector: [1, 0, 0],
-      conversationText: "## Lessons & pitfalls\n- Always add jitter to retry backoff",
-      scopeFilter: ["global"],
-      sourceKind: "reflection",
-    });
-
-    assert.equal(llm.prompts.length, 1);
-    const { userPrompt } = llm.prompts[0];
-    assert.match(userPrompt, /Source document \(agent reflection\)/i);
-    assert.doesNotMatch(userPrompt, /Conversation excerpt:/);
-  });
-
-  it("indents continuation lines of a multi-line Overview so its markdown stays nested under the bullet instead of landing flush-left mid-list", async () => {
-    const llm = makeAdmissionLlm();
-    const controller = new AdmissionController(admissionStore, llm, balanced);
-
-    await controller.evaluate({
-      candidate: {
-        category: "preferences",
-        abstract: "Editor preferences",
-        overview: "## Preference Domain\n- Editor: Zed\n- Theme: dark",
-        content: "User prefers the Zed editor with a dark theme.",
-      },
-      candidateVector: [1, 0, 0],
-      conversationText: "some real conversation text",
-      scopeFilter: ["global"],
-    });
-
-    const { userPrompt } = llm.prompts[0];
-    assert.doesNotMatch(
-      userPrompt,
-      /\n## Preference Domain/,
-      "a continuation line of the Overview bullet must not land flush-left (would escape the bullet in rendered markdown)"
-    );
-    assert.match(userPrompt, /- Overview: ## Preference Domain\n {2}- Editor: Zed\n {2}- Theme: dark/);
-  });
-
-  it("blank-line separates the Overview and Content bullets from the rest of the candidate block instead of gluing them with a single newline", async () => {
-    const llm = makeAdmissionLlm();
-    const controller = new AdmissionController(admissionStore, llm, balanced);
-
-    await controller.evaluate({
-      candidate: {
-        category: "preferences",
-        abstract: "Editor preferences",
-        overview: "Uses Zed",
-        content: "User prefers the Zed editor.",
-      },
-      candidateVector: [1, 0, 0],
-      conversationText: "some real conversation text",
-      scopeFilter: ["global"],
-    });
-
-    const { userPrompt } = llm.prompts[0];
-    assert.match(
-      userPrompt,
-      /- Abstract: Editor preferences\n\n- Overview: Uses Zed\n\n- Content: User prefers the Zed editor\./,
-      "Overview and Content carry multi-line content so each gets its own blank-line-separated block, not a single-\\n glued list"
-    );
-  });
-
-  it("wraps a clearly labeled, fenced few-shot example in the system prompt that cannot be mistaken for live candidate data", async () => {
-    const llm = makeAdmissionLlm();
-    const controller = new AdmissionController(admissionStore, llm, balanced);
-
-    await controller.evaluate({
-      candidate: {
-        category: "preferences",
-        abstract: "User prefers dark mode",
-        overview: "",
-        content: "User prefers dark mode.",
-      },
-      candidateVector: [1, 0, 0],
-      conversationText: "some real conversation text",
-      scopeFilter: ["global"],
-    });
-
-    const { systemPrompt } = llm.prompts[0];
-    const startIndex = systemPrompt.indexOf("--- EXAMPLE");
-    const endIndex = systemPrompt.indexOf("--- END EXAMPLE ---");
-    assert.ok(startIndex !== -1, "system prompt must fence the few-shot example with a clear start marker");
-    assert.ok(endIndex !== -1, "system prompt must fence the few-shot example with a clear end marker");
-    assert.ok(startIndex < endIndex, "the end marker must close the example after the start marker");
-    assert.match(
-      systemPrompt.slice(startIndex, endIndex),
-      /Example response:/,
-      "the example's sample output must be labeled so it reads as illustrative, not a live instruction"
-    );
-    const contractIndex = systemPrompt.indexOf("Return JSON only:");
-    assert.ok(
-      endIndex < contractIndex,
-      "the fenced example must close before the live output-format contract"
-    );
-  });
-});
-
-// ============================================================================
 // buildReflectionPrompt — system/user split (reflection distiller, JR-186)
 // ============================================================================
 
-describe("buildReflectionPrompt system/user split (reflection distiller)", () => {
+describe("buildReflectionPromptParts system/user split (reflection distiller)", () => {
   it("returns a {system, user} shape", () => {
-    const result = buildReflectionPrompt("user: hello\nassistant: hi", 1000, []);
+    const result = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, []);
     assert.equal(typeof result.system, "string");
     assert.equal(typeof result.user, "string");
   });
 
   it("system carries the distiller identity and every heading/rule/template instruction", () => {
-    const { system } = buildReflectionPrompt("user: hello\nassistant: hi", 1000, []);
-    assert.match(system, /You are a memory reflection distiller/i);
+    const { system } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, []);
+    assert.match(system, /You are generating a durable MEMORY REFLECTION entry/i);
     assert.match(system, /## Context \(session background\)/);
     assert.match(system, /## Derived/);
     assert.match(system, /Hard rules:/);
@@ -502,8 +360,8 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
   });
 
   it("user carries only the per-call payload (tool error signals + the conversation input), no identity or instruction duplication", () => {
-    const { user } = buildReflectionPrompt("user: hello\nassistant: hi", 1000, []);
-    assert.doesNotMatch(user, /You are a memory reflection distiller/i);
+    const { user } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, []);
+    assert.doesNotMatch(user, /You are generating a durable MEMORY REFLECTION entry/i);
     assert.doesNotMatch(user, /Hard rules:/);
     assert.doesNotMatch(user, /OUTPUT TEMPLATE/);
     assert.match(user, /Recent tool error signals:/);
@@ -512,7 +370,7 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
   });
 
   it("does not leak this call's tool error signals or conversation input into system", () => {
-    const { system } = buildReflectionPrompt(
+    const { system } = buildReflectionPromptParts(
       "a very specific unique conversation marker XYZZY",
       1000,
       [{ toolName: "bash", summary: "unique tool failure marker QWERTY", signatureHash: "abcd1234" }],
@@ -522,7 +380,7 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
   });
 
   it("joining system and user with a blank line reproduces the exact prior single-string prompt", () => {
-    const { system, user } = buildReflectionPrompt("user: hello\nassistant: hi", 1000, [
+    const { system, user } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, [
       { toolName: "bash", summary: "flaky retry", signatureHash: "deadbeef" },
     ]);
     const joined = `${system}\n\n${user}`;

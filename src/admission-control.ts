@@ -487,22 +487,6 @@ function cosineSimilarity(left: number[], right: number[]): number {
 // through the one shared formatter (imported above).
 
 /**
- * Admission-judge view of a candidate block: the shared formatCandidateBlock
- * shape plus the candidate's extraction-time grounding self-tag and batch
- * conversation register, rendered with explicit legacy fallbacks so the
- * judge can apply the grounding rule even to rows extracted before those
- * fields existed. Used by BOTH the standalone and batch utility prompts so
- * the two paths always share one block shape.
- */
-function formatAdmissionCandidateBlock(n: number, candidate: CandidateMemory): string {
-  return [
-    formatCandidateBlock(n, candidate),
-    `   Grounding: ${candidate.grounding ?? "unknown (legacy payload, treat as real)"}`,
-    `   Conversation register: ${candidate.conversationRegister ?? "unknown (legacy payload)"}`,
-  ].join("\n");
-}
-
-/**
  * The admission judge scores solely on what extraction provided (the
  * candidate's own category/abstract/overview/content) plus, elsewhere in
  * AdmissionController, the store's existing rows via the separate
@@ -518,7 +502,7 @@ function buildUtilityPrompt(candidate: CandidateMemory): string {
 
 Candidate memory:
 
-${formatAdmissionCandidateBlock(1, candidate)}
+${formatCandidateBlock(1, candidate)}
 
 Score future usefulness on a 0.0-1.0 scale.
 
@@ -529,15 +513,6 @@ Use moderate scores for events worth an episodic record.
 Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
 
 Grounding rule: this candidate's own grounding tag already passed the deterministic pre-admission check (a "constructed" tag is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If the candidate's own content shows such a constructed frame and its claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
-
---- EXAMPLE (not part of the live data) ---
-Candidate memory:
-- Category: preferences
-- Abstract: User's preferred name is Alex
-
-Example response:
-{"utility": 0.9, "reason": "durable identity fact"}
---- END EXAMPLE ---
 
 Return JSON only:
 {
@@ -606,7 +581,7 @@ export function buildBatchUtilityPrompt(
   candidates: CandidateMemory[],
 ): { system: string; user: string } {
   const exampleCandidateBlocks = BATCH_UTILITY_EXAMPLE_CANDIDATES.map((candidate, i) =>
-    formatAdmissionCandidateBlock(i + 1, candidate),
+    formatCandidateBlock(i + 1, candidate),
   ).join("\n\n");
 
   const system = `You are an admission judge. Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
@@ -639,7 +614,7 @@ Return JSON only, with exactly one entry per candidate, in this shape:
 }`;
 
   const candidateBlocks = candidates
-    .map((candidate, i) => formatAdmissionCandidateBlock(i + 1, candidate))
+    .map((candidate, i) => formatCandidateBlock(i + 1, candidate))
     .join("\n\n");
 
   const user = `Candidates:
@@ -1005,6 +980,11 @@ export class AdmissionController {
     scopeFilter: string[];
     now?: number;
   }): Promise<AdmissionEvaluation> {
+    // Constructed-grounding candidates are rejected deterministically BEFORE
+    // the utility call — the short-circuit must never spend an LLM call.
+    if (params.candidate.grounding === "constructed") {
+      return this.rejectConstructed(params.candidate, params.now ?? Date.now());
+    }
     const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate);
     return this.evaluateWithUtility(params, utility);
   }
@@ -1170,11 +1150,22 @@ export class AdmissionController {
       return out;
     }
 
-    const utilities = await this.scoreUtilityBatch(chunk.map((item) => item.candidate));
+    // Constructed-grounding candidates never spend a batch slot: they are
+    // rejected deterministically here, and only the remaining candidates go
+    // into the (at most one per chunk) batch utility call.
+    const scorable = chunk.filter((item) => item.candidate.grounding !== "constructed");
+    const utilities = scorable.length > 0
+      ? await this.scoreUtilityBatch(scorable.map((item) => item.candidate))
+      : [];
+    const utilityByItem = new Map(scorable.map((item, i) => [item, utilities[i]]));
 
     const out: AdmissionEvaluation[] = [];
-    for (let i = 0; i < chunk.length; i++) {
-      out.push(await this.evaluateWithUtility(chunk[i], utilities[i]));
+    for (const item of chunk) {
+      if (item.candidate.grounding === "constructed") {
+        out.push(this.rejectConstructed(item.candidate, item.now ?? Date.now()));
+        continue;
+      }
+      out.push(await this.evaluateWithUtility(item, utilityByItem.get(item) ?? { score: 0.5 }));
     }
     return out;
   }

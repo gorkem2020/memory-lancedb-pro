@@ -191,11 +191,13 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
   });
 
   it("separates the few-shot example's own logical blocks (header, each candidate, response, closing note) with blank lines", async () => {
+    // The example is a static block, so it rides the system slot; capture
+    // system + user combined so the assertions see the full prompt text.
     let capturedPrompt;
     const llm = {
-      async completeJson(prompt, label) {
+      async completeJson(prompt, label, systemPrompt) {
         if (label === "admission-utility-batch") {
-          capturedPrompt = prompt;
+          capturedPrompt = `${systemPrompt}\n\n${prompt}`;
           return { results: [{ index: 1, utility: 0.5, reason: "r" }] };
         }
         return null;
@@ -222,11 +224,13 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
   });
 
   it("emits the few-shot example through the live candidate formatter (same four-field block shape)", async () => {
+    // The example is a static block, so it rides the system slot; capture
+    // system + user combined so the assertions see the full prompt text.
     let capturedPrompt;
     const llm = {
-      async completeJson(prompt, label) {
+      async completeJson(prompt, label, systemPrompt) {
         if (label === "admission-utility-batch") {
-          capturedPrompt = prompt;
+          capturedPrompt = `${systemPrompt}\n\n${prompt}`;
           return { results: [{ index: 1, utility: 0.5, reason: "r" }] };
         }
         return null;

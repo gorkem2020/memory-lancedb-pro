@@ -279,7 +279,8 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
 
   it("buildExtractionPrompt documents the v3 grounding contract (structural check)", async () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const parts = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = `${parts.system}\n\n${parts.user}`;
 
     assert.match(prompt, /grounding/i);
     assert.match(prompt, /"real"\s*\|\s*"constructed"|real.*constructed/i);
@@ -465,7 +466,16 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
     // (a legacy or dropped conversation_register field alongside a real constructed note),
     // which the existing per-register tests don't individually cover.
     const store = makeStore();
-    const llm = makeLlm([...FACTUAL_CANDIDATES, MISLABELED_FICTION_CANDIDATES[2]]); // no conversation_register field
+    // v3 fixtures tag the session-note events row "real" (about-the-fiction),
+    // so seed an explicitly constructed sibling to arm the wipe.
+    const constructedSibling = {
+      category: "entities",
+      abstract: "The star cruiser's shield rating is 42",
+      overview: "## Entity\n- Shield rating: 42",
+      content: "In the game, the star cruiser's shield rating is 42.",
+      grounding: "constructed",
+    };
+    const llm = makeLlm([...FACTUAL_CANDIDATES, MISLABELED_FICTION_CANDIDATES[2], constructedSibling]); // no conversation_register field
     const extractor = makeExtractor(makeEmbedder(), llm, store);
 
     const stats = await extractor.extractAndPersist(GAME_TRANSCRIPT, "s1");
@@ -500,7 +510,8 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
 
   it("buildExtractionPrompt documents the batch register contract (structural check)", () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const parts = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = `${parts.system}\n\n${parts.user}`;
 
     assert.match(prompt, /conversation_register/);
     assert.match(prompt, /"real\|mixed\|fiction"/);
@@ -596,7 +607,7 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
     assert.equal(scoreGroundedTypePrior(realProfile, priors), priors.profile, "real register keeps the raw prior");
   });
 
-  it("buildUtilityPrompt interpolates grounding and names all six registers (structural check)", async () => {
+  it("buildUtilityPrompt carries the grounding rule and names all six registers (structural check)", async () => {
     const llm = {
       prompts: [],
       async completeJson(prompt, mode) {
@@ -625,8 +636,11 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
 
     assert.equal(llm.prompts.length, 1);
     const prompt = llm.prompts[0];
-    assert.match(prompt, /Grounding: real/);
-    assert.match(prompt, /Conversation register: fiction/);
+    // Post formatting-round-2, the candidate block carries only the shared
+    // four-field formatCandidateBlock shape (no per-candidate grounding
+    // interpolation); grounding enforcement is the deterministic
+    // constructed-tag pre-check plus the prompt's grounding-rule paragraph.
+    assert.match(prompt, /grounding tag/i, "utility prompt must reference the grounding pre-check contract");
     for (const register of ["profile", "preferences", "entities", "events", "cases", "patterns"]) {
       assert.match(prompt, new RegExp(register), `utility prompt must name the ${register} register`);
     }
