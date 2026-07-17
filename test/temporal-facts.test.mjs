@@ -97,12 +97,18 @@ async function runTest() {
           content: "用户现在改喝咖啡。",
         }],
       });
-    } else if (prompt.includes("You are a dedup decider")) {
-      content = JSON.stringify({
+    } else if (
+      prompt.includes("Determine how to handle this candidate memory") ||
+      prompt.includes("Determine how to handle each numbered candidate memory")
+    ) {
+      const verdict = {
         decision: dedupDecision,
         match_index: 1,
         reason: "same preference topic, new truth replaces old truth",
-      });
+      };
+      content = prompt.includes("each numbered candidate memory")
+        ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+        : JSON.stringify(verdict);
     }
 
     res.writeHead(200, { "Content-Type": "application/json" });

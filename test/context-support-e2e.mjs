@@ -89,13 +89,31 @@ async function runTest() {
                     content: "用户喜欢乌龙茶。",
                 }],
             });
-        } else if (prompt.includes("You are a dedup decider")) {
-            content = JSON.stringify({
+        } else if (
+            prompt.includes("Determine how to handle this candidate memory") ||
+            prompt.includes("Determine how to handle each numbered candidate memory")
+        ) {
+            const verdict = {
                 decision: dedupDecision,
                 match_index: 1,
                 reason: `test ${dedupDecision}`,
                 context_label: dedupContextLabel,
-            });
+            };
+            content = prompt.includes("each numbered candidate memory")
+                ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
+                : JSON.stringify(verdict);
+        } else if (
+            prompt.includes("Merge the following memory into a single coherent record") ||
+            prompt.includes("Merge each numbered job")
+        ) {
+            const merged = {
+                abstract: "饮品偏好：乌龙茶",
+                overview: "## Preference\n- 喜欢乌龙茶",
+                content: "用户喜欢乌龙茶。",
+            };
+            content = prompt.includes("Merge each numbered job")
+                ? JSON.stringify({ results: [{ index: 1, ...merged }] })
+                : JSON.stringify(merged);
         } else {
             content = JSON.stringify({ memories: [] });
         }
