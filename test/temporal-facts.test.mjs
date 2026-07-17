@@ -97,7 +97,7 @@ async function runTest() {
           content: "用户现在改喝咖啡。",
         }],
       });
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a memory dedup judge.")) {
       content = JSON.stringify({
         decision: dedupDecision,
         match_index: 1,

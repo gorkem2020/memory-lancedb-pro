@@ -256,7 +256,7 @@ async function runScenario(mode) {
           },
         ],
       });
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a memory dedup judge.")) {
       content = JSON.stringify({
         decision: mode === "merge" ? "merge" : "skip",
         match_index: 1,
@@ -264,7 +264,7 @@ async function runScenario(mode) {
           ? "Same preference domain, merge into existing memory"
           : "Candidate fully duplicates existing memory",
       });
-    } else if (prompt.includes("Merge the following memory into a single coherent record")) {
+    } else if (prompt.includes("You are a memory merge writer.")) {
       content = JSON.stringify({
         abstract: "饮品偏好：乌龙茶、茉莉花茶",
         overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢乌龙茶\n- 喜欢茉莉花茶",
@@ -424,7 +424,7 @@ async function runMultiRoundScenario() {
           ],
         });
       }
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a memory dedup judge.")) {
       dedupCall += 1;
       if (dedupCall === 1) {
         content = JSON.stringify({
@@ -445,7 +445,7 @@ async function runMultiRoundScenario() {
           reason: "Already merged into existing memory",
         });
       }
-    } else if (prompt.includes("Merge the following memory into a single coherent record")) {
+    } else if (prompt.includes("You are a memory merge writer.")) {
       mergeCall += 1;
       content = JSON.stringify({
         abstract: "饮品偏好：乌龙茶、茉莉花茶",
@@ -1235,7 +1235,7 @@ async function runInboundMetadataCleanupScenario() {
           },
         ],
       });
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a memory dedup judge.")) {
       content = JSON.stringify({
         decision: "create",
         reason: "No similar memory exists yet",
@@ -1612,7 +1612,7 @@ async function runDedupDecisionLLMCallScenario() {
           }, finish_reason: "stop"
         }]
       }));
-    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+    } else if (prompt.includes("You are a memory dedup judge.")) {
       dedupCalls += 1;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({

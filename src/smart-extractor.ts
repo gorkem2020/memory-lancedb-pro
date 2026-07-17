@@ -14,6 +14,7 @@ import {
   buildDedupPrompt,
   buildMergePrompt,
 } from "./extraction-prompts.js";
+import { formatExistingMemoryEntry } from "./prompt-blocks.js";
 import {
   AdmissionController,
   type AdmissionAuditRecord,
@@ -1094,17 +1095,16 @@ export class SmartExtractor {
           metaObj = JSON.parse(r.entry.metadata || "{}");
         } catch { }
         const abstract = (metaObj.l0_abstract as string) || r.entry.text;
-        const overview = (metaObj.l1_overview as string) || "";
-        return `${i + 1}. [${(metaObj.memory_category as string) || r.entry.category}] ${abstract}\n   Overview: ${overview}\n   Score: ${r.score.toFixed(3)}`;
+        return formatExistingMemoryEntry(
+          i + 1,
+          (metaObj.memory_category as string) || r.entry.category,
+          abstract,
+          r.score,
+        );
       })
       .join("\n");
 
-    const prompt = buildDedupPrompt(
-      candidate.abstract,
-      candidate.overview,
-      candidate.content,
-      existingFormatted,
-    );
+    const prompt = buildDedupPrompt(candidate, existingFormatted);
 
     try {
       const data = await this.llm.completeJson<{
@@ -1281,13 +1281,8 @@ export class SmartExtractor {
 
     // Call LLM to merge
     const prompt = buildMergePrompt(
-      existingAbstract,
-      existingOverview,
-      existingContent,
-      candidate.abstract,
-      candidate.overview,
-      candidate.content,
-      candidate.category,
+      { abstract: existingAbstract, overview: existingOverview, content: existingContent },
+      candidate,
     );
 
     const merged = await this.llm.completeJson<{

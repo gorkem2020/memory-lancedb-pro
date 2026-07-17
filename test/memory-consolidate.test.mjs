@@ -528,7 +528,7 @@ describe("memory consolidate: batched prompt slot conformance", () => {
         "Return JSON only:",
         "Source legend:",
       ],
-      userOpener: "Cluster 1 members:",
+      userOpener: "## Cluster 1",
     });
     assert.ok(prompt.user.includes("row one"), "member rows are per-call data and belong in user");
     assert.ok(!prompt.system.includes("row one"));
@@ -548,9 +548,9 @@ describe("memory consolidate: batched prompt slot conformance", () => {
         "Requirements:",
         "Return JSON only, with exactly one entry per job",
       ],
-      userOpener: "Merge jobs:",
+      userOpener: "## Merge jobs",
     });
-    assert.match(prompt.user, /1\. Category: preferences/);
+    assert.match(prompt.user, /### 1\. preferences/);
     assert.ok(prompt.user.includes("existing abstract"));
     assert.ok(prompt.user.includes("new content"));
     assert.ok(!prompt.system.includes("existing abstract"), "job payloads must never leak into system");
@@ -1221,7 +1221,7 @@ describe("memory consolidate: orchestration", () => {
     let sawClusterMemberCount = null;
     const completeJson = async (prompt, label) => {
       if (label !== "consolidate-decide") return null;
-      sawClusterMemberCount = (prompt.match(/^\d+\. \[/gm) || []).length;
+      sawClusterMemberCount = (prompt.match(/^### \d+\. /gm) || []).length;
       return {
         verdicts: [
           { cluster_index: 1, verdict: "supersede", survivor_index: 4, absorbed_indices: [1, 2, 3], reason: "reversal supersedes all 3 cross-lane duplicates" },
