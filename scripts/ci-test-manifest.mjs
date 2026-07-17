@@ -128,6 +128,8 @@ export const CI_TEST_MANIFEST = [
   // D3: admission model resolution and lane affinity
   { group: "core-regression", runner: "node", file: "test/admission-model-resolution.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/admission-lane-model-affinity.test.mjs", args: ["--test"] },
+  // CLI subcommand attachment: pins every command under the memory-pro group, root program stays clean
+  { group: "core-regression", runner: "node", file: "test/cli-subcommand-attachment.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
