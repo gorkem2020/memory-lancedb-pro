@@ -1,10 +1,11 @@
 /**
  * Shared static prompt content, single-sourced here and composed into every
  * prompt builder that needs it: extraction, admission (standalone + batch),
- * dedup decider (standalone + batch), and merge writer (standalone + batch).
- * Copied prompt text between builders is a defect -- converge it here
- * instead. Topology-specific wording (singular/plural framing, output
- * contracts, batch-only guidance) stays local to each builder by design.
+ * dedup decider (standalone + batch), merge writer (standalone + batch),
+ * consolidate decider, and consolidate merge writer. Copied prompt text
+ * between builders is a defect -- converge it here instead. Topology-
+ * specific wording (singular/plural framing, output contracts, batch-only
+ * guidance) stays local to each builder by design.
  */
 
 import type { CandidateMemory } from "./memory-categories.js";
@@ -27,6 +28,8 @@ export const DEDUP_JUDGE_IDENTITY =
   "You are a memory dedup judge. Decide how each candidate memory relates to the existing memories: new, duplicate, or an update.";
 export const MERGE_WRITER_IDENTITY =
   "You are a memory merge writer. Combine each candidate with its existing memory into one improved record.";
+export const CONSOLIDATE_DECIDER_IDENTITY = "You are a memory consolidation decider.";
+export const CONSOLIDATE_MERGE_WRITER_IDENTITY = "You are a memory consolidation merge writer.";
 
 /** Wraps a raw JSON example/contract in a fenced ```json code block. */
 export function jsonBlock(json: string): string {

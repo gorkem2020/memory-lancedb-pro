@@ -186,7 +186,7 @@ function createApiKeyClient(config, log, warnLog) {
     });
     let lastError = null;
     return {
-        async completeJson(prompt, label = "generic", systemPrompt) {
+        async completeJson(prompt, label = "generic", systemPrompt, temperature) {
             lastError = null;
             try {
                 const request = {
@@ -198,7 +198,7 @@ function createApiKeyClient(config, log, warnLog) {
                         },
                         { role: "user", content: prompt },
                     ],
-                    temperature: 0.1,
+                    temperature: temperature ?? 0.1,
                     ...(shouldDisableReasoningForJson(config.model)
                         ? { chat_template_kwargs: { enable_thinking: false } }
                         : {}),
@@ -295,7 +295,7 @@ function createOauthClient(config, log, warnLog) {
         return session;
     }
     return {
-        async completeJson(prompt, label = "generic", systemPrompt) {
+        async completeJson(prompt, label = "generic", systemPrompt, _temperature) {
             lastError = null;
             try {
                 const session = await getSession();

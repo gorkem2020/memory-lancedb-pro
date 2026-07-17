@@ -20,6 +20,8 @@ import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import type { LlmClient } from "./src/llm-client.js";
+import type { MdMirrorWriter } from "./src/tools.js";
+import { runConsolidate, formatConsolidateCostPreview, type ClusterPlanReport } from "./src/consolidate.js";
 import {
   getDefaultOauthModelForProvider,
   getOAuthProviderLabel,
@@ -41,6 +43,7 @@ interface CLIContext {
   migrator: MemoryMigrator;
   embedder?: import("./src/embedder.js").Embedder;
   llmClient?: LlmClient;
+  mdMirror?: MdMirrorWriter | null;
   pluginId?: string;
   pluginConfig?: Record<string, unknown>;
   oauthTestHooks?: {
@@ -1302,6 +1305,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--limit <n>", "Maximum number of results", "20")
     .option("--offset <n>", "Number of results to skip", "0")
     .option("--json", "Output as JSON")
+    .option("--include-invalidated", "Include invalidated/superseded rows (excluded by default)", false)
     .action(async (options) => {
       try {
         const limit = parseInt(options.limit) || 20;
@@ -1316,7 +1320,8 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           scopeFilter,
           options.category,
           limit,
-          offset
+          offset,
+          { excludeInactive: !options.includeInvalidated },
         );
 
         if (options.json) {
@@ -1434,6 +1439,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           writeJson(summary);
         } else {
           console.log(`Memory Statistics:`);
+          console.log(`• Live memories: ${stats.liveCount}`);
           console.log(`• Total memories: ${stats.totalCount}`);
           console.log(`• Available scopes: ${scopeStats.totalScopes}`);
           console.log(`• Retrieval mode: ${retrievalConfig.mode}`);
@@ -1540,10 +1546,15 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           scopeFilter = [options.scope];
         }
 
+        // excludeInactive:false -- export is a backup/forensic view and must
+        // keep full-dump semantics, including invalidated/superseded rows
+        // (item 6, PR #946).
         const memories = await context.store.list(
           scopeFilter,
           options.category,
-          1000 // Large limit for export
+          1000, // Large limit for export
+          0,
+          { excludeInactive: false },
         );
 
         const exportData = {
@@ -1587,11 +1598,18 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     .option("--category <category>", "Export specific category")
     .option("--limit <number>", "Maximum memories to export", "1000")
     .option("--dry-run", "Show what would be written without creating files")
+    .option("--include-invalidated", "Include invalidated/superseded rows (excluded by default)", false)
     .action(async (options) => {
       try {
         const limit = clampInt(Number(options.limit), 1, 10000);
         const scopeFilter = options.scope ? [String(options.scope)] : undefined;
-        const memories = await context.store.list(scopeFilter, options.category, limit);
+        const memories = await context.store.list(
+          scopeFilter,
+          options.category,
+          limit,
+          0,
+          { excludeInactive: !options.includeInvalidated },
+        );
         const vault = path.resolve(String(options.vault));
         const root = path.join(vault, "00-AI-Memory");
 
@@ -2201,6 +2219,184 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         console.log(`\nRepair complete: ${repaired} fixed, ${failed} failed out of ${staleEntries.length} stale.`);
       } catch (error) {
         console.error("repair-summaries failed:", error);
+        process.exit(1);
+      }
+    });
+
+  // consolidate: reconcile duplicate/contradictory rows already in the store
+  registerConsolidateCommand(memory, context);
+}
+
+/**
+ * Item 7: the real confirm implementation wired to a real CLI invocation.
+ * Fails closed -- non-interactive (either stream not a TTY) resolves false
+ * without ever reading anything, so a scripted/piped invocation without
+ * --yes aborts cleanly instead of hanging on stdin or silently proceeding.
+ * Streams are injectable so tests can drive both branches deterministically.
+ */
+export function createConsolidateConfirm(streams?: {
+  stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
+  stdout?: NodeJS.WritableStream & { isTTY?: boolean };
+}): (promptText: string) => Promise<boolean> {
+  const stdin = streams?.stdin ?? process.stdin;
+  const stdout = streams?.stdout ?? process.stdout;
+
+  return async (promptText: string): Promise<boolean> => {
+    if (!stdin.isTTY || !stdout.isTTY) {
+      return false;
+    }
+    const rl = readline.createInterface({ input: stdin as NodeJS.ReadableStream, output: stdout as NodeJS.WritableStream });
+    try {
+      const answer = await new Promise<string>((resolve) => rl.question(promptText, resolve));
+      return answer.trim() === "YES";
+    } finally {
+      rl.close();
+    }
+  };
+}
+
+/** Item 8: renders the full plan (verdict, member ids, survivor, exact merge content) for user review before the apply prompt. */
+export function formatConsolidatePlanForDisplay(clusters: ClusterPlanReport[]): string {
+  const actionable = clusters.filter((c) => c.action);
+  if (actionable.length === 0) {
+    return "No actionable clusters in this plan.";
+  }
+  const lines: string[] = [`Plan (${actionable.length} cluster(s)):`];
+  for (const cluster of actionable) {
+    lines.push(`  [${cluster.action}] cluster ${cluster.clusterIndex} — ${cluster.verdict!.reason}`);
+    lines.push(`    members: ${cluster.memberIds.join(", ")}`);
+    lines.push(`    survivor: ${cluster.survivorId}`);
+    if (cluster.absorbedIds?.length) {
+      lines.push(`    absorbed: ${cluster.absorbedIds.join(", ")}`);
+    }
+    if (cluster.action === "merge" && cluster.mergedContent) {
+      lines.push(`    merged abstract: ${cluster.mergedContent.abstract}`);
+      lines.push(`    merged overview: ${cluster.mergedContent.overview}`);
+      lines.push(`    merged content: ${cluster.mergedContent.content}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function registerConsolidateCommand(memory: Command, context: CLIContext) {
+  memory
+    .command("consolidate")
+    .description("Reconcile duplicate or contradictory memories already in the store across write lanes (dry-run by default)")
+    .requiredOption("--scope <scope>", "Scope to consolidate")
+    .option("--category <category>", "Limit to one smart category (profile|preferences|entities|events|cases|patterns)")
+    .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
+    .option("--apply", "Apply the consolidation plan immediately (default is a dry-run preview with an interactive apply prompt)", false)
+    .option("--yes", "Skip the LLM-cost confirmation prompt (required for non-interactive/automated runs)", false)
+    .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
+    .option("--agent <agentId>", "Agent identity to route journal-mirror writes to (omit to use the fallback mirror directory)")
+    .action(async (options: {
+      scope: string;
+      category?: string;
+      since?: string;
+      apply: boolean;
+      yes: boolean;
+      includeReflectionSlices: boolean;
+      agent?: string;
+    }) => {
+      try {
+        if (!context.llmClient) {
+          console.error("consolidate: no LLM client configured, cannot make consolidation decisions");
+          process.exit(1);
+        }
+        if (!context.embedder) {
+          console.error("consolidate: no embedder configured, cannot re-embed merged rows");
+          process.exit(1);
+        }
+        const llmClient = context.llmClient;
+        const embedder = context.embedder;
+
+        let sinceMs: number | undefined;
+        if (options.since) {
+          const parsed = Date.parse(options.since);
+          if (Number.isNaN(parsed)) {
+            console.error(`consolidate: invalid --since timestamp "${options.since}"`);
+            process.exit(1);
+          }
+          sinceMs = parsed;
+        }
+
+        const mdMirror = context.mdMirror;
+        const confirm = createConsolidateConfirm();
+
+        const result = await runConsolidate(
+          {
+            fetchRows: (scopeFilter, maxTimestamp, limit) =>
+              context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit),
+            update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
+            getById: (id, scopeFilter) => context.store.getById(id, scopeFilter),
+            embed: (text) => embedder.embedPassage(text),
+            completeJson: (prompt, label, system, temperature) => llmClient.completeJson(prompt, label, system, temperature),
+            log: (message) => console.warn(message),
+            confirmCost: async (message) => {
+              console.log(`\n${message}`);
+              return confirm("Proceed with these LLM calls? Type YES to continue: ");
+            },
+            confirmApply: async (message, clusters) => {
+              console.log(`\n${formatConsolidatePlanForDisplay(clusters)}`);
+              console.log(`\n${message}`);
+              return confirm("Type YES to apply: ");
+            },
+            onAudit: mdMirror
+              ? async (audit) => {
+                  const summary = `${audit.action} survivor=${audit.survivorId.slice(0, 8)} absorbed=${audit.absorbedIds.map((id) => id.slice(0, 8)).join(",")} reason="${audit.reason}"`;
+                  await mdMirror(
+                    { text: summary, category: "consolidation", scope: audit.scope, timestamp: Date.now() },
+                    { source: `memory-consolidate:${audit.action}`, agentId: options.agent },
+                  );
+                }
+              : undefined,
+          },
+          {
+            scope: options.scope,
+            category: options.category as import("./src/memory-categories.js").MemoryCategory | undefined,
+            sinceMs,
+            includeReflectionSlices: options.includeReflectionSlices,
+            apply: options.apply === true,
+            autoConfirm: options.yes === true,
+          },
+        );
+
+        if (result.status === "aborted") {
+          console.error(`consolidate: aborted -- ${result.abortReason}`);
+          if (result.costPreview) {
+            console.error(formatConsolidateCostPreview(result.costPreview));
+          }
+          console.error(`Pass --yes to skip this prompt (e.g. for automation), or re-run interactively and type YES.`);
+          process.exit(1);
+        }
+
+        console.log(`Scanned ${result.scanned} row(s), ${result.eligible} eligible for consolidation.`);
+        console.log(`Found ${result.clusters.length} cluster(s).\n`);
+
+        for (const cluster of result.clusters) {
+          if (cluster.malformed) {
+            console.log(`  [skipped: malformed verdict] ${cluster.memberIds.length} rows`);
+            for (const text of cluster.memberTexts) console.log(`    - "${text}"`);
+            continue;
+          }
+          console.log(`  [${cluster.verdict!.verdict}] ${cluster.memberIds.length} rows — ${cluster.verdict!.reason}`);
+          for (const text of cluster.memberTexts) console.log(`    - "${text}"`);
+        }
+
+        if (result.staleSkipped.length > 0) {
+          console.log(`\n${result.staleSkipped.length} cluster(s) skipped: changed since the plan was built (stale).`);
+        }
+
+        if (!result.executed) {
+          if (!options.apply) {
+            console.log(`\nNo changes applied.`);
+          }
+          return;
+        }
+
+        console.log(`\nApplied ${result.applied.length} action(s); ${result.skippedMalformed} cluster(s) skipped due to malformed verdicts.`);
+      } catch (error) {
+        console.error("consolidate failed:", error);
         process.exit(1);
       }
     });

@@ -7,6 +7,11 @@
  * Batched variants (one LLM call per pipeline stage):
  * - buildBatchDedupPrompt: one dedup decision per numbered candidate
  * - buildBatchMergePrompt: one merged record per numbered merge job
+ * Consolidate prompts (post-hoc reconciliation of already-stored memories):
+ * - buildConsolidatePrompt / buildConsolidateBatchPrompt: merge/supersede/
+ *   contradict/skip decider, single-cluster and multi-cluster variants
+ * - buildConsolidateBatchMergePrompt: one merged record per numbered
+ *   consolidate merge job
  *
  * Each builder returns a {system, user} pair: instructions, criteria,
  * identity, and the output-format contract live in `system`; the per-call
@@ -20,6 +25,8 @@
 import type { CandidateMemory } from "./memory-categories.js";
 import {
   CATEGORY_TAXONOMY,
+  CONSOLIDATE_DECIDER_IDENTITY,
+  CONSOLIDATE_MERGE_WRITER_IDENTITY,
   DEDUP_JUDGE_IDENTITY,
   EXTRACTION_AGENT_IDENTITY,
   MERGE_WRITER_IDENTITY,
@@ -339,6 +346,210 @@ Requirements:
 - Keep the most up-to-date details
 - Maintain a coherent narrative
 - Keep code identifiers / URIs / model names unchanged when they are proper nouns
+
+Return JSON only, with exactly one entry per job, in this shape:
+${jsonBlock(`{
+  "results": [
+    { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
+  ]
+}`)}
+
+- "index" is the job's number in the batch below.`;
+
+  const blocks = jobs.map((job, i) => {
+    const lines = [`### ${i + 1}. ${job.category}`, "", "#### Existing memory", ...formatMemoryFieldLines(job.existing)];
+    job.additions.forEach((addition, j) => {
+      const heading = job.additions.length > 1 ? `#### New information ${j + 1}` : "#### New information";
+      lines.push("", heading, ...formatMemoryFieldLines(addition));
+    });
+    return lines.join("\n");
+  });
+
+  const user = `## Merge jobs
+
+${blocks.join("\n\n")}`;
+
+  return { system, user };
+}
+
+export interface ConsolidateMember {
+  index: number;
+  category: string;
+  abstract: string;
+  overview: string;
+  content: string;
+  source?: string;
+  timestamp?: number;
+  validFrom?: number;
+}
+
+export const CONSOLIDATE_MERGE_SYSTEM_PROMPT = `${CONSOLIDATE_MERGE_WRITER_IDENTITY} Merge two versions of the same memory into a single coherent record with all three levels (abstract, overview, content).
+
+${CATEGORY_TAXONOMY}
+
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
+
+Return JSON only:
+${jsonBlock(`{
+  "abstract": "Merged one-line abstract",
+  "overview": "Merged structured Markdown overview",
+  "content": "Merged full content"
+}`)}`;
+
+// mapped/manual/legacy rows without a real overview/content commonly fall
+// back to the raw abstract text in all three tiers (see
+// src/smart-metadata.ts's parseSmartMetadata: l2_content falls back to raw
+// text, l1_overview falls back to `- ${abstract}`). Printing that fact three
+// times per member wastes cluster-listing space for no signal.
+function hasThinTiers(m: ConsolidateMember): boolean {
+  const overviewIsDefault = m.overview === "" || m.overview === `- ${m.abstract}` || m.overview === m.abstract;
+  const contentIsDefault = m.content === m.abstract;
+  return overviewIsDefault && contentIsDefault;
+}
+
+/** Renders one member's provenance/timestamp fields, when present, as plain lines under its heading. */
+function formatMemberProvenanceLines(m: ConsolidateMember): string[] {
+  const lines: string[] = [];
+  if (m.source) lines.push(`source: ${m.source}`);
+  if (m.timestamp !== undefined) {
+    lines.push(`timestamp: ${new Date(m.timestamp).toISOString()}`);
+    if (m.validFrom !== undefined && m.validFrom !== m.timestamp) {
+      lines.push(`valid_from: ${new Date(m.validFrom).toISOString()}`);
+    }
+  }
+  return lines;
+}
+
+/** Formats one cluster member as a markdown subsection: `### N. category` heading, provenance lines, then either a single `Fact:` line (thin tiers) or full Abstract/Overview/Content. */
+function formatMemberBlock(m: ConsolidateMember): string {
+  const lines = [`### ${m.index}. ${m.category}`, ...formatMemberProvenanceLines(m)];
+  if (hasThinTiers(m)) {
+    lines.push(`Fact: ${m.abstract}`);
+  } else {
+    lines.push(...formatMemoryFieldLines(m));
+  }
+  return lines.join("\n");
+}
+
+const CONSOLIDATE_VERDICT_RULES = `Return exactly one verdict, scoped to whichever rows it actually applies to:
+- skip: none of the rows in this cluster need any action. Use this only when nothing here is a duplicate, reversal, or contradiction.
+- merge: two or more rows are duplicates or near-duplicates of the same fact. Pick the row with the best-quality, most complete text as the survivor and list only the true duplicates as absorbed.
+- supersede: one row is a newer fact or an explicit reversal that replaces one or more older rows describing the same fact (for example, a decision to stop doing something an older row describes). The survivor is the newer/reversal row; list only the rows it actually replaces as absorbed. Supersede is NOT destructive: absorbed rows are never deleted. They are kept as an auditable historical record and simply marked as no longer current, exactly like SUPERSEDE in ordinary dedup decisions ("the same mutable fact has changed over time; keep the old memory as historical but no longer current"). Use supersede whenever a row states that a fact from an older row has changed, even if that only applies to part of the cluster.
+- contradict: two or more rows conflict and it is not clear which one is correct. Flag this for human review. No destructive action.`;
+
+const CONSOLIDATE_APPEND_ONLY_RULE = `"events" and "cases" categories are append-only: they can never be superseded or contradicted (append-only means invalidation-protection, not merge-immunity). A merge must never mix an append-only row with a non-append-only row, or with a different append-only category. The one exception: near-identical duplicate rows within the SAME append-only category (for example two "events" rows describing the exact same occurrence, or two "cases" rows describing the exact same problem/solution) may still be merged like any other true duplicate. Outside that same-category duplicate case, leave append-only rows out of your survivor_index/absorbed_indices selection`;
+
+const CONSOLIDATE_SOURCE_LEGEND = `Source legend: legacy = pre-smart-format rows, manual = operator memory_store saves, auto-capture = extraction lane, reflection* = mirror lanes; manual rows are operator-authored and strong survivor candidates.
+
+Each member below also shows its timestamp (and valid_from when it differs) — use these to judge supersede recency explicitly rather than inferring it from wording alone.`;
+
+export function buildConsolidatePrompt(members: ConsolidateMember[]): SplitPrompt {
+  const system = `${CONSOLIDATE_DECIDER_IDENTITY} You are given a cluster of existing memories that were flagged as likely related, either by embedding similarity or by sharing a topic key. Decide how to reconcile the ACTIONABLE rows in this cluster. You do NOT have to act on every row: survivor_index and absorbed_indices only need to cover the rows you are deciding about. Any row you leave out of both is simply left untouched — this is expected and correct whenever a cluster mixes actionable duplicates or reversals with unrelated or append-only rows.
+
+${CATEGORY_TAXONOMY}
+
+${CONSOLIDATE_VERDICT_RULES}
+
+${CONSOLIDATE_APPEND_ONLY_RULE} — that never blocks you from merging or superseding the OTHER, actionable rows in the same cluster.
+
+${CONSOLIDATE_SOURCE_LEGEND}
+
+Return JSON only:
+${jsonBlock(`{
+  "verdict": "skip|merge|supersede|contradict",
+  "survivor_index": 1,
+  "absorbed_indices": [2, 3],
+  "reason": "short explanation"
+}`)}
+
+Only include survivor_index and absorbed_indices for merge or supersede. survivor_index and every entry in absorbed_indices must be one of the row numbers shown below, and must never be an append-only (events/cases) row — unless the verdict is merge and every row in survivor_index/absorbed_indices shares the exact same append-only category.`;
+
+  const user = `## Cluster
+
+${members.map((m) => formatMemberBlock(m)).join("\n\n")}`;
+
+  return { system, user };
+}
+
+export interface ConsolidateBatchCluster {
+  clusterIndex: number;
+  members: ConsolidateMember[];
+}
+
+// Same decider semantics as buildConsolidatePrompt, but scoped to decide
+// N independent clusters in a single call: one LLM round-trip per
+// consolidate run instead of one per cluster. Each cluster is decided
+// independently -- a verdict for one cluster must never be influenced by
+// another cluster's rows -- and the response is a JSON array with one
+// verdict object per cluster, tagged by cluster_index so a malformed entry
+// for one cluster can be dropped without discarding the others' verdicts.
+export function buildConsolidateBatchPrompt(clusters: ConsolidateBatchCluster[]): SplitPrompt {
+  const system = `${CONSOLIDATE_DECIDER_IDENTITY} You are given multiple independent clusters of existing memories, each flagged as likely related within itself, either by embedding similarity or by sharing a topic key. Decide how to reconcile the ACTIONABLE rows in EACH cluster independently -- a decision about one cluster must never be influenced by another cluster's rows. You do NOT have to act on every row in a cluster: survivor_index and absorbed_indices only need to cover the rows you are deciding about within that cluster. Any row you leave out of both is simply left untouched -- this is expected and correct whenever a cluster mixes actionable duplicates or reversals with unrelated or append-only rows.
+
+${CATEGORY_TAXONOMY}
+
+Return exactly one verdict per cluster, scoped to whichever rows it actually applies to:
+- skip: none of the rows in this cluster need any action. Use this only when nothing here is a duplicate, reversal, or contradiction.
+- merge: two or more rows are duplicates or near-duplicates of the same fact. Pick the row with the best-quality, most complete text as the survivor and list only the true duplicates as absorbed.
+- supersede: one row is a newer fact or an explicit reversal that replaces one or more older rows describing the same fact (for example, a decision to stop doing something an older row describes). The survivor is the newer/reversal row; list only the rows it actually replaces as absorbed. Supersede is NOT destructive: absorbed rows are never deleted. They are kept as an auditable historical record and simply marked as no longer current, exactly like SUPERSEDE in ordinary dedup decisions ("the same mutable fact has changed over time; keep the old memory as historical but no longer current"). Use supersede whenever a row states that a fact from an older row has changed, even if that only applies to part of the cluster.
+- contradict: two or more rows conflict and it is not clear which one is correct. Flag this for human review. No destructive action.
+
+Decision criteria: apply these checks in order for the rows in each cluster.
+1. Do two or more rows say the same thing, with no row stating a newer fact, a change, or a reversal? -> merge.
+2. Does one row explicitly state a fact has changed, ended, or reversed relative to another row (wording like "no longer", "stopped", "switched to", or simply a materially later timestamp describing a different state of the same fact)? -> supersede.
+3. Do two or more rows assert mutually exclusive facts with no textual or temporal signal indicating which one is current? -> contradict.
+4. None of the above apply to any rows in this cluster? -> skip.
+When it is genuinely ambiguous whether a pair of rows should be merged or superseded, prefer supersede: it is the safer, fully-reversible choice, since a superseded row is retained as historical record rather than combined away into a single new record.
+
+${CONSOLIDATE_APPEND_ONLY_RULE} -- that never blocks you from merging or superseding the OTHER, actionable rows in the same cluster.
+
+${CONSOLIDATE_SOURCE_LEGEND}
+
+Return JSON only:
+${jsonBlock(`{
+  "verdicts": [
+    { "cluster_index": 1, "verdict": "skip|merge|supersede|contradict", "survivor_index": 1, "absorbed_indices": [2, 3], "reason": "short explanation" }
+  ]
+}`)}
+
+Include exactly one verdict object per cluster listed below, each tagged with the matching cluster_index. Only include survivor_index and absorbed_indices for merge or supersede. survivor_index and every entry in absorbed_indices are row numbers scoped to that cluster's own member list, and must never be an append-only (events/cases) row -- unless the verdict is merge and every row in survivor_index/absorbed_indices shares the exact same append-only category.`;
+
+  const user = clusters
+    .map((c) => `## Cluster ${c.clusterIndex}\n\n${c.members.map((m) => formatMemberBlock(m)).join("\n\n")}`)
+    .join("\n\n===\n\n");
+
+  return { system, user };
+}
+
+export interface ConsolidateBatchMergeJob {
+  category: string;
+  existing: { abstract: string; overview: string; content: string };
+  /** Every absorbed member folding into this job's existing memory. */
+  additions: Array<{ abstract: string; overview: string; content: string }>;
+}
+
+/**
+ * Batched variant of the consolidate merge writer prompt: one LLM call
+ * writes every numbered merge job. Each job carries its survivor ("Existing
+ * memory") and every absorbed member folding into it ("New information");
+ * merge requirements match CONSOLIDATE_MERGE_SYSTEM_PROMPT verbatim — only
+ * the call topology changes from one call per absorbed member to one call
+ * per batch of merge verdicts.
+ */
+export function buildConsolidateBatchMergePrompt(jobs: ConsolidateBatchMergeJob[]): SplitPrompt {
+  const system = `${CONSOLIDATE_MERGE_WRITER_IDENTITY} For each job, merge every "New information" section into that job's "Existing memory"; never mix content across jobs.
+
+${CATEGORY_TAXONOMY}
+
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
 
 Return JSON only, with exactly one entry per job, in this shape:
 ${jsonBlock(`{
