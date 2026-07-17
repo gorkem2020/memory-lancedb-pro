@@ -1590,6 +1590,18 @@ export function buildReflectionPromptParts(
   return { system, user };
 }
 
+// Combined single-slot form of the distiller prompt. Exported for tests
+// that assert on the full prompt text (PR #931 adds one); the embedded
+// runner itself consumes the split parts above.
+export function buildReflectionPrompt(
+  conversation: string,
+  maxInputChars: number,
+  toolErrorSignals: ReflectionErrorSignal[] = []
+): string {
+  const parts = buildReflectionPromptParts(conversation, maxInputChars, toolErrorSignals);
+  return `${parts.system}\n\n${parts.user}`;
+}
+
 function buildReflectionFallbackText(): string {
   return [
     "## Context (session background)",
