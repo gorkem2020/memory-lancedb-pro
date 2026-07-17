@@ -461,21 +461,57 @@ function cosineSimilarity(left: number[], right: number[]): number {
 }
 
 /**
+ * Formats one candidate as a numbered block: `N. Category: <cat>` with the
+ * number inline on the first line, then each remaining field on its own line
+ * indented under the candidate. Multi-line field values (stored overviews
+ * commonly carry bulleted markdown like "- Name: ...") are split per line,
+ * any leading markdown list marker (`- ` / `* `) is stripped while the
+ * line's own inner indentation is kept, and every continuation line is
+ * indented under the candidate so the block stays visually grouped. Without
+ * this, content-carried bullets land at column 0 inside the numbered list
+ * and (in markdown renderers) break the list apart; other content markdown
+ * (e.g. `##` headings) is deliberately left as-is.
+ *
+ * Every admission-prompt path (standalone, batch, and the batch prompt's own
+ * few-shot example) must emit candidate blocks through this one function so
+ * the shapes can never drift apart.
+ */
+function formatCandidateBlock(n: number, candidate: CandidateMemory): string {
+  const lines = [`${n}. Category: ${candidate.category}`];
+  const fields: Array<[string, string]> = [
+    ["Abstract", candidate.abstract],
+    ["Overview", candidate.overview],
+    ["Content", candidate.content],
+  ];
+  for (const [label, value] of fields) {
+    const valueLines = String(value ?? "")
+      .split("\n")
+      .map((line) => line.replace(/^(\s*)[-*] /, "$1"));
+    lines.push(`   ${label}: ${valueLines[0]}`);
+    for (const continuation of valueLines.slice(1)) {
+      lines.push(`   ${continuation}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
  * The admission judge scores solely on what extraction provided (the
  * candidate's own category/abstract/overview/content) plus, elsewhere in
  * AdmissionController, the store's existing rows via the separate
  * non-LLM novelty feature — never on raw conversation/transcript text, so
  * this prompt intentionally carries no conversation excerpt or other
  * source-context blob.
+ *
+ * The candidate is rendered through formatCandidateBlock so the standalone
+ * path emits the exact same block shape as the batch path.
  */
 function buildUtilityPrompt(candidate: CandidateMemory): string {
   return `Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
 
 Candidate memory:
-- Category: ${candidate.category}
-- Abstract: ${candidate.abstract}
-- Overview: ${candidate.overview}
-- Content: ${candidate.content}
+
+${formatCandidateBlock(1, candidate)}
 
 Score future usefulness on a 0.0-1.0 scale.
 
@@ -497,6 +533,33 @@ interface BatchUtilityResponse {
 }
 
 /**
+ * Few-shot example candidates for the batch-utility prompt. Rendered through
+ * formatCandidateBlock (the same function that formats the live batch) so
+ * the example's shape can never drift from the live candidates' shape.
+ * Entirely synthetic content.
+ */
+const BATCH_UTILITY_EXAMPLE_CANDIDATES: CandidateMemory[] = [
+  {
+    category: "preferences",
+    abstract: "User's preferred name is Alex",
+    overview: "## Preference\nThe user asked to be addressed as Alex.",
+    content: "The user said their preferred name is Alex and asked to be called that in future sessions.",
+  },
+  {
+    category: "events",
+    abstract: "User said hello",
+    overview: "## Event\nA one-off greeting at the start of a session.",
+    content: "The user opened the conversation with a short greeting.",
+  },
+  {
+    category: "entities",
+    abstract: "The project uses PostgreSQL as its primary datastore",
+    overview: "## Entity\nPostgreSQL is the project's primary datastore.",
+    content: "The user confirmed the project stores its data in PostgreSQL.",
+  },
+];
+
+/**
  * Builds the batch-utility prompt as {system, user} so the eventual merge
  * with the system/user prompt-architecture split is mechanical: on this
  * branch the two are concatenated before the single-string completeJson()
@@ -511,14 +574,18 @@ interface BatchUtilityResponse {
  * Formatting: every logical block (intro, scoring guidance, the few-shot
  * example, the return-format spec) is blank-line separated, candidates
  * within the example and within the live batch are blank-line separated
- * from each other, and each candidate's multi-line fields are indented
- * under its numbered line — this keeps the few-shot example and the live
- * batch visually consistent, and both easy to scan for a multi-candidate
- * batch.
+ * from each other, and both the example and the live batch render each
+ * candidate through formatCandidateBlock — number inline on the Category
+ * line, fields indented under it, content-carried list markers stripped —
+ * so the few-shot example and the live batch always share one shape.
  */
 function buildBatchUtilityPrompt(
   candidates: CandidateMemory[],
 ): { system: string; user: string } {
+  const exampleCandidateBlocks = BATCH_UTILITY_EXAMPLE_CANDIDATES.map((candidate, i) =>
+    formatCandidateBlock(i + 1, candidate),
+  ).join("\n\n");
+
   const system = `You are an admission judge. Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
 
 Score each candidate's future usefulness independently on a 0.0-1.0 scale. Score every item on its own absolute merit — do not rank or curve candidates relative to each other within this batch; a batch of entirely weak candidates should all score low, and a batch of entirely strong candidates should all score high.
@@ -531,11 +598,7 @@ Example of absolute scoring across a mixed-quality batch:
 
 Candidates:
 
-1. Category: preferences — "User's preferred name is Alex"
-
-2. Category: events — "User said hello"
-
-3. Category: entities — "The project uses PostgreSQL as its primary datastore"
+${exampleCandidateBlocks}
 
 Example response:
 {"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}
@@ -551,13 +614,7 @@ Return JSON only, with exactly one entry per candidate, in this shape:
 }`;
 
   const candidateBlocks = candidates
-    .map((candidate, i) => {
-      const n = i + 1;
-      return `${n}. Category: ${candidate.category}
-   Abstract: ${candidate.abstract}
-   Overview: ${candidate.overview}
-   Content: ${candidate.content}`;
-    })
+    .map((candidate, i) => formatCandidateBlock(i + 1, candidate))
     .join("\n\n");
 
   const user = `Candidates:

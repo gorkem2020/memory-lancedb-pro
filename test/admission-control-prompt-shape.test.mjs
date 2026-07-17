@@ -212,12 +212,203 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
     assert.ok(capturedPrompt);
     // "Candidates:" header separated by a blank line from the first example candidate.
     assert.match(capturedPrompt, /Candidates:\n\n1\. Category: preferences/);
-    // Blank line between each example candidate.
-    assert.match(capturedPrompt, /Alex"\n\n2\. Category: events/);
-    assert.match(capturedPrompt, /hello"\n\n3\. Category: entities/);
+    // Blank line between each example candidate (last field line, then blank, then next number).
+    assert.match(capturedPrompt, /\n\n2\. Category: events/);
+    assert.match(capturedPrompt, /\n\n3\. Category: entities/);
     // Blank line between the last example candidate and the "Example response:" label.
-    assert.match(capturedPrompt, /datastore"\n\nExample response:/);
+    assert.match(capturedPrompt, /\n\nExample response:/);
     // Blank line between the example response JSON and the closing explanatory note.
     assert.match(capturedPrompt, /durable project\/entity fact"\}\]\}\n\nCandidate 2 scores low/);
+  });
+
+  it("emits the few-shot example through the live candidate formatter (same four-field block shape)", async () => {
+    let capturedPrompt;
+    const llm = {
+      async completeJson(prompt, label) {
+        if (label === "admission-utility-batch") {
+          capturedPrompt = prompt;
+          return { results: [{ index: 1, utility: 0.5, reason: "r" }] };
+        }
+        return null;
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const controller = new AdmissionController(makeStore(), llm, config);
+
+    await controller.evaluateBatch([
+      { candidate: makeCandidate(1), candidateVector: [0.1], conversationText: "x", scopeFilter: ["global"] },
+    ]);
+
+    assert.ok(capturedPrompt);
+    // Each example candidate carries the exact live block shape: number inline
+    // on the Category line, then indented Abstract/Overview/Content lines.
+    assert.match(
+      capturedPrompt,
+      /1\. Category: preferences\n {3}Abstract: User's preferred name is Alex\n {3}Overview: /,
+    );
+    assert.match(capturedPrompt, /2\. Category: events\n {3}Abstract: User said hello\n {3}Overview: /);
+    assert.match(
+      capturedPrompt,
+      /3\. Category: entities\n {3}Abstract: The project uses PostgreSQL as its primary datastore\n {3}Overview: /,
+    );
+    // A number must never sit alone on its own line, in the example or anywhere else.
+    assert.doesNotMatch(capturedPrompt, /^\d+\.\s*$/m);
+  });
+});
+
+describe("AdmissionController prompt shape: candidate blocks carry no markdown list markers", () => {
+  // A stored row whose overview/content themselves contain markdown bullet
+  // lists (the common "## Entity\n- Name: ..." overview convention). The
+  // formatter must strip the leading list markers while keeping each line's
+  // own indentation, and keep every continuation line indented under the
+  // candidate so the numbered list survives rendering intact.
+  function makeBulletedCandidate() {
+    return {
+      category: "entities",
+      abstract: "Sample is the team's build agent",
+      overview: "## Entity\n- Name: Sample\n- Role: build agent\n  - Scope: CI only",
+      content: "The user described Sample as their build agent.\n* Mentioned during a routing test",
+    };
+  }
+
+  function assertCandidateSectionClean(prompt, header) {
+    const sectionStart = prompt.lastIndexOf(header);
+    assert.ok(sectionStart >= 0, `expected a "${header}" section`);
+    const section = prompt.slice(sectionStart);
+    for (const line of section.split("\n")) {
+      assert.doesNotMatch(line, /^\s*[-*] /, `list-marker line leaked into the candidate section: ${JSON.stringify(line)}`);
+    }
+    return section;
+  }
+
+  it("batch: strips content-carried bullet markers, keeps indentation and grouping", async () => {
+    let capturedPrompt;
+    const llm = {
+      async completeJson(prompt, label) {
+        if (label === "admission-utility-batch") {
+          capturedPrompt = prompt;
+          return { results: [{ index: 1, utility: 0.5, reason: "r" }] };
+        }
+        return null;
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const controller = new AdmissionController(makeStore(), llm, config);
+
+    await controller.evaluateBatch([
+      { candidate: makeBulletedCandidate(), candidateVector: [0.1], conversationText: "x", scopeFilter: ["global"] },
+    ]);
+
+    assert.ok(capturedPrompt);
+    const section = assertCandidateSectionClean(capturedPrompt, "Candidates:");
+    // First field line: number inline, field label on the same line.
+    assert.match(section, /^1\. Category: entities$/m);
+    // Multi-line field value: marker stripped, continuation indented under the candidate.
+    assert.match(section, /^ {3}Overview: ## Entity$/m);
+    assert.match(section, /^ {3}Name: Sample$/m);
+    assert.match(section, /^ {3}Role: build agent$/m);
+    // Nested bullet keeps its own inner indentation after the marker is stripped.
+    assert.match(section, /^ {3} {2}Scope: CI only$/m);
+    // Star markers are stripped too.
+    assert.match(section, /^ {3}Mentioned during a routing test$/m);
+    // Non-list markdown (the heading) is left alone.
+    assert.match(section, /## Entity/);
+  });
+
+  it("standalone (evaluate): emits the same numbered block shape with no dash-bulleted fields", async () => {
+    let capturedPrompt;
+    const llm = {
+      async completeJson(prompt, label) {
+        if (label === "admission-utility") capturedPrompt = prompt;
+        return { utility: 0.5, reason: "r" };
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "standalone" });
+    const controller = new AdmissionController(makeStore(), llm, config);
+
+    await controller.evaluate({
+      candidate: makeBulletedCandidate(),
+      candidateVector: [0.1],
+      conversationText: "x",
+      scopeFilter: ["global"],
+    });
+
+    assert.ok(capturedPrompt, "expected a standalone admission-utility call");
+    const section = assertCandidateSectionClean(capturedPrompt, "Candidate memory:");
+    // Same block shape as the batch path: number inline, fields indented.
+    assert.match(section, /^1\. Category: entities$/m);
+    assert.match(section, /^ {3}Abstract: Sample is the team's build agent$/m);
+    assert.match(section, /^ {3}Overview: ## Entity$/m);
+    assert.match(section, /^ {3}Name: Sample$/m);
+    assert.match(section, /^ {3}Content: The user described Sample as their build agent\.$/m);
+    assert.doesNotMatch(capturedPrompt, /^- Category:/m);
+    assert.doesNotMatch(capturedPrompt, /^\d+\.\s*$/m);
+  });
+
+  it("reflection-lane shaped candidate (mapped-row conventions) gets the same clean block through evaluate", async () => {
+    // Reflection-mapped rows reach admission through the same controller
+    // evaluate/evaluateBatch surface (no separate prompt builder), so the
+    // controller-layer shape guarantee is what keeps that lane clean too.
+    let capturedPrompt;
+    const llm = {
+      async completeJson(prompt, label) {
+        if (label === "admission-utility") capturedPrompt = prompt;
+        return { utility: 0.5, reason: "r" };
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "standalone" });
+    const controller = new AdmissionController(makeStore(), llm, config);
+
+    await controller.evaluate({
+      candidate: {
+        category: "cases",
+        abstract: "Decision: adopt PostgreSQL for the storage layer",
+        overview: "## Decision\n- Choice: PostgreSQL\n- Rationale: relational fit",
+        content: "The team decided to adopt PostgreSQL for the storage layer.",
+      },
+      candidateVector: [0.1],
+      conversationText: "x",
+      scopeFilter: ["global"],
+    });
+
+    assert.ok(capturedPrompt);
+    const section = assertCandidateSectionClean(capturedPrompt, "Candidate memory:");
+    assert.match(section, /^1\. Category: cases$/m);
+    assert.match(section, /^ {3}Choice: PostgreSQL$/m);
+    assert.match(section, /^ {3}Rationale: relational fit$/m);
+  });
+
+  it("batch: keeps blank-line separation between bulleted-content candidates", async () => {
+    let capturedPrompt;
+    const llm = {
+      async completeJson(prompt, label) {
+        if (label === "admission-utility-batch") {
+          capturedPrompt = prompt;
+          return {
+            results: [
+              { index: 1, utility: 0.5, reason: "r1" },
+              { index: 2, utility: 0.5, reason: "r2" },
+            ],
+          };
+        }
+        return null;
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const controller = new AdmissionController(makeStore(), llm, config);
+
+    await controller.evaluateBatch([
+      { candidate: makeBulletedCandidate(), candidateVector: [0.1], conversationText: "x", scopeFilter: ["global"] },
+      { candidate: makeCandidate(2), candidateVector: [0.1], conversationText: "x", scopeFilter: ["global"] },
+    ]);
+
+    assert.ok(capturedPrompt);
+    // Candidate 1's last content line, a blank line, then candidate 2's numbered line.
+    assert.match(capturedPrompt, /^ {3}Mentioned during a routing test\n\n2\. Category: events$/m);
   });
 });
