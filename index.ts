@@ -68,6 +68,7 @@ import {
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { gateMappedReflectionEntry } from "./src/reflection-mapped-admission.js";
+import { gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import {
@@ -4251,16 +4252,19 @@ const memoryLanceDBProPlugin = {
               api.logger.debug(
                 `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
-              // For history-carrying sessions, roll the cursor back so the
-              // next turn's slice re-includes these texts in the extraction
-              // input -- otherwise a run of below-threshold turns would each
-              // tentatively advance the cursor and the eventual firing turn
-              // would only see its own last slice, silently forfeiting every
-              // earlier deferred turn's content. Ingress-fed sessions keep
-              // their accumulator advance: their per-turn text is not
-              // recoverable on the next turn by design (the ingress queue
-              // was already drained), and rolling back would keep the count
-              // below the threshold forever.
+              // Below-threshold turns are deferred, never handed to the raw
+              // regex fallback (which stores text verbatim, bypassing the
+              // grounding filter and admission control). For history-carrying
+              // sessions, roll the cursor back so the next turn's slice
+              // re-includes these texts in the extraction input -- unless the
+              // payload is delta-shaped (did not grow past the previous turn's
+              // eligible-text length), in which case rolling back would pin the
+              // count below the threshold forever, so the tentative advance is
+              // kept instead. Ingress-fed sessions keep their accumulator advance
+              // (rolling the counter back alone would stall it below threshold
+              // forever, since only fresh message_received events grow it) and
+              // re-queue the consumed pending texts so the actual content, not
+              // just the count, survives for the next turn to pick up.
               if (pendingIngressTexts.length === 0) {
                 if (lastEligibleLength !== undefined && eligibleTexts.length <= lastEligibleLength) {
                   // Delta-shaped payload (the eligible-text list did not grow
@@ -4276,7 +4280,18 @@ const memoryLanceDBProPlugin = {
                 } else {
                   await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
                 }
+              } else if (conversationKey) {
+                const requeuedIngressTexts = [
+                  ...pendingIngressTexts,
+                  ...(autoCapturePendingIngressTexts.get(conversationKey) || []),
+                ].slice(-6);
+                autoCapturePendingIngressTexts.set(conversationKey, requeuedIngressTexts);
+                pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
               }
+              api.logger.debug(
+                `memory-lancedb-pro: auto-capture deferred below-threshold turn for agent ${agentId}; regex fallback skipped (smart extraction enabled)`,
+              );
+              return;
             }
           }
 
@@ -4362,6 +4377,27 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
+            // Fallback captures go through the same admission gate as
+            // extraction candidates when admission control is active;
+            // passthrough when it is disabled (or when smart extraction is
+            // off, in which case no controller instance exists to borrow).
+            const fallbackGate = await gateRegexFallbackCapture({
+              admissionController: smartExtractor?.getAdmissionController() ?? null,
+              attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+              text,
+              storeCategory: category,
+              vector,
+              conversationText: texts.join("\n"),
+              scopeFilter: accessibleScopes ?? [defaultScope],
+              warnLog: (msg: string) => api.logger.warn(msg),
+            });
+            if (!fallbackGate.admit) {
+              api.logger.info(
+                `memory-lancedb-pro: admission rejected regex-fallback capture "${text.slice(0, 40)}" provenance=auto-capture-regex-fallback: ${fallbackGate.reason ?? "no reason"}`,
+              );
+              continue;
+            }
+
             // Build metadata; if it fails, skip this entry rather than propagating
             // the exception and leaving capturedEntries in a partial state.
             let metadata: string;
@@ -4388,6 +4424,7 @@ const memoryLanceDBProPlugin = {
                     injected_count: 0,
                     bad_recall_count: 0,
                     suppressed_until_turn: 0,
+                    ...(fallbackGate.auditJson ? { admission_audit: fallbackGate.auditJson } : {}),
                   },
                 ),
               );
