@@ -268,7 +268,8 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
       category: "entities",
       abstract: "Sample is the team's build agent",
       overview: "## Entity\n- Name: Sample\n- Role: build agent\n  - Scope: CI only",
-      content: "The user described Sample as their build agent.\n* Mentioned during a routing test",
+      content:
+        "The user described Sample as their build agent.\n* Mentioned during a routing test\n- - Doubled marker line",
     };
   }
 
@@ -313,6 +314,8 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
     assert.match(section, /^ {3} {2}Scope: CI only$/m);
     // Star markers are stripped too.
     assert.match(section, /^ {3}Mentioned during a routing test$/m);
+    // Doubled/mixed markers ("- - x", "* - y") must not leave a residual marker behind.
+    assert.match(section, /^ {3}Doubled marker line$/m);
     // Non-list markdown (the heading) is left alone.
     assert.match(section, /## Entity/);
   });
@@ -409,6 +412,6 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
 
     assert.ok(capturedPrompt);
     // Candidate 1's last content line, a blank line, then candidate 2's numbered line.
-    assert.match(capturedPrompt, /^ {3}Mentioned during a routing test\n\n2\. Category: events$/m);
+    assert.match(capturedPrompt, /^ {3}Doubled marker line\n\n2\. Category: events$/m);
   });
 });

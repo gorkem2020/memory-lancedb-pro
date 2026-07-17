@@ -486,7 +486,7 @@ function formatCandidateBlock(n: number, candidate: CandidateMemory): string {
   for (const [label, value] of fields) {
     const valueLines = String(value ?? "")
       .split("\n")
-      .map((line) => line.replace(/^(\s*)[-*] /, "$1"));
+      .map((line) => line.replace(/^(\s*)(?:[-*] )+/, "$1"));
     lines.push(`   ${label}: ${valueLines[0]}`);
     for (const continuation of valueLines.slice(1)) {
       lines.push(`   ${continuation}`);
