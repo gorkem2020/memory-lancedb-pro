@@ -1290,7 +1290,7 @@ export class SmartExtractor {
                 })),
             })));
             try {
-                const response = await this.llm.completeJson(`${system}\n\n${user}`, "merge-memory-batch");
+                const response = await this.llm.completeJson(user, "merge-memory-batch", system);
                 const byIndex = new Map();
                 for (const entry of response && Array.isArray(response.results) ? response.results : []) {
                     if (!entry || typeof entry.index !== "number")
