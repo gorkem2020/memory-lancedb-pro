@@ -86,8 +86,22 @@ function makeLlm({ dedupDecision = "merge", mergeSucceeds = true }) {
           ],
         };
       }
-      if (mode === "dedup-decision") {
-        return { decision: dedupDecision, match_index: 1, reason: "extends existing tea preference" };
+      if (mode === "dedup-decision" || mode === "dedup-decision-batch") {
+        const verdict = { decision: dedupDecision, match_index: 1, reason: "extends existing tea preference" };
+        return mode === "dedup-decision-batch" ? { results: [{ index: 1, ...verdict }] } : verdict;
+      }
+      if (mode === "merge-memory-batch") {
+        if (!mergeSucceeds) return null;
+        return {
+          results: [
+            {
+              index: 1,
+              abstract: "User likes tea, including jasmine tea",
+              overview: "## Preference\n- tea\n- jasmine tea",
+              content: "User likes tea generally and jasmine tea specifically",
+            },
+          ],
+        };
       }
       if (mode === "merge-memory") {
         if (!mergeSucceeds) return null;
