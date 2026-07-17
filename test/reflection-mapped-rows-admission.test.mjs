@@ -28,10 +28,10 @@ const jiti = jitiFactory(import.meta.url, {
 });
 
 const {
-  mapReflectionMappedCategoryToSmartRegister,
   gateMappedReflectionEntry,
   gateMappedReflectionEntries,
 } = jiti("../src/reflection-mapped-admission.ts");
+const { getReflectionMappedMemoryCategory } = jiti("../src/reflection-mapped-metadata.ts");
 const { AdmissionController, ADMISSION_CONTROL_PRESETS } = jiti("../src/admission-control.ts");
 
 const REFLECTION_TEXT = [
@@ -41,12 +41,16 @@ const REFLECTION_TEXT = [
   "- Decision: keep the deploy branch cut from a fresh master.",
 ].join("\n");
 
-describe("mapReflectionMappedCategoryToSmartRegister", () => {
-  it("maps legacy mapped categories onto the smart registers admission priors use", () => {
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("preference"), "preferences");
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("fact"), "cases");
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("decision"), "events");
-    assert.equal(mapReflectionMappedCategoryToSmartRegister("unknown-legacy"), "events", "unknown categories take the lowest-prior durable-free register");
+describe("getReflectionMappedMemoryCategory (single-sourced taxonomy map)", () => {
+  it("maps every mapped kind onto the smart taxonomy: user-model=preferences, agent-model=patterns, lesson=cases, decision=cases", () => {
+    assert.equal(getReflectionMappedMemoryCategory("user-model"), "preferences");
+    assert.equal(
+      getReflectionMappedMemoryCategory("agent-model"),
+      "patterns",
+      "agent self-observations must not become user preference rows",
+    );
+    assert.equal(getReflectionMappedMemoryCategory("lesson"), "cases");
+    assert.equal(getReflectionMappedMemoryCategory("decision"), "cases");
   });
 });
 
@@ -54,6 +58,7 @@ describe("gateMappedReflectionEntry", () => {
   const baseParams = {
     text: "Operator prefers streaming test reporters for long suites.",
     category: "preference",
+    kind: "user-model",
     heading: "User model deltas (about the human)",
     vector: [1, 0, 0],
     conversationText: REFLECTION_TEXT,
@@ -200,18 +205,21 @@ describe("gateMappedReflectionEntries (batched burst)", () => {
     {
       text: "Operator prefers streaming test reporters for long suites.",
       category: "preference",
+      kind: "user-model",
       heading: "User model deltas (about the human)",
       vector: [1, 0, 0],
     },
     {
       text: "Symptom: flaky port bind. Cause: parallel suites. Fix: ephemeral ports.",
       category: "fact",
+      kind: "lesson",
       heading: "Lessons & pitfalls",
       vector: [0, 1, 0],
     },
     {
       text: "Decision: keep the deploy branch cut from a fresh master.",
       category: "decision",
+      kind: "decision",
       heading: "Decisions (durable)",
       vector: [0, 0, 1],
     },
@@ -257,7 +265,7 @@ describe("gateMappedReflectionEntries (batched burst)", () => {
     assert.equal(seenItems.length, 3);
     assert.equal(seenItems[0].candidate.category, "preferences");
     assert.equal(seenItems[1].candidate.category, "cases");
-    assert.equal(seenItems[2].candidate.category, "events");
+    assert.equal(seenItems[2].candidate.category, "cases");
     for (const item of seenItems) {
       assert.equal(item.conversationText, REFLECTION_TEXT);
       assert.deepEqual(item.scopeFilter, ["global"]);
@@ -434,6 +442,7 @@ describe("production pipeline: parse distillate -> gate -> bulkStore (end to end
     const gateRows = mappedReflectionMemories.map((mapped) => ({
       text: mapped.text,
       category: mapped.category,
+      kind: mapped.kind ?? mapped.mappedKind,
       heading: mapped.heading,
       vector: [1, 0, 0],
     }));
