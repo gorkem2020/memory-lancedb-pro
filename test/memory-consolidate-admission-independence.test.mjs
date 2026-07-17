@@ -72,7 +72,11 @@ describe("memory consolidate: item 9 admissionControl independence", () => {
           if (label === "consolidate-decide") {
             return { verdicts: [{ cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2], reason: "same fact, second adds detail" }] };
           }
-          return { abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "merged content" };
+          return {
+            results: [
+              { index: 1, abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "merged content" },
+            ],
+          };
         },
         getLastError: () => null,
       },
@@ -91,7 +95,7 @@ describe("memory consolidate: item 9 admissionControl independence", () => {
     await program.parseAsync(["node", "openclaw", "memory-pro", "consolidate", "--scope", "global", "--apply", "--yes"]);
 
     assert.ok(calls.includes("consolidate-decide"), "the decider call must still fire normally");
-    assert.ok(calls.includes("consolidate-merge"), "merge-content generation must still fire normally");
+    assert.ok(calls.includes("consolidate-merge-batch"), "merge-content generation must still fire normally");
 
     const survivor = rows.find((r) => r.text === "Coffee order: oat milk latte, extra hot");
     assert.ok(survivor, "the merge must have actually applied, proving the flow completed end to end");

@@ -62,8 +62,8 @@ function buildMergeableRows() {
 }
 
 describe("memory consolidate: cost preview (pure)", () => {
-  it("reports N clusters -> 1 batched decider call plus the upper-bound merge-generation count", () => {
-    // 3 units: sizes 2, 3, 4 -> max merge generations = (2-1)+(3-1)+(4-1) = 6
+  it("reports N clusters -> 1 batched decider call plus the chunk-capped batched merge-writer call count", () => {
+    // 3 units, each at most one merge job -> 3 jobs -> ceil(3/10) = 1 batched call
     const units = [
       { members: [{}, {}] },
       { members: [{}, {}, {}] },
@@ -71,22 +71,31 @@ describe("memory consolidate: cost preview (pure)", () => {
     ];
     const preview = computeConsolidateCostPreview(units);
     assert.equal(preview.clusterCount, 3);
-    assert.equal(preview.maxMergeGenerations, 6);
+    assert.equal(preview.maxMergeJobs, 3);
+    assert.equal(preview.maxMergeContentCalls, 1);
+  });
+
+  it("chunk math: more units than the batch cap means more than one batched call", () => {
+    const units = Array.from({ length: 12 }, () => ({ members: [{}, {}] }));
+    const preview = computeConsolidateCostPreview(units);
+    assert.equal(preview.maxMergeJobs, 12);
+    assert.equal(preview.maxMergeContentCalls, 2);
   });
 
   it("formats the preview with real numbers, not placeholders", () => {
-    const preview = { clusterCount: 4, maxMergeGenerations: 9 };
+    const preview = { clusterCount: 4, maxMergeJobs: 4, maxMergeContentCalls: 1 };
     const text = formatConsolidateCostPreview(preview);
     assert.match(text, /4 cluster/);
     assert.match(text, /1 batched decider call/);
-    assert.match(text, /up to 9 merge-content generation/);
+    assert.match(text, /up to 1 batched merge-content call/);
+    assert.match(text, /up to 4 merge job/);
   });
 
-  it("omits the merge-generation line when no cluster could ever produce a merge (all singletons impossible, but zero max)", () => {
-    const preview = { clusterCount: 2, maxMergeGenerations: 0 };
+  it("omits the merge-writer line when no cluster could ever produce a merge", () => {
+    const preview = { clusterCount: 2, maxMergeJobs: 0, maxMergeContentCalls: 0 };
     const text = formatConsolidateCostPreview(preview);
     assert.match(text, /2 cluster/);
-    assert.doesNotMatch(text, /merge-content generation/);
+    assert.doesNotMatch(text, /merge-content/);
   });
 });
 
