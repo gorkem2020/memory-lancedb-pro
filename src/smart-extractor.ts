@@ -15,6 +15,10 @@ import {
   buildMergePrompt,
 } from "./extraction-prompts.js";
 import {
+  type ConversationTurn,
+  formatConversationTranscript,
+} from "./auto-capture-cleanup.js";
+import {
   AdmissionController,
   type AdmissionAuditRecord,
   type AdmissionControlConfig,
@@ -307,6 +311,24 @@ export interface ExtractPersistOptions {
   scopeFilter?: string[];
   /** Agent identifier forwarded to onPersisted, resolved the same way callers resolve it for other sinks. */
   agentId?: string;
+  /**
+   * Assistant-authored lines included in the extraction prompt's conversation
+   * transcript as context (disambiguation only). These never count toward
+   * extraction eligibility or the auto-capture watermark, and the prompt
+   * instructs the extractor not to source candidates from them. Used as a
+   * fallback (appended after `conversationText` as trailing turns) when
+   * `conversationTurns` is not provided.
+   */
+  assistantContextTexts?: string[];
+  /**
+   * Ordered conversation turns for the extraction prompt's transcript block,
+   * oldest-first, true chronological interleaving of user and assistant
+   * turns. Preferred over `conversationText` + `assistantContextTexts` when
+   * available (real callers with per-message role data); falls back to
+   * treating `conversationText` as one user turn followed by
+   * `assistantContextTexts` as trailing assistant turns when omitted.
+   */
+  conversationTurns?: ConversationTurn[];
 }
 
 /**
@@ -405,7 +427,11 @@ export class SmartExtractor {
     const agentId = options.agentId;
 
     // Step 1: LLM extraction
-    const extraction = await this.extractCandidates(conversationText);
+    const extraction = await this.extractCandidates(
+      conversationText,
+      options.assistantContextTexts,
+      options.conversationTurns,
+    );
     const candidates = extraction.candidates;
 
     if (candidates.length === 0) {
@@ -754,24 +780,39 @@ export class SmartExtractor {
   // --------------------------------------------------------------------------
 
   /**
-   * Call LLM to extract candidate memories from conversation text.
+   * Call LLM to extract candidate memories from conversation text. Assembles
+   * the single interleaved conversation-turns transcript: `conversationTurns`
+   * (oldest-first, real per-message roles) when the caller has them, else a
+   * fallback of one user turn from `conversationText` followed by
+   * `assistantContextTexts` as trailing assistant turns. Assistant turns are
+   * context only -- the extractor must never source a candidate from one
+   * directly (enforced by prompt instruction, not a deterministic gate).
    */
   private async extractCandidates(
     conversationText: string,
+    assistantContextTexts?: string[],
+    conversationTurns?: ConversationTurn[],
   ): Promise<ExtractCandidatesResult> {
     const maxChars = this.config.extractMaxChars ?? 8000;
-    const truncated =
-      conversationText.length > maxChars
-        ? conversationText.slice(-maxChars)
-        : conversationText;
+    const user = this.config.user ?? "User";
 
     // Strip platform envelope metadata injected by OpenClaw channels
     // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
     // These pollute extraction if treated as conversation content.
-    const cleaned = stripEnvelopeMetadata(truncated);
+    const turns: ConversationTurn[] = conversationTurns
+      ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
+      : [
+          ...(conversationText
+            ? [{ role: "user" as const, text: stripEnvelopeMetadata(conversationText) }]
+            : []),
+          ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant" as const, text })),
+        ];
 
-    const user = this.config.user ?? "User";
-    const { system, user: userPrompt } = buildExtractionPrompt(cleaned, user);
+    const rawTranscript = formatConversationTranscript(turns, user);
+    const transcript =
+      rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
+
+    const { system, user: userPrompt } = buildExtractionPrompt(transcript, user);
 
     const result = await this.llm.completeJson<{
       memories: Array<{
