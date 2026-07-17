@@ -6,8 +6,6 @@
  *
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, } from "./extraction-prompts.js";
-import { formatConversationTranscript, } from "./auto-capture-cleanup.js";
-import { AdmissionController, } from "./admission-control.js";
 import { ALWAYS_MERGE_CATEGORIES, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
@@ -193,10 +191,7 @@ export class SmartExtractor {
                 config.admissionControl.auditMetadata !== false;
         this.onAdmissionRejected = config.onAdmissionRejected;
         this.onPersisted = config.onPersisted;
-        this.admissionController =
-            config.admissionControl?.enabled === true
-                ? new AdmissionController(this.store, this.llm, config.admissionControl, this.debugLog)
-                : null;
+        this.admissionController = config.admissionController ?? null;
     }
     /**
      * Notify the onPersisted sink (e.g. markdown mirror) after a successful
@@ -234,7 +229,7 @@ export class SmartExtractor {
             : [targetScope];
         const agentId = options.agentId;
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText, options.assistantContextTexts, options.conversationTurns);
+        const extraction = await this.extractCandidates(conversationText);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
@@ -502,31 +497,19 @@ export class SmartExtractor {
     // Step 1: LLM Extraction
     // --------------------------------------------------------------------------
     /**
-     * Call LLM to extract candidate memories from conversation text. Assembles
-     * the single interleaved conversation-turns transcript: `conversationTurns`
-     * (oldest-first, real per-message roles) when the caller has them, else a
-     * fallback of one user turn from `conversationText` followed by
-     * `assistantContextTexts` as trailing assistant turns. Assistant turns are
-     * context only -- the extractor must never source a candidate from one
-     * directly (enforced by prompt instruction, not a deterministic gate).
+     * Call LLM to extract candidate memories from conversation text.
      */
-    async extractCandidates(conversationText, assistantContextTexts, conversationTurns) {
+    async extractCandidates(conversationText) {
         const maxChars = this.config.extractMaxChars ?? 8000;
-        const user = this.config.user ?? "User";
+        const truncated = conversationText.length > maxChars
+            ? conversationText.slice(-maxChars)
+            : conversationText;
         // Strip platform envelope metadata injected by OpenClaw channels
         // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
         // These pollute extraction if treated as conversation content.
-        const turns = conversationTurns
-            ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
-            : [
-                ...(conversationText
-                    ? [{ role: "user", text: stripEnvelopeMetadata(conversationText) }]
-                    : []),
-                ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant", text })),
-            ];
-        const rawTranscript = formatConversationTranscript(turns, user);
-        const transcript = rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
-        const prompt = buildExtractionPrompt(transcript, user);
+        const cleaned = stripEnvelopeMetadata(truncated);
+        const user = this.config.user ?? "User";
+        const prompt = buildExtractionPrompt(cleaned, user);
         const result = await this.llm.completeJson(prompt, "extract-candidates");
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");

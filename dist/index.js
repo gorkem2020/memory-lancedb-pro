@@ -39,7 +39,7 @@ import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, } from "./src/auto-capture-cleanup.js";
+import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -51,7 +51,7 @@ import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, toLifecycleMemory, } from "./src/smart-metadata.js";
 import { computeTier1Patch, isSuppressed as isTier1Suppressed, TIER1_DEFAULT_BAD_RECALL_DECAY_MS, TIER1_DEFAULT_SUPPRESSION_DURATION_MS, } from "./src/auto-recall-tier1.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./src/workspace-boundary.js";
-import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
+import { normalizeAdmissionControlConfig, createAdmissionController, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
@@ -767,14 +767,9 @@ function asNonEmptyString(value) {
 function isInternalReflectionSessionKey(sessionKey) {
     return typeof sessionKey === "string" && sessionKey.trim().startsWith("temp:memory-reflection");
 }
-// Any :subagent:/:active-memory: sub-build (delegated subagents in general, not only
-// memory-internal ones) is treated as "its context comes from the parent" across every
-// memory-adjacent hook in this file: auto-recall injection, reflection injection, and
-// self-improvement reminders all skip it via this same check (each with its own "skip for
-// sub-agent sessions" comment at its call site), and auto-capture (agent_end) follows the
-// same convention. This is deliberately broader than "memory-internal only"; a subagent's
-// own task-scoped conversation is not treated as an independent, capturable/injectable
-// top-level conversation by this plugin.
+// Memory sub-completions (active-memory's embedded recall sub-build, and any :subagent:
+// sub-build) must not re-enter memory prompt injection: they would waste an embedding+vector
+// search per turn, and their injected block can leak into the main prompt via shared session messages.
 function isMemorySubsessionKey(sessionKey) {
     return typeof sessionKey === "string" && (sessionKey.includes(":subagent:") || sessionKey.includes(":active-memory:"));
 }
@@ -1013,15 +1008,15 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
         await writeFile(dailyPath, `# ${dateStr}\n\n`, "utf-8");
     }
 }
-export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
+function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
     const clipped = conversation.slice(-maxInputChars);
     const errorHints = toolErrorSignals.length > 0
         ? toolErrorSignals
             .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
             .join("\n")
         : "- (none)";
-    const system = [
-        "You are a memory reflection distiller. Generate a durable MEMORY REFLECTION entry for an AI assistant system.",
+    return [
+        "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
         "",
         "Output Markdown only. No intro text. No outro text. No extra headings.",
         "",
@@ -1116,8 +1111,7 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         "",
         "## Derived",
         "- This run showed ...",
-    ].join("\n");
-    const user = [
+        "",
         "Recent tool error signals:",
         errorHints,
         "",
@@ -1126,7 +1120,6 @@ export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSign
         clipped,
         "```",
     ].join("\n");
-    return { system, user };
 }
 function buildReflectionFallbackText() {
     return [
@@ -1202,8 +1195,7 @@ export async function generateReflectionText(params) {
     }
 }
 async function generateReflectionTextUnbounded(params) {
-    const { system: reflectionSystemPrompt, user: reflectionUserPrompt } = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
-    const prompt = `${reflectionSystemPrompt}\n\n${reflectionUserPrompt}`;
+    const prompt = buildReflectionPrompt(params.conversation, params.maxInputChars, params.toolErrorSignals ?? []);
     const promptHash = sha256Hex(prompt);
     const tempSessionFile = join(tmpdir(), `memory-reflection-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
     let reflectionText = null;
@@ -1813,7 +1805,8 @@ function _initPluginState(api) {
     // callback below closes over it.
     const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
-    if (config.smartExtraction !== false) {
+    let admissionController = null;
+    if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
             const llmApiKey = llmAuth === "oauth"
@@ -1843,30 +1836,42 @@ function _initPluginState(api) {
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
             });
-            const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
-            noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
-            const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
-            smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-                user: "User",
-                extractMinMessages: config.extractMinMessages ?? 4,
-                extractMaxChars: config.extractMaxChars ?? 8000,
-                defaultScope: config.scopes?.default ?? "global",
-                workspaceBoundary: config.workspaceBoundary,
-                admissionControl: config.admissionControl,
-                onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-                onPersisted: mdMirror ?? undefined,
-                log: (msg) => api.logger.info(msg),
-                debugLog: (msg) => api.logger.debug(msg),
-                noiseBank,
-            });
-            (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
-                + llmModel
-                + ", timeoutMs: "
-                + llmTimeoutMs
-                + ", noise bank: ON)");
+            // Constructed independently of SmartExtractor so admission gating is
+            // available to other write paths (e.g. reflection-mapped rows, the
+            // regex fallback) even when smart extraction itself is disabled.
+            admissionController = createAdmissionController(store, llmClient, config.admissionControl, (msg) => api.logger.debug(msg));
+            if (config.smartExtraction !== false) {
+                const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
+                noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
+                const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
+                smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+                    user: "User",
+                    extractMinMessages: config.extractMinMessages ?? 4,
+                    extractMaxChars: config.extractMaxChars ?? 8000,
+                    defaultScope: config.scopes?.default ?? "global",
+                    workspaceBoundary: config.workspaceBoundary,
+                    admissionControl: config.admissionControl,
+                    admissionController,
+                    onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+                    onPersisted: mdMirror ?? undefined,
+                    log: (msg) => api.logger.info(msg),
+                    debugLog: (msg) => api.logger.debug(msg),
+                    noiseBank,
+                });
+                (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
+                    + llmModel
+                    + ", timeoutMs: "
+                    + llmTimeoutMs
+                    + ", noise bank: ON)");
+            }
         }
         catch (err) {
-            api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            if (config.smartExtraction !== false) {
+                api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            }
+            else {
+                api.logger.warn(`memory-lancedb-pro: standalone admission control init failed, admission gating unavailable: ${String(err)}`);
+            }
         }
     }
     const extractionRateLimiter = createExtractionRateLimiter({
@@ -1882,7 +1887,6 @@ function _initPluginState(api) {
     const autoCaptureSeenTextCount = new Map();
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
-    const autoCaptureRecentAssistantTexts = new Map();
     return {
         config,
         resolvedDbPath,
@@ -1898,6 +1902,7 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        admissionController,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
@@ -1909,7 +1914,6 @@ function _initPluginState(api) {
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
         autoCaptureRecentTexts,
-        autoCaptureRecentAssistantTexts,
     };
 }
 export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
@@ -2018,7 +2022,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentAssistantTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2217,7 +2221,7 @@ const memoryLanceDBProPlugin = {
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
         if (isFirstRegistration) {
-            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`);
+            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'}, admissionControl: ${admissionController ? 'ON' : 'OFF'})`);
             logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
         }
         // Dual-memory model warning: help users understand the two-layer architecture
@@ -2819,16 +2823,6 @@ const memoryLanceDBProPlugin = {
                 if (!event.success || !event.messages || event.messages.length === 0) {
                     return;
                 }
-                // Internal memory sub-sessions (the reflection distiller's embedded
-                // temp:memory-reflection run, :subagent:/:active-memory: sub-builds) emit
-                // agent_end too; capturing them would extract memory scaffolding prompts
-                // as if they were conversation. Same guard convention as the sibling
-                // reflection injection hooks.
-                const hookSessionKey = ctx?.sessionKey || event.sessionKey;
-                if (isInternalReflectionSessionKey(hookSessionKey) || isMemorySubsessionKey(hookSessionKey)) {
-                    api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 internal memory session '${hookSessionKey}'`);
-                    return;
-                }
                 // Fire-and-forget: run capture work in the background so the hook
                 // returns immediately and does not hold the session lock.  Blocking
                 // here causes downstream channel deliveries (e.g. Telegram) to be
@@ -2852,27 +2846,21 @@ const memoryLanceDBProPlugin = {
                             ? config.scopes?.default ?? "global"
                             : scopeManager.getDefaultScope(agentId);
                         const sessionKey = ctx?.sessionKey || event.sessionKey || "unknown";
-                        api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${JSON.stringify(config.captureAssistant)}, ${summarizeAgentEndMessages(event.messages)})`);
+                        api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`);
                         // Extract text content from messages
                         const eligibleTexts = [];
-                        const assistantContextTexts = [];
-                        const conversationTurns = [];
                         let skippedAutoCaptureTexts = 0;
-                        const captureAssistantValue = config.captureAssistant;
-                        const captureAssistantEligible = captureAssistantValue === true;
-                        const captureAssistantAsContext = captureAssistantValue === "context";
                         for (const msg of event.messages) {
                             if (!msg || typeof msg !== "object") {
                                 continue;
                             }
                             const msgObj = msg;
                             const role = msgObj.role;
-                            const isEligibleRole = role === "user" || (captureAssistantEligible && role === "assistant");
-                            const isContextOnlyRole = captureAssistantAsContext && role === "assistant";
-                            if (!isEligibleRole && !isContextOnlyRole) {
+                            const captureAssistant = config.captureAssistant === true;
+                            if (role !== "user" &&
+                                !(captureAssistant && role === "assistant")) {
                                 continue;
                             }
-                            const targetTexts = isEligibleRole ? eligibleTexts : assistantContextTexts;
                             const content = msgObj.content;
                             if (typeof content === "string") {
                                 const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
@@ -2880,8 +2868,7 @@ const memoryLanceDBProPlugin = {
                                     skippedAutoCaptureTexts++;
                                 }
                                 else {
-                                    targetTexts.push(normalized);
-                                    conversationTurns.push({ role: role, text: normalized });
+                                    eligibleTexts.push(normalized);
                                 }
                                 continue;
                             }
@@ -2899,8 +2886,7 @@ const memoryLanceDBProPlugin = {
                                             skippedAutoCaptureTexts++;
                                         }
                                         else {
-                                            targetTexts.push(normalized);
-                                            conversationTurns.push({ role: role, text: normalized });
+                                            eligibleTexts.push(normalized);
                                         }
                                     }
                                 }
@@ -2936,13 +2922,6 @@ const memoryLanceDBProPlugin = {
                             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
-                        }
-                        const priorAssistantContextTexts = autoCaptureRecentAssistantTexts.get(sessionKey) || [];
-                        let assistantContextForRun = priorAssistantContextTexts;
-                        if (assistantContextTexts.length > 0) {
-                            assistantContextForRun = [...priorAssistantContextTexts, ...assistantContextTexts].slice(-6);
-                            autoCaptureRecentAssistantTexts.set(sessionKey, assistantContextForRun);
-                            pruneMapIfOver(autoCaptureRecentAssistantTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
                         const minMessages = config.extractMinMessages ?? 4;
                         if (skippedAutoCaptureTexts > 0) {
@@ -3000,17 +2979,10 @@ const memoryLanceDBProPlugin = {
                             if (cumulativeCount >= minMessages) {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
                                 const conversationText = cleanTexts.join("\n");
-                                const finalConversationTurns = buildConversationTurnsForExtraction({
-                                    messageLoopTurns: conversationTurns,
-                                    eligibleTexts,
-                                    newUserTexts: cleanTexts,
-                                    assistantContextForRun,
-                                    assistantContextTexts,
-                                });
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun, conversationTurns: finalConversationTurns });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
@@ -3030,7 +3002,6 @@ const memoryLanceDBProPlugin = {
                                     // consumed history length there instead, so the next turn
                                     // only sees the delta.
                                     autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
-                                    autoCaptureRecentAssistantTexts.delete(sessionKey);
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
@@ -4653,7 +4624,7 @@ export function parsePluginConfig(value) {
             }
             return s;
         })(),
-        captureAssistant: cfg.captureAssistant === "context" ? "context" : cfg.captureAssistant === true,
+        captureAssistant: cfg.captureAssistant === true,
         retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null
             ? (() => {
                 const retrieval = { ...cfg.retrieval };
