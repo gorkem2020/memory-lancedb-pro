@@ -158,6 +158,8 @@ export const CI_TEST_MANIFEST = [
   // Scope/ownership leak hardening: NULL-scope visibility, isOwnedByAgent main/blank leaks, parse-failure attribution
   { group: "core-regression", runner: "node", file: "test/scope-owner-leak-hardening.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/isOwnedByAgent.test.mjs", args: ["--test"] },
+  // Delete/delete-bulk must synchronously invalidate in-process reflection read caches
+  { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
