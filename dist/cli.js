@@ -1878,9 +1878,32 @@ export function createConsolidateConfirm(streams) {
     };
 }
 /** Item 8: renders the full plan (verdict, member ids, survivor, exact merge content) for user review before the apply prompt. */
+async function loadConsolidateSettledLedger(ledgerPath) {
+    try {
+        const raw = await readFile(ledgerPath, "utf-8");
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : {};
+    }
+    catch {
+        return {};
+    }
+}
+async function saveConsolidateSettledLedger(ledgerPath, ledger, scope, newlySettled) {
+    if (newlySettled.length === 0)
+        return;
+    try {
+        const merged = new Set([...(ledger[scope] ?? []), ...newlySettled]);
+        ledger[scope] = [...merged];
+        await writeFile(ledgerPath, JSON.stringify(ledger, null, 2), "utf-8");
+    }
+    catch (err) {
+        console.warn(`consolidate: could not persist settled ledger: ${String(err)}`);
+    }
+}
 export function formatConsolidatePlanForDisplay(clusters) {
     const actionable = clusters.filter((c) => c.action);
-    if (actionable.length === 0) {
+    const blocked = clusters.filter((c) => c.blocked === "append-only-shield");
+    if (actionable.length === 0 && blocked.length === 0) {
         return "No actionable clusters in this plan.";
     }
     const lines = [`Plan (${actionable.length} cluster(s)):`];
@@ -1897,19 +1920,22 @@ export function formatConsolidatePlanForDisplay(clusters) {
             lines.push(`    merged content: ${cluster.mergedContent.content}`);
         }
     }
+    for (const cluster of blocked) {
+        lines.push(`  [${cluster.verdict.verdict} — BLOCKED by append-only shield, will NOT be applied] cluster ${cluster.clusterIndex} — ${cluster.verdict.reason}`);
+        lines.push(`    members: ${cluster.memberIds.join(", ")}`);
+    }
     return lines.join("\n");
 }
 function registerConsolidateCommand(memory, context) {
     memory
         .command("consolidate")
         .description("Reconcile duplicate or contradictory memories already in the store across write lanes (dry-run by default)")
-        .requiredOption("--scope <scope>", "Scope to consolidate")
+        .requiredOption("--agent <agentId>", "Agent whose memory to consolidate (scope agent:<agentId>; journal-mirror writes route to this agent's workspace)")
         .option("--category <category>", "Limit to one smart category (profile|preferences|entities|events|cases|patterns)")
         .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
         .option("--apply", "Apply the consolidation plan immediately (default is a dry-run preview with an interactive apply prompt)", false)
         .option("--yes", "Skip the LLM-cost confirmation prompt (required for non-interactive/automated runs)", false)
         .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
-        .option("--agent <agentId>", "Agent identity to route journal-mirror writes to (omit to use the fallback mirror directory)")
         .action(async (options) => {
         try {
             if (!context.llmClient) {
@@ -1933,6 +1959,11 @@ function registerConsolidateCommand(memory, context) {
             }
             const mdMirror = context.mdMirror;
             const confirm = createConsolidateConfirm();
+            const scope = `agent:${options.agent}`;
+            const settledLedgerPath = typeof context.store.dbPath === "string" && context.store.dbPath.length > 0
+                ? path.join(context.store.dbPath, "consolidate-settled.json")
+                : undefined;
+            const settledLedger = settledLedgerPath ? await loadConsolidateSettledLedger(settledLedgerPath) : {};
             const result = await runConsolidate({
                 fetchRows: (scopeFilter, maxTimestamp, limit) => context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit),
                 update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
@@ -1956,12 +1987,13 @@ function registerConsolidateCommand(memory, context) {
                     }
                     : undefined,
             }, {
-                scope: options.scope,
+                scope,
                 category: options.category,
                 sinceMs,
                 includeReflectionSlices: options.includeReflectionSlices,
                 apply: options.apply === true,
                 autoConfirm: options.yes === true,
+                settledFingerprints: new Set(settledLedger[scope] ?? []),
             });
             if (result.status === "aborted") {
                 console.error(`consolidate: aborted -- ${result.abortReason}`);
@@ -1972,20 +2004,31 @@ function registerConsolidateCommand(memory, context) {
                 process.exit(1);
             }
             console.log(`Scanned ${result.scanned} row(s), ${result.eligible} eligible for consolidation.`);
-            console.log(`Found ${result.clusters.length} cluster(s).\n`);
+            const settledNote = result.settledSkipped > 0 ? ` (${result.settledSkipped} settled in previous runs)` : "";
+            if (result.clusters.length === 0) {
+                console.log(`0 candidates${settledNote} — nothing to consolidate.\n`);
+            }
+            else {
+                console.log(`Found ${result.clusters.length} cluster(s) to decide${settledNote}.\n`);
+            }
             for (const cluster of result.clusters) {
                 if (cluster.malformed) {
-                    console.log(`  [skipped: malformed verdict] ${cluster.memberIds.length} rows`);
+                    const label = cluster.failure === "call-failed" ? "undecided: LLM call failed" : "skipped: malformed verdict";
+                    console.log(`  [${label}] ${cluster.memberIds.length} rows`);
                     for (const text of cluster.memberTexts)
                         console.log(`    - "${text}"`);
                     continue;
                 }
-                console.log(`  [${cluster.verdict.verdict}] ${cluster.memberIds.length} rows — ${cluster.verdict.reason}`);
+                const blockedNote = cluster.blocked === "append-only-shield" ? " — BLOCKED by append-only shield (not applied)" : "";
+                console.log(`  [${cluster.verdict.verdict}] ${cluster.memberIds.length} rows — ${cluster.verdict.reason}${blockedNote}`);
                 for (const text of cluster.memberTexts)
                     console.log(`    - "${text}"`);
             }
             if (result.staleSkipped.length > 0) {
                 console.log(`\n${result.staleSkipped.length} cluster(s) skipped: changed since the plan was built (stale).`);
+            }
+            if (result.status === "completed" && settledLedgerPath) {
+                await saveConsolidateSettledLedger(settledLedgerPath, settledLedger, scope, result.newlySettled);
             }
             if (!result.executed) {
                 if (!options.apply) {
@@ -1993,7 +2036,12 @@ function registerConsolidateCommand(memory, context) {
                 }
                 return;
             }
-            console.log(`\nApplied ${result.applied.length} action(s); ${result.skippedMalformed} cluster(s) skipped due to malformed verdicts.`);
+            const failureNotes = [];
+            if (result.skippedMalformed > 0)
+                failureNotes.push(`${result.skippedMalformed} cluster(s) skipped due to malformed verdicts`);
+            if (result.undecidedCallFailed > 0)
+                failureNotes.push(`${result.undecidedCallFailed} cluster(s) undecided because the decide call failed`);
+            console.log(`\nApplied ${result.applied.length} action(s)${failureNotes.length ? "; " + failureNotes.join("; ") : ""}.`);
         }
         catch (error) {
             console.error("consolidate failed:", error);
