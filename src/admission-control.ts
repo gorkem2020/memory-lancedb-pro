@@ -562,10 +562,10 @@ const BATCH_UTILITY_EXAMPLE_CANDIDATES: CandidateMemory[] = [
 ];
 
 /**
- * Builds the batch-utility prompt as {system, user} so the eventual merge
- * with the system/user prompt-architecture split is mechanical: on this
- * branch the two are concatenated before the single-string completeJson()
- * call, since that split hasn't landed here yet.
+ * Builds the batch-utility prompt as {system, user}: the static judge block
+ * (identity, taxonomy, rubric, few-shot example, output contract) is the
+ * system slot and the numbered candidate blocks are the user slot, which is
+ * how scoreUtilityBatch submits them.
  *
  * Like buildUtilityPrompt, this intentionally carries no conversation
  * excerpt or other source-context blob — the admission judge scores solely
@@ -1198,8 +1198,9 @@ export class AdmissionController {
     let response: BatchUtilityResponse | null = null;
     try {
       response = await this.llm.completeJson<BatchUtilityResponse>(
-        `${system}\n\n${user}`,
+        user,
         "admission-utility-batch",
+        system,
       );
     } catch {
       // Candidate count is included on both this line and the success line

@@ -193,9 +193,9 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
   it("separates the few-shot example's own logical blocks (header, each candidate, response, closing note) with blank lines", async () => {
     let capturedPrompt;
     const llm = {
-      async completeJson(prompt, label) {
+      async completeJson(_prompt, label, systemPrompt) {
         if (label === "admission-utility-batch") {
-          capturedPrompt = prompt;
+          capturedPrompt = systemPrompt;
           return { results: [{ index: 1, utility: 0.5, reason: "r" }] };
         }
         return null;
@@ -223,10 +223,12 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
 
   it("emits the few-shot example through the live candidate formatter (same markdown block shape)", async () => {
     let capturedPrompt;
+    let capturedUser;
     const llm = {
-      async completeJson(prompt, label) {
+      async completeJson(prompt, label, systemPrompt) {
         if (label === "admission-utility-batch") {
-          capturedPrompt = prompt;
+          capturedPrompt = systemPrompt;
+          capturedUser = prompt;
           return { results: [{ index: 1, utility: 0.5, reason: "r" }] };
         }
         return null;
@@ -251,6 +253,7 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
     );
     // A number must never sit alone on its own line, in the example or anywhere else.
     assert.doesNotMatch(capturedPrompt, /^\d+\.\s*$/m);
+    assert.doesNotMatch(capturedUser, /^\d+\.\s*$/m);
   });
 });
 
@@ -416,10 +419,11 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
 // Prompt-architecture slot conformance for the batched prompts: every static
 // block (identity, taxonomy, task framing, rules, few-shot examples, the JSON
 // output contract) lives in the SYSTEM slot; the USER slot carries only the
-// numbered candidate/job blocks and other per-call data. On this branch the
-// two slots are concatenated at the completeJson call sites (the client has
-// no system param yet); these tests pin the builder-level split so the
-// eventual transport change is a pure call-site move.
+// numbered candidate/job blocks and other per-call data. These tests pin the
+// builder-level split; the call sites submit the two slots through
+// completeJson's system parameter, pinned by the transport-slot tests in
+// admission-control-batch-utility.test.mjs and
+// smart-extractor-batch-admission.test.mjs.
 describe("batched prompt slot conformance (system = static, user = per-call data)", () => {
   const { buildBatchUtilityPrompt } = jiti("../src/admission-control.ts");
   const { buildBatchDedupPrompt, buildBatchMergePrompt } = jiti("../src/extraction-prompts.ts");

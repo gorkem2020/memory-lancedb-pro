@@ -627,3 +627,50 @@ describe("SmartExtractor batched merge writer", () => {
     assert.doesNotMatch(prompt, /^ *- (Abstract|Overview|Content)/m);
   });
 });
+
+describe("batched merge-writer transport slots", () => {
+  it("sends the static merge-writer block through the system slot and only the job blocks as the user prompt", async () => {
+    const mergeTransportCalls = [];
+    const store = makeNeighborStore();
+    const llm = {
+      async completeJson(prompt, label, systemPrompt) {
+        if (label === "extract-candidates") {
+          return { memories: [1, 2].map((i) => candidateFixture(i)) };
+        }
+        if (label === "dedup-decision-batch") {
+          return dedupResults(
+            Array.from({ length: 2 }, (_, i) => ({
+              index: i + 1,
+              decision: "merge",
+              match_index: 1,
+              reason: "adds detail",
+            })),
+          );
+        }
+        if (label === "merge-memory-batch") {
+          mergeTransportCalls.push({ prompt, systemPrompt });
+          return dedupResults([
+            { index: 1, abstract: "merged one", overview: "o", content: "merged one" },
+            { index: 2, abstract: "merged two", overview: "o", content: "merged two" },
+          ]);
+        }
+        throw new Error(`unexpected mode: ${label}`);
+      },
+    };
+    const extractor = makeExtractor(store, llm);
+
+    await extractor.extractAndPersist("text", "s1", { scope: "global" });
+
+    assert.equal(mergeTransportCalls.length, 1);
+    const call = mergeTransportCalls[0];
+    assert.ok(
+      typeof call.systemPrompt === "string" && call.systemPrompt.startsWith("You are a memory merge writer."),
+      "system slot must carry the merge-writer identity block",
+    );
+    assert.ok(call.prompt.startsWith("## Merge jobs"), "user slot must open with the job data header");
+    assert.ok(
+      !call.prompt.includes("You are a memory merge writer."),
+      "identity/static block must not be concatenated into the user slot",
+    );
+  });
+});

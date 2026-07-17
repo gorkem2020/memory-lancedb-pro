@@ -1963,7 +1963,7 @@ export class SmartExtractor {
       try {
         const response = await this.llm.completeJson<{
           results?: Array<{ index?: number; abstract?: string; overview?: string; content?: string }>;
-        }>(`${system}\n\n${user}`, "merge-memory-batch");
+        }>(user, "merge-memory-batch", system);
 
         const byIndex = new Map<number, { abstract?: string; overview?: string; content?: string }>();
         for (const entry of response && Array.isArray(response.results) ? response.results : []) {

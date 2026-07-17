@@ -275,11 +275,11 @@ describe("AdmissionController.evaluateBatch", () => {
   });
 
   it("fences the batch few-shot example so it cannot be misread as an instruction for the live batch", async () => {
-    let capturedPrompt;
+    let capturedSystem;
     const llm = {
-      async completeJson(prompt, label) {
+      async completeJson(_prompt, label, systemPrompt) {
         if (label === "admission-utility-batch") {
-          capturedPrompt = prompt;
+          capturedSystem = systemPrompt;
           return {
             results: [{ index: 1, utility: 0.5, reason: "r" }],
           };
@@ -293,15 +293,15 @@ describe("AdmissionController.evaluateBatch", () => {
 
     await controller.evaluateBatch(makeBatchItems(1));
 
-    assert.ok(capturedPrompt, "expected a batch-utility call");
+    assert.ok(capturedSystem, "expected a batch-utility call carrying the system slot");
     assert.doesNotMatch(
-      capturedPrompt,
+      capturedSystem,
       /Expected response:/,
       "the few-shot label must not read as an instruction the model is expected to follow literally"
     );
-    assert.match(capturedPrompt, /Example response:/);
-    assert.match(capturedPrompt, /--- EXAMPLE \(not your current batch\) ---/);
-    assert.match(capturedPrompt, /--- END EXAMPLE ---/);
+    assert.match(capturedSystem, /Example response:/);
+    assert.match(capturedSystem, /--- EXAMPLE \(not your current batch\) ---/);
+    assert.match(capturedSystem, /--- END EXAMPLE ---/);
   });
 });
 
@@ -443,5 +443,40 @@ describe("AdmissionController.evaluateBatch honors non-batch utilityMode", () =>
 
     assert.equal(llmCalls, 0, "utilityMode off must not spend any utility LLM calls");
     assert.equal(results.length, 3);
+  });
+});
+
+describe("AdmissionController.evaluateBatch transport slots", () => {
+  it("sends the static judge block through the system slot and only the candidate blocks as the user prompt", async () => {
+    const calls = [];
+    const llm = {
+      async completeJson(prompt, label, systemPrompt) {
+        calls.push({ prompt, label, systemPrompt });
+        return {
+          results: [
+            { index: 1, utility: 0.9, reason: "durable" },
+            { index: 2, utility: 0.2, reason: "chatter" },
+          ],
+        };
+      },
+    };
+
+    const config = normalizeAdmissionControlConfig({ enabled: true, utilityMode: "batch" });
+    const controller = new AdmissionController(makeStore(), llm, config);
+
+    await controller.evaluateBatch(makeBatchItems(2));
+
+    assert.equal(calls.length, 1);
+    const call = calls[0];
+    assert.equal(call.label, "admission-utility-batch");
+    assert.ok(
+      typeof call.systemPrompt === "string" && call.systemPrompt.startsWith("You are an admission judge."),
+      "system slot must carry the judge identity block",
+    );
+    assert.ok(call.prompt.startsWith("## Candidates"), "user slot must open with the candidate data header");
+    assert.ok(
+      !call.prompt.includes("You are an admission judge."),
+      "identity/static block must not be concatenated into the user slot",
+    );
   });
 });
