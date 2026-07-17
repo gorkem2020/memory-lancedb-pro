@@ -512,7 +512,7 @@ Score future usefulness on a 0.0-1.0 scale.
 
 ${SCORE_TIER_RUBRIC}
 
-Grounding rule: this candidate's own grounding tag already passed the deterministic pre-admission check (a "constructed" tag targeting a durable category is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If the candidate's own content shows such a constructed frame and its claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
+Grounding rule: this candidate's own grounding tag already passed the deterministic pre-admission check (a "constructed" tag is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If the candidate's own content shows such a constructed frame and its claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
 
 Return JSON only:
 ${jsonBlock(`{
@@ -918,7 +918,7 @@ export class AdmissionController {
     private readonly debugLog: (msg: string) => void = () => {},
   ) {}
 
-  private rejectConstructedDurable(
+  private rejectConstructed(
     candidate: CandidateMemory,
     now: number,
   ): AdmissionEvaluation {
@@ -929,7 +929,7 @@ export class AdmissionController {
       recency: 0,
       typePrior: 0,
     };
-    const reason = `Admission rejected (constructed-grounding candidate targeting durable category "${candidate.category}"; deterministic pre-admission short-circuit, no LLM call).`;
+    const reason = `Admission rejected (constructed-grounding candidate category "${candidate.category}"; deterministic pre-admission short-circuit, no LLM call).`;
     const audit: AdmissionAuditRecord = {
       version: "amac-v1",
       decision: "reject",
@@ -949,7 +949,7 @@ export class AdmissionController {
       conversation_register: candidate.conversationRegister,
     };
     this.debugLog(
-      `memory-lancedb-pro: admission-control: decision=reject (constructed durable short-circuit) candidate=${JSON.stringify(candidate.abstract.slice(0, 80))}`,
+      `memory-lancedb-pro: admission-control: decision=reject (constructed short-circuit) candidate=${JSON.stringify(candidate.abstract.slice(0, 80))}`,
     );
     return { decision: "reject", audit };
   }
@@ -989,13 +989,11 @@ export class AdmissionController {
     scopeFilter: string[];
     now?: number;
   }): Promise<AdmissionEvaluation> {
-    // Constructed-grounding candidates targeting a durable category are
-    // rejected deterministically BEFORE any utility LLM call is spent.
-    if (
-      params.candidate.grounding === "constructed" &&
-      DURABLE_CATEGORIES.has(params.candidate.category)
-    ) {
-      return this.rejectConstructedDurable(params.candidate, params.now ?? Date.now());
+    // "constructed" is true only within the fiction, never about the real
+    // world — it must never be stored, in any category or register.
+    // Rejected deterministically BEFORE any utility LLM call is spent.
+    if (params.candidate.grounding === "constructed") {
+      return this.rejectConstructed(params.candidate, params.now ?? Date.now());
     }
     const utility = await scoreUtility(this.llm, this.config.utilityMode, params.candidate);
     return this.evaluateWithUtility(params, utility);
@@ -1021,15 +1019,13 @@ export class AdmissionController {
     const now = params.now ?? Date.now();
 
     // Deterministic pre-admission short-circuit: a candidate tagged
-    // "constructed" must never occupy a durable register, no matter how any
-    // downstream score would blend. Reject before any LLM call. Candidates
-    // without grounding metadata (legacy payloads) fall through to normal
-    // scoring.
-    if (
-      params.candidate.grounding === "constructed" &&
-      DURABLE_CATEGORIES.has(params.candidate.category)
-    ) {
-      return this.rejectConstructedDurable(params.candidate, now);
+    // "constructed" is true only within the fiction, never about the real
+    // world — it must never be stored, in any category or register, no
+    // matter how any downstream score would blend. Reject before any LLM
+    // call. Candidates without grounding metadata (legacy payloads) fall
+    // through to normal scoring.
+    if (params.candidate.grounding === "constructed") {
+      return this.rejectConstructed(params.candidate, now);
     }
 
     const relevantMatches = await this.loadRelevantMatches(
@@ -1164,13 +1160,10 @@ export class AdmissionController {
       return out;
     }
 
-    // Constructed-grounding candidates targeting a durable category never
-    // spend a batch slot: they are rejected deterministically here, and only
-    // the remaining candidates go into the (at most one per chunk) batch
-    // utility call.
-    const scorable = chunk.filter(
-      (item) => !(item.candidate.grounding === "constructed" && DURABLE_CATEGORIES.has(item.candidate.category)),
-    );
+    // Constructed-grounding candidates never spend a batch slot: they are
+    // rejected deterministically here, and only the remaining candidates go
+    // into the (at most one per chunk) batch utility call.
+    const scorable = chunk.filter((item) => item.candidate.grounding !== "constructed");
     const utilities = scorable.length > 0
       ? await this.scoreUtilityBatch(scorable.map((item) => item.candidate))
       : [];
@@ -1178,8 +1171,8 @@ export class AdmissionController {
 
     const out: AdmissionEvaluation[] = [];
     for (const item of chunk) {
-      if (item.candidate.grounding === "constructed" && DURABLE_CATEGORIES.has(item.candidate.category)) {
-        out.push(this.rejectConstructedDurable(item.candidate, item.now ?? Date.now()));
+      if (item.candidate.grounding === "constructed") {
+        out.push(this.rejectConstructed(item.candidate, item.now ?? Date.now()));
         continue;
       }
       out.push(await this.evaluateWithUtility(item, utilityByItem.get(item) ?? { score: 0.5 }));
