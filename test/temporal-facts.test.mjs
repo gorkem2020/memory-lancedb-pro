@@ -98,15 +98,15 @@ async function runTest() {
         }],
       });
     } else if (
-      prompt.includes("Determine how to handle this candidate memory") ||
-      prompt.includes("Determine how to handle each numbered candidate memory")
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
     ) {
       const verdict = {
         decision: dedupDecision,
         match_index: 1,
         reason: "same preference topic, new truth replaces old truth",
       };
-      content = prompt.includes("each numbered candidate memory")
+      content = prompt.includes("Decide every candidate independently")
         ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
         : JSON.stringify(verdict);
     }

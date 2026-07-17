@@ -6,6 +6,7 @@
  *
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, buildBatchDedupPrompt, buildBatchMergePrompt, } from "./extraction-prompts.js";
+import { formatExistingMemoryEntry } from "./prompt-blocks.js";
 import { AdmissionController, } from "./admission-control.js";
 import { ALWAYS_MERGE_CATEGORIES, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
@@ -879,8 +880,7 @@ export class SmartExtractor {
             }
             catch { }
             const abstract = metaObj.l0_abstract || r.entry.text;
-            const overview = metaObj.l1_overview || "";
-            return `${i + 1}. [${metaObj.memory_category || r.entry.category}] ${abstract}\n   Overview: ${overview}\n   Score: ${r.score.toFixed(3)}`;
+            return formatExistingMemoryEntry(i + 1, metaObj.memory_category || r.entry.category, abstract, r.score);
         })
             .join("\n");
     }
@@ -927,7 +927,7 @@ export class SmartExtractor {
     async llmDedupDecision(candidate, similar) {
         const topSimilar = similar.slice(0, MAX_SIMILAR_FOR_PROMPT);
         const existingFormatted = this.formatExistingMemoriesForDedup(topSimilar);
-        const prompt = buildDedupPrompt(candidate.abstract, candidate.overview, candidate.content, existingFormatted);
+        const prompt = buildDedupPrompt(candidate, existingFormatted);
         try {
             const data = await this.llm.completeJson(prompt, "dedup-decision");
             return this.interpretDedupVerdict(data ?? null, topSimilar);
@@ -1049,7 +1049,7 @@ export class SmartExtractor {
             return "created";
         }
         // Call LLM to merge
-        const prompt = buildMergePrompt(target.abstract, target.overview, target.content, candidate.abstract, candidate.overview, candidate.content, candidate.category);
+        const prompt = buildMergePrompt({ abstract: target.abstract, overview: target.overview, content: target.content }, candidate);
         const merged = await this.llm.completeJson(prompt, "merge-memory");
         if (!merged) {
             this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");

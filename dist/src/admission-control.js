@@ -1,6 +1,6 @@
 import { join } from "node:path";
-import { formatCandidateBlock } from "./extraction-prompts.js";
 import { parseSmartMetadata } from "./smart-metadata.js";
+import { ADMISSION_JUDGE_IDENTITY, CATEGORY_TAXONOMY, SCORE_TIER_RUBRIC, formatCandidateBlock, jsonBlock, } from "./prompt-blocks.js";
 const DEFAULT_WEIGHTS = {
     utility: 0.1,
     confidence: 0.1,
@@ -326,22 +326,23 @@ function cosineSimilarity(left, right) {
  * path emits the exact same block shape as the batch path.
  */
 function buildUtilityPrompt(candidate) {
-    return `Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
+    return `${ADMISSION_JUDGE_IDENTITY} Evaluate whether this candidate memory is worth keeping for future cross-session interactions.
 
-Candidate memory:
+${CATEGORY_TAXONOMY}
+
+## Candidate
 
 ${formatCandidateBlock(1, candidate)}
 
 Score future usefulness on a 0.0-1.0 scale.
 
-Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
-Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
+${SCORE_TIER_RUBRIC}
 
 Return JSON only:
-{
+${jsonBlock(`{
   "utility": 0.0,
   "reason": "short explanation"
-}`;
+}`)}`;
 }
 /** Max candidates scored in a single batch-utility LLM call; larger batches are chunked. */
 const BATCH_UTILITY_MAX_SIZE = 10;
@@ -383,49 +384,51 @@ const BATCH_UTILITY_EXAMPLE_CANDIDATES = [
  * overview/content) plus, elsewhere in AdmissionController, the store's
  * existing rows via the non-LLM novelty feature.
  *
- * Formatting: every logical block (intro, scoring guidance, the few-shot
- * example, the return-format spec) is blank-line separated, candidates
- * within the example and within the live batch are blank-line separated
- * from each other, and both the example and the live batch render each
- * candidate through formatCandidateBlock — number inline on the Category
- * line, fields indented under it, content-carried list markers stripped —
- * so the few-shot example and the live batch always share one shape.
+ * Formatting: every logical block (intro, taxonomy, scoring guidance, the
+ * few-shot example, the return-format spec) is blank-line separated,
+ * candidates within the example and within the live batch are blank-line
+ * separated from each other, and both the example and the live batch render
+ * each candidate through formatCandidateBlock — a `### N. category` markdown
+ * heading with plain `Label: value` field lines under it, content-carried
+ * list markers stripped — so the few-shot example and the live batch always
+ * share one shape.
  *
  * Exported for the slot-conformance tests (system = static blocks, user =
  * per-call candidate data); production callers stay inside this module.
  */
 export function buildBatchUtilityPrompt(candidates) {
     const exampleCandidateBlocks = BATCH_UTILITY_EXAMPLE_CANDIDATES.map((candidate, i) => formatCandidateBlock(i + 1, candidate)).join("\n\n");
-    const system = `You are an admission judge. Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
+    const system = `${ADMISSION_JUDGE_IDENTITY} Evaluate whether each candidate memory in this batch is worth keeping for future cross-session interactions.
+
+${CATEGORY_TAXONOMY}
 
 Score each candidate's future usefulness independently on a 0.0-1.0 scale. Score every item on its own absolute merit — do not rank or curve candidates relative to each other within this batch; a batch of entirely weak candidates should all score low, and a batch of entirely strong candidates should all score high.
 
-Use higher scores for durable preferences, profile facts, reusable procedures, and long-lived project/entity state.
-Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.
+${SCORE_TIER_RUBRIC}
 
 --- EXAMPLE (not your current batch) ---
 Example of absolute scoring across a mixed-quality batch:
 
-Candidates:
+## Candidates
 
 ${exampleCandidateBlocks}
 
 Example response:
-{"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}
+${jsonBlock(`{"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}`)}
 
 Candidate 2 scores low even though candidates 1 and 3 score high in the same batch: each item is judged on its own merit, never curved against its neighbors.
 --- END EXAMPLE ---
 
 Return JSON only, with exactly one entry per candidate, in this shape:
-{
+${jsonBlock(`{
   "results": [
     { "index": 1, "utility": 0.0, "reason": "short explanation" }
   ]
-}`;
+}`)}`;
     const candidateBlocks = candidates
         .map((candidate, i) => formatCandidateBlock(i + 1, candidate))
         .join("\n\n");
-    const user = `Candidates:
+    const user = `## Candidates
 
 ${candidateBlocks}`;
     return { system, user };

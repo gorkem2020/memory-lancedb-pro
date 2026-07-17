@@ -257,8 +257,8 @@ async function runScenario(mode) {
         ],
       });
     } else if (
-      prompt.includes("Determine how to handle this candidate memory") ||
-      prompt.includes("Determine how to handle each numbered candidate memory")
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
     ) {
       const verdict = {
         decision: mode === "merge" ? "merge" : "skip",
@@ -267,19 +267,19 @@ async function runScenario(mode) {
           ? "Same preference domain, merge into existing memory"
           : "Candidate fully duplicates existing memory",
       };
-      content = prompt.includes("each numbered candidate memory")
+      content = prompt.includes("Decide every candidate independently")
         ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
         : JSON.stringify(verdict);
     } else if (
-      prompt.includes("Merge the following memory into a single coherent record") ||
-      prompt.includes("Merge each numbered job")
+      prompt.includes("You are a memory merge writer.") ||
+      prompt.includes("For each job, merge every")
     ) {
       const merged = {
         abstract: "饮品偏好：乌龙茶、茉莉花茶",
         overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢乌龙茶\n- 喜欢茉莉花茶",
         content: "用户长期喜欢乌龙茶，并补充说明也喜欢茉莉花茶。",
       };
-      content = prompt.includes("Merge each numbered job")
+      content = prompt.includes("For each job, merge every")
         ? JSON.stringify({ results: [{ index: 1, ...merged }] })
         : JSON.stringify(merged);
     } else {
@@ -437,8 +437,8 @@ async function runMultiRoundScenario() {
         });
       }
     } else if (
-      prompt.includes("Determine how to handle this candidate memory") ||
-      prompt.includes("Determine how to handle each numbered candidate memory")
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
     ) {
       dedupCall += 1;
       let verdict;
@@ -461,12 +461,12 @@ async function runMultiRoundScenario() {
           reason: "Already merged into existing memory",
         };
       }
-      content = prompt.includes("each numbered candidate memory")
+      content = prompt.includes("Decide every candidate independently")
         ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
         : JSON.stringify(verdict);
     } else if (
-      prompt.includes("Merge the following memory into a single coherent record") ||
-      prompt.includes("Merge each numbered job")
+      prompt.includes("You are a memory merge writer.") ||
+      prompt.includes("For each job, merge every")
     ) {
       mergeCall += 1;
       const merged = {
@@ -474,7 +474,7 @@ async function runMultiRoundScenario() {
         overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢乌龙茶\n- 喜欢茉莉花茶",
         content: "用户长期喜欢乌龙茶，并补充说明也喜欢茉莉花茶。",
       };
-      content = prompt.includes("Merge each numbered job")
+      content = prompt.includes("For each job, merge every")
         ? JSON.stringify({ results: [{ index: 1, ...merged }] })
         : JSON.stringify(merged);
     } else {
@@ -1261,14 +1261,14 @@ async function runInboundMetadataCleanupScenario() {
         ],
       });
     } else if (
-      prompt.includes("Determine how to handle this candidate memory") ||
-      prompt.includes("Determine how to handle each numbered candidate memory")
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
     ) {
       const verdict = {
         decision: "create",
         reason: "No similar memory exists yet",
       };
-      content = prompt.includes("each numbered candidate memory")
+      content = prompt.includes("Decide every candidate independently")
         ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
         : JSON.stringify(verdict);
     } else {
@@ -1644,8 +1644,8 @@ async function runDedupDecisionLLMCallScenario() {
         }]
       }));
     } else if (
-      prompt.includes("Determine how to handle this candidate memory") ||
-      prompt.includes("Determine how to handle each numbered candidate memory")
+      prompt.includes("You are a memory dedup judge.") ||
+      prompt.includes("Decide every candidate independently")
     ) {
       dedupCalls += 1;
       const verdict = { decision: "skip", match_index: 1, reason: "duplicate" };
@@ -1655,7 +1655,7 @@ async function runDedupDecisionLLMCallScenario() {
         created: Math.floor(Date.now() / 1000), model: "mock-memory-model",
         choices: [{
           index: 0, message: { role: "assistant",
-            content: prompt.includes("each numbered candidate memory")
+            content: prompt.includes("Decide every candidate independently")
               ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
               : JSON.stringify(verdict)
           }, finish_reason: "stop"

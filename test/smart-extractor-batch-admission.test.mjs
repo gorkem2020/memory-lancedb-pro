@@ -253,7 +253,7 @@ describe("SmartExtractor batched dedup decider", () => {
     await extractor.extractAndPersist("text", "s1", { scope: "global" });
 
     assert.equal(llm.dedupCalls.length, 1);
-    assert.match(llm.dedupCalls[0], /(^|\n)1\. Category: preferences/);
+    assert.match(llm.dedupCalls[0], /(^|\n)### 1\. preferences/);
   });
 
   it("makes zero dedup calls when admission rejects every candidate", async () => {
@@ -402,11 +402,11 @@ describe("SmartExtractor batched dedup decider", () => {
     await extractor.extractAndPersist("text", "s1", { scope: "global" });
 
     const prompt = llm.dedupCalls[0];
-    assert.match(prompt, /\n\n2\. Category: preferences/, "blocks are numbered inline and blank-line separated");
-    assert.match(prompt, /^ {3}Abstract: /m, "fields are indented under the candidate");
+    assert.match(prompt, /\n\n### 2\. preferences/, "blocks are numbered as markdown headings and blank-line separated");
+    assert.match(prompt, /^Abstract: /m, "fields are flush-left under the heading");
     assert.doesNotMatch(prompt, /^ *- (Abstract|Overview|Content|Name)/m, "no leading list markers survive");
-    assert.match(prompt, /^ {3}Name: Cola/m, "content-carried markers are stripped, indentation kept");
-    assert.match(prompt, /Existing similar memories:/, "each candidate carries its own neighbor context");
+    assert.match(prompt, /^Name: Cola/m, "content-carried markers are stripped");
+    assert.match(prompt, /#### Existing similar memories/, "each candidate carries its own neighbor context");
   });
 
   it("routes reflection-shaped candidates through the same single batched call", async () => {
@@ -613,10 +613,10 @@ describe("SmartExtractor batched merge writer", () => {
     await extractor.extractAndPersist("text", "s1", { scope: "global" });
 
     const prompt = llm.mergeCalls[0];
-    assert.match(prompt, /(^|\n)1\. Category: preferences/);
-    assert.match(prompt, /\n\n2\. Category: preferences/);
-    assert.match(prompt, /^ {3}Existing memory:/m);
-    assert.match(prompt, /^ {3}New information/m);
+    assert.match(prompt, /(^|\n)### 1\. preferences/);
+    assert.match(prompt, /\n\n### 2\. preferences/);
+    assert.match(prompt, /^#### Existing memory$/m);
+    assert.match(prompt, /^#### New information$/m);
     assert.doesNotMatch(prompt, /^ *- (Abstract|Overview|Content)/m);
   });
 });

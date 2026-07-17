@@ -160,11 +160,11 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
 
     assert.ok(capturedPrompt);
     // Candidate 1's last field (Content) must be followed by a blank line
-    // before candidate 2's numbered line, not run together with a single \n.
-    assert.match(capturedPrompt, /the user did thing 1\n\n2\. Category:/);
+    // before candidate 2's numbered heading, not run together with a single \n.
+    assert.match(capturedPrompt, /the user did thing 1\n\n### 2\. events/);
   });
 
-  it("indents each candidate's multi-line fields consistently under its numbered line", async () => {
+  it("renders each candidate's multi-line fields as plain flush-left lines under its numbered heading", async () => {
     let capturedPrompt;
     const llm = {
       async completeJson(prompt, label) {
@@ -184,10 +184,10 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
     ]);
 
     assert.ok(capturedPrompt);
-    assert.match(capturedPrompt, /^1\. Category: events$/m);
-    assert.match(capturedPrompt, /^ {3}Abstract: candidate 9$/m);
-    assert.match(capturedPrompt, /^ {3}Overview: ## Event 9$/m);
-    assert.match(capturedPrompt, /^ {3}Content: the user did thing 9$/m);
+    assert.match(capturedPrompt, /^### 1\. events$/m);
+    assert.match(capturedPrompt, /^Abstract: candidate 9$/m);
+    assert.match(capturedPrompt, /^Overview: ## Event 9$/m);
+    assert.match(capturedPrompt, /^Content: the user did thing 9$/m);
   });
 
   it("separates the few-shot example's own logical blocks (header, each candidate, response, closing note) with blank lines", async () => {
@@ -210,18 +210,18 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
     ]);
 
     assert.ok(capturedPrompt);
-    // "Candidates:" header separated by a blank line from the first example candidate.
-    assert.match(capturedPrompt, /Candidates:\n\n1\. Category: preferences/);
-    // Blank line between each example candidate (last field line, then blank, then next number).
-    assert.match(capturedPrompt, /\n\n2\. Category: events/);
-    assert.match(capturedPrompt, /\n\n3\. Category: entities/);
+    // "## Candidates" header separated by a blank line from the first example candidate.
+    assert.match(capturedPrompt, /## Candidates\n\n### 1\. preferences/);
+    // Blank line between each example candidate (last field line, then blank, then next heading).
+    assert.match(capturedPrompt, /\n\n### 2\. events/);
+    assert.match(capturedPrompt, /\n\n### 3\. entities/);
     // Blank line between the last example candidate and the "Example response:" label.
     assert.match(capturedPrompt, /\n\nExample response:/);
-    // Blank line between the example response JSON and the closing explanatory note.
-    assert.match(capturedPrompt, /durable project\/entity fact"\}\]\}\n\nCandidate 2 scores low/);
+    // Blank line between the fenced example response JSON and the closing explanatory note.
+    assert.match(capturedPrompt, /```\n\nCandidate 2 scores low/);
   });
 
-  it("emits the few-shot example through the live candidate formatter (same four-field block shape)", async () => {
+  it("emits the few-shot example through the live candidate formatter (same markdown block shape)", async () => {
     let capturedPrompt;
     const llm = {
       async completeJson(prompt, label) {
@@ -241,16 +241,13 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
     ]);
 
     assert.ok(capturedPrompt);
-    // Each example candidate carries the exact live block shape: number inline
-    // on the Category line, then indented Abstract/Overview/Content lines.
+    // Each example candidate carries the exact live block shape: a `### N.
+    // category` heading, then flush-left Abstract/Overview/Content lines.
+    assert.match(capturedPrompt, /### 1\. preferences\nAbstract: User's preferred name is Alex\nOverview: /);
+    assert.match(capturedPrompt, /### 2\. events\nAbstract: User said hello\nOverview: /);
     assert.match(
       capturedPrompt,
-      /1\. Category: preferences\n {3}Abstract: User's preferred name is Alex\n {3}Overview: /,
-    );
-    assert.match(capturedPrompt, /2\. Category: events\n {3}Abstract: User said hello\n {3}Overview: /);
-    assert.match(
-      capturedPrompt,
-      /3\. Category: entities\n {3}Abstract: The project uses PostgreSQL as its primary datastore\n {3}Overview: /,
+      /### 3\. entities\nAbstract: The project uses PostgreSQL as its primary datastore\nOverview: /,
     );
     // A number must never sit alone on its own line, in the example or anywhere else.
     assert.doesNotMatch(capturedPrompt, /^\d+\.\s*$/m);
@@ -261,8 +258,8 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
   // A stored row whose overview/content themselves contain markdown bullet
   // lists (the common "## Entity\n- Name: ..." overview convention). The
   // formatter must strip the leading list markers while keeping each line's
-  // own indentation, and keep every continuation line indented under the
-  // candidate so the numbered list survives rendering intact.
+  // own indentation, and keep every continuation line under the candidate
+  // so the section survives rendering intact.
   function makeBulletedCandidate() {
     return {
       category: "entities",
@@ -303,24 +300,24 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
     ]);
 
     assert.ok(capturedPrompt);
-    const section = assertCandidateSectionClean(capturedPrompt, "Candidates:");
-    // First field line: number inline, field label on the same line.
-    assert.match(section, /^1\. Category: entities$/m);
-    // Multi-line field value: marker stripped, continuation indented under the candidate.
-    assert.match(section, /^ {3}Overview: ## Entity$/m);
-    assert.match(section, /^ {3}Name: Sample$/m);
-    assert.match(section, /^ {3}Role: build agent$/m);
+    const section = assertCandidateSectionClean(capturedPrompt, "## Candidates");
+    // First line: markdown heading with the number and category.
+    assert.match(section, /^### 1\. entities$/m);
+    // Multi-line field value: marker stripped, flush-left under the heading.
+    assert.match(section, /^Overview: ## Entity$/m);
+    assert.match(section, /^Name: Sample$/m);
+    assert.match(section, /^Role: build agent$/m);
     // Nested bullet keeps its own inner indentation after the marker is stripped.
-    assert.match(section, /^ {3} {2}Scope: CI only$/m);
+    assert.match(section, /^ {2}Scope: CI only$/m);
     // Star markers are stripped too.
-    assert.match(section, /^ {3}Mentioned during a routing test$/m);
+    assert.match(section, /^Mentioned during a routing test$/m);
     // Doubled/mixed markers ("- - x", "* - y") must not leave a residual marker behind.
-    assert.match(section, /^ {3}Doubled marker line$/m);
+    assert.match(section, /^Doubled marker line$/m);
     // Non-list markdown (the heading) is left alone.
     assert.match(section, /## Entity/);
   });
 
-  it("standalone (evaluate): emits the same numbered block shape with no dash-bulleted fields", async () => {
+  it("standalone (evaluate): emits the same markdown block shape with no dash-bulleted fields", async () => {
     let capturedPrompt;
     const llm = {
       async completeJson(prompt, label) {
@@ -340,13 +337,13 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
     });
 
     assert.ok(capturedPrompt, "expected a standalone admission-utility call");
-    const section = assertCandidateSectionClean(capturedPrompt, "Candidate memory:");
-    // Same block shape as the batch path: number inline, fields indented.
-    assert.match(section, /^1\. Category: entities$/m);
-    assert.match(section, /^ {3}Abstract: Sample is the team's build agent$/m);
-    assert.match(section, /^ {3}Overview: ## Entity$/m);
-    assert.match(section, /^ {3}Name: Sample$/m);
-    assert.match(section, /^ {3}Content: The user described Sample as their build agent\.$/m);
+    const section = assertCandidateSectionClean(capturedPrompt, "## Candidate\n");
+    // Same block shape as the batch path: `### N. category` heading, flush-left fields.
+    assert.match(section, /^### 1\. entities$/m);
+    assert.match(section, /^Abstract: Sample is the team's build agent$/m);
+    assert.match(section, /^Overview: ## Entity$/m);
+    assert.match(section, /^Name: Sample$/m);
+    assert.match(section, /^Content: The user described Sample as their build agent\.$/m);
     assert.doesNotMatch(capturedPrompt, /^- Category:/m);
     assert.doesNotMatch(capturedPrompt, /^\d+\.\s*$/m);
   });
@@ -379,10 +376,10 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
     });
 
     assert.ok(capturedPrompt);
-    const section = assertCandidateSectionClean(capturedPrompt, "Candidate memory:");
-    assert.match(section, /^1\. Category: cases$/m);
-    assert.match(section, /^ {3}Choice: PostgreSQL$/m);
-    assert.match(section, /^ {3}Rationale: relational fit$/m);
+    const section = assertCandidateSectionClean(capturedPrompt, "## Candidate\n");
+    assert.match(section, /^### 1\. cases$/m);
+    assert.match(section, /^Choice: PostgreSQL$/m);
+    assert.match(section, /^Rationale: relational fit$/m);
   });
 
   it("batch: keeps blank-line separation between bulleted-content candidates", async () => {
@@ -411,18 +408,18 @@ describe("AdmissionController prompt shape: candidate blocks carry no markdown l
     ]);
 
     assert.ok(capturedPrompt);
-    // Candidate 1's last content line, a blank line, then candidate 2's numbered line.
-    assert.match(capturedPrompt, /^ {3}Doubled marker line\n\n2\. Category: events$/m);
+    // Candidate 1's last content line, a blank line, then candidate 2's heading.
+    assert.match(capturedPrompt, /^Doubled marker line\n\n### 2\. events$/m);
   });
 });
 
 // Prompt-architecture slot conformance for the batched prompts: every static
-// block (identity, task framing, rules, few-shot examples, the JSON output
-// contract) lives in the SYSTEM slot; the USER slot carries only the numbered
-// candidate/job blocks and other per-call data. On this branch the two slots
-// are concatenated at the completeJson call sites (the client has no system
-// param yet); these tests pin the builder-level split so the eventual
-// transport change is a pure call-site move.
+// block (identity, taxonomy, task framing, rules, few-shot examples, the JSON
+// output contract) lives in the SYSTEM slot; the USER slot carries only the
+// numbered candidate/job blocks and other per-call data. On this branch the
+// two slots are concatenated at the completeJson call sites (the client has
+// no system param yet); these tests pin the builder-level split so the
+// eventual transport change is a pure call-site move.
 describe("batched prompt slot conformance (system = static, user = per-call data)", () => {
   const { buildBatchUtilityPrompt } = jiti("../src/admission-control.ts");
   const { buildBatchDedupPrompt, buildBatchMergePrompt } = jiti("../src/extraction-prompts.ts");
@@ -435,40 +432,42 @@ describe("batched prompt slot conformance (system = static, user = per-call data
     assert.ok(user.startsWith(userOpener), `user must open with the data header ${JSON.stringify(userOpener)}`);
   }
 
-  it("admission-utility-batch: identity, scoring rules, few-shot example, and output contract are system-only", () => {
+  it("admission-utility-batch: identity, taxonomy, scoring rules, few-shot example, and output contract are system-only", () => {
     const prompt = buildBatchUtilityPrompt([makeCandidate(1), makeCandidate(2)]);
     assertSlotSplit(prompt, {
       staticSentinels: [
         "You are an admission judge.",
+        "The memory system stores six categories:",
         "Score each candidate's future usefulness independently",
         "--- EXAMPLE (not your current batch) ---",
         "Return JSON only, with exactly one entry per candidate",
       ],
-      userOpener: "Candidates:",
+      userOpener: "## Candidates",
     });
-    assert.match(prompt.user, /1\. Category: events/);
-    assert.match(prompt.user, /2\. Category: events/);
+    assert.match(prompt.user, /### 1\. events/);
+    assert.match(prompt.user, /### 2\. events/);
   });
 
-  it("dedup-decision-batch: verdict vocabulary, rules, and output contract are system-only", () => {
+  it("dedup-decision-batch: identity, taxonomy, verdict vocabulary, rules, and output contract are system-only", () => {
     const prompt = buildBatchDedupPrompt([
       { candidate: makeCandidate(1), existingMemories: "1. [preferences] existing memory one" },
     ]);
     assertSlotSplit(prompt, {
       staticSentinels: [
-        "Determine how to handle each numbered candidate memory in this batch.",
+        "You are a memory dedup judge.",
+        "The memory system stores six categories:",
         "- SKIP: Candidate memory duplicates existing memories",
         "IMPORTANT:",
         "Return JSON only, with exactly one entry per candidate",
       ],
-      userOpener: "Candidates:",
+      userOpener: "## Candidates",
     });
-    assert.match(prompt.user, /1\. Category: events/);
+    assert.match(prompt.user, /### 1\. events/);
     assert.ok(prompt.user.includes("existing memory one"), "per-candidate neighbor lists are per-call data and belong in user");
     assert.ok(!prompt.system.includes("existing memory one"));
   });
 
-  it("merge-memory-batch: merge requirements and output contract are system-only", () => {
+  it("merge-memory-batch: identity, taxonomy, merge requirements, and output contract are system-only", () => {
     const prompt = buildBatchMergePrompt([
       {
         category: "preferences",
@@ -478,11 +477,12 @@ describe("batched prompt slot conformance (system = static, user = per-call data
     ]);
     assertSlotSplit(prompt, {
       staticSentinels: [
-        "Merge each numbered job below into a single coherent record",
+        "You are a memory merge writer.",
+        "The memory system stores six categories:",
         "Requirements:",
         "Return JSON only, with exactly one entry per job",
       ],
-      userOpener: "Merge jobs:",
+      userOpener: "## Merge jobs",
     });
     assert.ok(prompt.user.includes("existing abstract"));
     assert.ok(prompt.user.includes("new content"));

@@ -90,8 +90,8 @@ async function runTest() {
                 }],
             });
         } else if (
-            prompt.includes("Determine how to handle this candidate memory") ||
-            prompt.includes("Determine how to handle each numbered candidate memory")
+            prompt.includes("You are a memory dedup judge.") ||
+            prompt.includes("Decide every candidate independently")
         ) {
             const verdict = {
                 decision: dedupDecision,
@@ -99,19 +99,19 @@ async function runTest() {
                 reason: `test ${dedupDecision}`,
                 context_label: dedupContextLabel,
             };
-            content = prompt.includes("each numbered candidate memory")
+            content = prompt.includes("Decide every candidate independently")
                 ? JSON.stringify({ results: [{ index: 1, ...verdict }] })
                 : JSON.stringify(verdict);
         } else if (
-            prompt.includes("Merge the following memory into a single coherent record") ||
-            prompt.includes("Merge each numbered job")
+            prompt.includes("You are a memory merge writer.") ||
+            prompt.includes("For each job, merge every")
         ) {
             const merged = {
                 abstract: "饮品偏好：乌龙茶",
                 overview: "## Preference\n- 喜欢乌龙茶",
                 content: "用户喜欢乌龙茶。",
             };
-            content = prompt.includes("Merge each numbered job")
+            content = prompt.includes("For each job, merge every")
                 ? JSON.stringify({ results: [{ index: 1, ...merged }] })
                 : JSON.stringify(merged);
         } else {
