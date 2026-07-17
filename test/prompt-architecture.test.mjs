@@ -36,7 +36,7 @@ const { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt } = jiti(
 );
 const { createLlmClient } = jiti("../src/llm-client.ts");
 const { formatExistingMemoryEntry } = jiti("../src/prompt-blocks.ts");
-const { buildReflectionPrompt } = jiti("../index.ts");
+const { buildReflectionPromptParts } = jiti("../index.ts");
 
 // ============================================================================
 // buildExtractionPrompt — system/user split
@@ -440,14 +440,14 @@ describe("AdmissionController buildUtilityPrompt (candidate formatting)", () => 
 
 describe("buildReflectionPrompt system/user split (reflection distiller)", () => {
   it("returns a {system, user} shape", () => {
-    const result = buildReflectionPrompt("user: hello\nassistant: hi", 1000, []);
+    const result = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, []);
     assert.equal(typeof result.system, "string");
     assert.equal(typeof result.user, "string");
   });
 
   it("system carries the distiller identity and every heading/rule/template instruction", () => {
-    const { system } = buildReflectionPrompt("user: hello\nassistant: hi", 1000, []);
-    assert.match(system, /You are a memory reflection distiller/i);
+    const { system } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, []);
+    assert.match(system, /You are generating a durable MEMORY REFLECTION entry/i);
     assert.match(system, /## Context \(session background\)/);
     assert.match(system, /## Derived/);
     assert.match(system, /Hard rules:/);
@@ -457,8 +457,8 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
   });
 
   it("user carries only the per-call payload (tool error signals + the conversation input), no identity or instruction duplication", () => {
-    const { user } = buildReflectionPrompt("user: hello\nassistant: hi", 1000, []);
-    assert.doesNotMatch(user, /You are a memory reflection distiller/i);
+    const { user } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, []);
+    assert.doesNotMatch(user, /You are generating a durable MEMORY REFLECTION entry/i);
     assert.doesNotMatch(user, /Hard rules:/);
     assert.doesNotMatch(user, /OUTPUT TEMPLATE/);
     assert.match(user, /Recent tool error signals:/);
@@ -467,7 +467,7 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
   });
 
   it("does not leak this call's tool error signals or conversation input into system", () => {
-    const { system } = buildReflectionPrompt(
+    const { system } = buildReflectionPromptParts(
       "a very specific unique conversation marker XYZZY",
       1000,
       [{ toolName: "bash", summary: "unique tool failure marker QWERTY", signatureHash: "abcd1234" }],
@@ -477,7 +477,7 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
   });
 
   it("joining system and user with a blank line reproduces the exact prior single-string prompt", () => {
-    const { system, user } = buildReflectionPrompt("user: hello\nassistant: hi", 1000, [
+    const { system, user } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, [
       { toolName: "bash", summary: "flaky retry", signatureHash: "deadbeef" },
     ]);
     const joined = `${system}\n\n${user}`;
