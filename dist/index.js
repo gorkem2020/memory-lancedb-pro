@@ -37,9 +37,12 @@ import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import { extractReflectionLearningGovernanceCandidates, extractInjectableReflectionMappedMemoryItems, isRecallUsed, } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
+import { gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText } from "./src/auto-capture-cleanup.js";
+import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, } from "./src/auto-capture-cleanup.js";
+import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -51,7 +54,7 @@ import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, toLifecycleMemory, } from "./src/smart-metadata.js";
 import { computeTier1Patch, isSuppressed as isTier1Suppressed, TIER1_DEFAULT_BAD_RECALL_DECAY_MS, TIER1_DEFAULT_SUPPRESSION_DURATION_MS, } from "./src/auto-recall-tier1.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./src/workspace-boundary.js";
-import { normalizeAdmissionControlConfig, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
+import { normalizeAdmissionControlConfig, resolveAdmissionModel, createAdmissionController, resolveRejectedAuditFilePath, } from "./src/admission-control.js";
 import { analyzeIntent, applyCategoryBoost } from "./src/intent-analyzer.js";
 import { createOpenClawMemoryCapability } from "./src/openclaw-memory-capability.js";
 import { CanonicalCorpusIndexer, parseCanonicalCorpusConfig, } from "./src/corpus-indexer.js";
@@ -368,6 +371,7 @@ const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_SERIAL_GUARD_COOLDOWN_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_TTL_MS = 120_000;
 const DEFAULT_REFLECTION_EMPTY_EVENT_GUARD_MAX_ENTRIES = 200;
+const DEFAULT_REFLECTION_CACHE_TTL_MS = 15_000;
 // After /new or /reset, the just-closed session may have generated fresh
 // derived deltas. Keep those out of the immediately opened prompt window.
 const DEFAULT_REFLECTION_BOUNDARY_DERIVED_SUPPRESSION_MS = 120_000;
@@ -758,6 +762,17 @@ export function inferProviderFromBaseURL(baseURL) {
         return undefined;
     }
 }
+/**
+ * Feature-detect the OpenClaw host-managed runtime LLM completion surface
+ * (api.runtime.llm.complete). Returns undefined on older hosts that do not
+ * expose it yet, so callers can fall back to the direct/oauth transport.
+ */
+export function resolveRuntimeLlmComplete(api) {
+    const runtimeLlm = api.runtime?.llm;
+    return typeof runtimeLlm?.complete === "function"
+        ? runtimeLlm.complete.bind(runtimeLlm)
+        : undefined;
+}
 function asNonEmptyString(value) {
     if (typeof value !== "string")
         return undefined;
@@ -827,6 +842,21 @@ function pruneMapIfOver(map, maxEntries) {
         const key = iter.next().value;
         if (key !== undefined)
             map.delete(key);
+    }
+}
+/**
+ * Prune a Set to stay within the given maximum number of entries.
+ * Deletes the oldest (earliest-inserted) values when over the limit.
+ */
+function pruneSetIfOver(set, maxEntries) {
+    if (set.size <= maxEntries)
+        return;
+    const excess = set.size - maxEntries;
+    const iter = set.values();
+    for (let i = 0; i < excess; i++) {
+        const value = iter.next().value;
+        if (value !== undefined)
+            set.delete(value);
     }
 }
 function isExplicitRememberCommand(text) {
@@ -1052,6 +1082,7 @@ export function buildReflectionPromptParts(conversation, maxInputChars, toolErro
         "- Do not wrap one bullet across multiple lines.",
         "- If a bullet section is empty, write exactly: '- (none captured)'",
         "- Do not paste raw transcript.",
+        "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
         "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
         "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
         "",
@@ -1835,19 +1866,32 @@ function _initPluginState(api) {
     // callback below closes over it.
     const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
-    if (config.smartExtraction !== false) {
+    let admissionController = null;
+    let admissionControllerReflectionLane = null;
+    if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
         try {
             const llmAuth = config.llm?.auth || "api-key";
+            // A host-transport setup should never silently fall back to the
+            // embedding lane's credentials if the runtime.llm.complete surface
+            // turns out to be unavailable and createLlmClient falls back to a
+            // direct client -- that talks to the wrong provider with the wrong
+            // key on a split-provider setup. Leave apiKey/baseURL unset in that
+            // case; createLlmClient throws a clear error / defaults the baseURL.
+            const llmIsHostTransport = config.llm?.transport === "host";
             const llmApiKey = llmAuth === "oauth"
                 ? undefined
                 : config.llm?.apiKey
                     ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-                    : resolveFirstApiKey(api, config.embedding.apiKey);
+                    : llmIsHostTransport
+                        ? undefined
+                        : resolveFirstApiKey(api, config.embedding.apiKey);
             const llmBaseURL = llmAuth === "oauth"
                 ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                 : config.llm?.baseURL
                     ? resolveEnvVars(config.llm.baseURL)
-                    : config.embedding.baseURL;
+                    : llmIsHostTransport
+                        ? undefined
+                        : config.embedding.baseURL;
             const llmModel = config.llm?.model || "openai/gpt-oss-120b";
             const llmOauthPath = llmAuth === "oauth"
                 ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
@@ -1862,33 +1906,82 @@ function _initPluginState(api) {
                 oauthProvider: llmOauthProvider,
                 oauthPath: llmOauthPath,
                 timeoutMs: llmTimeoutMs,
+                transport: config.llm?.transport,
+                thinkLevel: config.llm?.thinkLevel,
+                reasoningEffort: config.llm?.reasoningEffort,
+                runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
             });
-            const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
-            noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
-            const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
-            smartExtractor = new SmartExtractor(store, embedder, llmClient, {
-                user: "User",
-                extractMinMessages: config.extractMinMessages ?? 4,
-                extractMaxChars: config.extractMaxChars ?? 8000,
-                defaultScope: config.scopes?.default ?? "global",
-                workspaceBoundary: config.workspaceBoundary,
+            // Model resolution for admission calls: explicit admissionControl.model
+            // override > lane affinity (reflection lane resolves the
+            // memoryReflection model) > global default. See resolveAdmissionModel().
+            const reflectionModelForAdmission = asNonEmptyString(config.memoryReflection?.model);
+            const admissionModelExtraction = resolveAdmissionModel({
                 admissionControl: config.admissionControl,
-                onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
-                onPersisted: mdMirror ?? undefined,
-                log: (msg) => api.logger.info(msg),
-                debugLog: (msg) => api.logger.debug(msg),
-                noiseBank,
+                lane: "other",
+                globalModel: llmModel,
+                reflectionModel: reflectionModelForAdmission,
             });
-            (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
-                + llmModel
-                + ", timeoutMs: "
-                + llmTimeoutMs
-                + ", noise bank: ON)");
+            const admissionModelReflection = resolveAdmissionModel({
+                admissionControl: config.admissionControl,
+                lane: "reflection",
+                globalModel: llmModel,
+                reflectionModel: reflectionModelForAdmission,
+            });
+            const buildAdmissionLlmClient = (model) => model === llmModel
+                ? llmClient
+                : createLlmClient({
+                    auth: llmAuth,
+                    apiKey: llmApiKey,
+                    model,
+                    baseURL: llmBaseURL,
+                    oauthProvider: llmOauthProvider,
+                    oauthPath: llmOauthPath,
+                    timeoutMs: llmTimeoutMs,
+                    log: (msg) => api.logger.debug(msg),
+                    warnLog: (msg) => api.logger.warn(msg),
+                });
+            // Constructed independently of SmartExtractor so admission gating is
+            // available to other write paths (e.g. reflection-mapped rows, the
+            // regex fallback) even when smart extraction itself is disabled.
+            admissionController = createAdmissionController(store, buildAdmissionLlmClient(admissionModelExtraction), config.admissionControl, (msg) => api.logger.debug(msg));
+            admissionControllerReflectionLane =
+                admissionModelReflection === admissionModelExtraction
+                    ? admissionController
+                    : createAdmissionController(store, buildAdmissionLlmClient(admissionModelReflection), config.admissionControl, (msg) => api.logger.debug(msg));
+            if (config.smartExtraction !== false) {
+                const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));
+                noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
+                const admissionRejectionAuditWriter = createAdmissionRejectionAuditWriter(config, resolvedDbPath, api);
+                smartExtractor = new SmartExtractor(store, embedder, llmClient, {
+                    user: "User",
+                    extractMinMessages: config.extractMinMessages ?? 4,
+                    extractMaxChars: config.extractMaxChars ?? 8000,
+                    defaultScope: config.scopes?.default ?? "global",
+                    workspaceBoundary: config.workspaceBoundary,
+                    admissionControl: config.admissionControl,
+                    admissionController,
+                    onAdmissionRejected: admissionRejectionAuditWriter ?? undefined,
+                    onPersisted: mdMirror ?? undefined,
+                    log: (msg) => api.logger.info(msg),
+                    debugLog: (msg) => api.logger.debug(msg),
+                    noiseBank,
+                });
+                (isCliMode() ? api.logger.debug : api.logger.info)("memory-lancedb-pro: smart extraction enabled (LLM model: "
+                    + llmModel
+                    + ", timeoutMs: "
+                    + llmTimeoutMs
+                    + ", noise bank: ON)");
+            }
         }
         catch (err) {
-            api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            if (config.smartExtraction !== false) {
+                api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
+            }
+            else {
+                api.logger.warn(`memory-lancedb-pro: standalone admission control init failed, admission gating unavailable: ${String(err)}`);
+            }
         }
     }
     const extractionRateLimiter = createExtractionRateLimiter({
@@ -1899,11 +1992,18 @@ function _initPluginState(api) {
     const reflectionDerivedBySession = new Map();
     const reflectionDerivedSuppressionBySession = new Map();
     const reflectionByAgentCache = new Map();
+    // Bumped on every invalidateReflectionCachesAfterDelete call. loadAgentReflectionSlices
+    // snapshots this before its awaited store.list() reads and skips caching its result if
+    // it changed mid-flight, so an in-flight read can never publish a stale pre-delete
+    // snapshot back into the cache after the delete already invalidated it.
+    const reflectionByAgentCacheGeneration = { count: 0 };
     const recallHistory = new Map();
     const turnCounter = new Map();
-    const autoCaptureSeenTextCount = new Map();
+    const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
+    const autoCaptureRecentAssistantTexts = new Map();
+    const autoCapturePayloadShapeLoggedSessions = new Set();
     return {
         config,
         resolvedDbPath,
@@ -1919,17 +2019,22 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        admissionController,
+        admissionControllerReflectionLane,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
         reflectionDerivedBySession,
         reflectionDerivedSuppressionBySession,
         reflectionByAgentCache,
+        reflectionByAgentCacheGeneration,
         recallHistory,
         turnCounter,
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
         autoCaptureRecentTexts,
+        autoCaptureRecentAssistantTexts,
+        autoCapturePayloadShapeLoggedSessions,
     };
 }
 export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
@@ -1962,6 +2067,9 @@ export function isAgentOrSessionExcluded(agentId, sessionKey, patterns) {
     return false;
 }
 const _channelPluginDiagnosticWarnings = new Set();
+export function resolveMappedRowAdmissionController(reflectionLane, extractionLane) {
+    return reflectionLane ?? extractionLane;
+}
 function readRecord(value) {
     return value && typeof value === "object" && !Array.isArray(value)
         ? value
@@ -2038,7 +2146,16 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, admissionControllerReflectionLane, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentAssistantTexts, autoCapturePayloadShapeLoggedSessions, } = singleton;
+        // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
+        // must also go through here so the on-disk watermark never drifts from the
+        // in-memory Map -- a process restart rehydrates from exactly what was last
+        // written here (see loadAutoCaptureWatermarks at construction, above).
+        const persistAutoCaptureWatermark = async (key, value) => {
+            autoCaptureSeenTextCount.set(key, value);
+            pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            await saveAutoCaptureWatermarks(resolvedDbPath, autoCaptureSeenTextCount, (message) => api.logger.debug(message));
+        };
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2201,8 +2318,9 @@ const memoryLanceDBProPlugin = {
                 : "<NO_SCOPE_FILTER>";
             const cacheKey = `${agentId}::${scopeKey}`;
             const cached = reflectionByAgentCache.get(cacheKey);
-            if (cached && Date.now() - cached.updatedAt < 15_000)
+            if (cached && Date.now() - cached.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS)
                 return cached;
+            const generationAtStart = reflectionByAgentCacheGeneration.count;
             // Prefer reflection-category rows to avoid full-table reads on bypass callers.
             // Fall back to an uncategorized scan only when the category query produced no
             // agent-owned reflection slices, preserving backward compatibility with mixed-schema stores.
@@ -2231,13 +2349,54 @@ const memoryLanceDBProPlugin = {
             }
             const { invariants, derived } = slices;
             const next = { updatedAt: Date.now(), invariants, derived };
-            reflectionByAgentCache.set(cacheKey, next);
+            // Only cache if no delete invalidated this cacheKey while the awaits above were in
+            // flight (TOCTOU guard); otherwise this late-arriving, possibly-stale read would
+            // silently resurrect a cache entry the delete just cleared.
+            if (reflectionByAgentCacheGeneration.count === generationAtStart) {
+                reflectionByAgentCache.set(cacheKey, next);
+            }
             return next;
+        };
+        // Fast-path invalidation for SAME-PROCESS deletes only: CLI delete/delete-bulk
+        // commands run as a short-lived, separate process from the long-running Gateway
+        // in typical deployments, so this callback firing there does not reach (and
+        // cannot invalidate) the Gateway process own in-memory caches. It only has an
+        // effect when a delete genuinely happens inside this same plugin instance.
+        //
+        // The actual cross-process staleness bound comes from two other layers:
+        //   - DEFAULT_REFLECTION_CACHE_TTL_MS bounds how long either cache below can
+        //     serve stale content after ANY delete, same-process or not (see the read
+        //     sites in loadAgentReflectionSlices and the derived-focus injector).
+        //   - readConsistencyInterval (store config) bounds how long the underlying
+        //     LanceDB table handle can serve stale rows to a fresh query in the first
+        //     place, which is what a TTL-expired cache re-populates from.
+        //
+        // reflectionByAgentCache is keyed "<agentId>::scopes:<sorted,scopes>" (or
+        // "<agentId>::<NO_SCOPE_FILTER>"); drop any entry whose scope set intersects
+        // the deleted scopes, plus every no-scope-filter entry (it spans all scopes).
+        // reflectionDerivedBySession has no cheap scope-to-session mapping, so it is
+        // cleared in full rather than left to expire on its own TTL.
+        const invalidateReflectionCachesAfterDelete = (deletedScopes) => {
+            reflectionByAgentCacheGeneration.count++;
+            const deletedSet = new Set(deletedScopes ?? []);
+            for (const cacheKey of reflectionByAgentCache.keys()) {
+                const sepIdx = cacheKey.indexOf("::");
+                const scopePart = sepIdx === -1 ? "" : cacheKey.slice(sepIdx + 2);
+                if (scopePart === "<NO_SCOPE_FILTER>" || deletedSet.size === 0) {
+                    reflectionByAgentCache.delete(cacheKey);
+                    continue;
+                }
+                const cachedScopes = scopePart.startsWith("scopes:") ? scopePart.slice("scopes:".length).split(",") : [];
+                if (cachedScopes.some((s) => deletedSet.has(s))) {
+                    reflectionByAgentCache.delete(cacheKey);
+                }
+            }
+            reflectionDerivedBySession.clear();
         };
         const pendingRecall = new Map();
         const logReg = isCliMode() ? api.logger.debug : api.logger.info;
         if (isFirstRegistration) {
-            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`);
+            logReg(`memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'}, admissionControl: ${admissionController ? 'ON' : 'OFF'})`);
             logReg(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
         }
         // Dual-memory model warning: help users understand the two-layer architecture
@@ -2337,6 +2496,9 @@ const memoryLanceDBProPlugin = {
             mdMirror,
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
+            // Mirrors the CLI context wiring below: keep in-process reflection caches
+            // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
+            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
         }, {
             enableManagementTools: config.enableManagementTools,
             enableSelfImprovementTools: config.selfImprovement?.enabled === true,
@@ -2376,21 +2538,28 @@ const memoryLanceDBProPlugin = {
             store,
             retriever,
             scopeManager,
+            onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
             migrator,
             embedder,
+            mdMirror,
             llmClient: smartExtractor ? (() => {
                 try {
                     const llmAuth = config.llm?.auth || "api-key";
+                    const llmIsHostTransport = config.llm?.transport === "host";
                     const llmApiKey = llmAuth === "oauth"
                         ? undefined
                         : config.llm?.apiKey
                             ? resolveSecretCredential(api, config.llm.apiKey, "llm.apiKey")
-                            : resolveFirstApiKey(api, config.embedding.apiKey);
+                            : llmIsHostTransport
+                                ? undefined
+                                : resolveFirstApiKey(api, config.embedding.apiKey);
                     const llmBaseURL = llmAuth === "oauth"
                         ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
                         : config.llm?.baseURL
                             ? resolveEnvVars(config.llm.baseURL)
-                            : config.embedding.baseURL;
+                            : llmIsHostTransport
+                                ? undefined
+                                : config.embedding.baseURL;
                     const llmOauthPath = llmAuth === "oauth"
                         ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
                         : undefined;
@@ -2406,6 +2575,10 @@ const memoryLanceDBProPlugin = {
                         oauthProvider: llmOauthProvider,
                         oauthPath: llmOauthPath,
                         timeoutMs: llmTimeoutMs,
+                        transport: config.llm?.transport,
+                        thinkLevel: config.llm?.thinkLevel,
+                        reasoningEffort: config.llm?.reasoningEffort,
+                        runtimeLlmComplete: resolveRuntimeLlmComplete(api),
                         log: (msg) => api.logger.debug(msg),
                     });
                 }
@@ -2872,21 +3045,27 @@ const memoryLanceDBProPlugin = {
                             ? config.scopes?.default ?? "global"
                             : scopeManager.getDefaultScope(agentId);
                         const sessionKey = ctx?.sessionKey || event.sessionKey || "unknown";
-                        api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`);
+                        api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${JSON.stringify(config.captureAssistant)}, ${summarizeAgentEndMessages(event.messages)})`);
                         // Extract text content from messages
                         const eligibleTexts = [];
+                        const assistantContextTexts = [];
+                        const conversationTurns = [];
                         let skippedAutoCaptureTexts = 0;
+                        const captureAssistantValue = config.captureAssistant;
+                        const captureAssistantEligible = captureAssistantValue === true;
+                        const captureAssistantAsContext = captureAssistantValue === "context";
                         for (const msg of event.messages) {
                             if (!msg || typeof msg !== "object") {
                                 continue;
                             }
                             const msgObj = msg;
                             const role = msgObj.role;
-                            const captureAssistant = config.captureAssistant === true;
-                            if (role !== "user" &&
-                                !(captureAssistant && role === "assistant")) {
+                            const isEligibleRole = role === "user" || (captureAssistantEligible && role === "assistant");
+                            const isContextOnlyRole = captureAssistantAsContext && role === "assistant";
+                            if (!isEligibleRole && !isContextOnlyRole) {
                                 continue;
                             }
+                            const targetTexts = isEligibleRole ? eligibleTexts : assistantContextTexts;
                             const content = msgObj.content;
                             if (typeof content === "string") {
                                 const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
@@ -2894,7 +3073,8 @@ const memoryLanceDBProPlugin = {
                                     skippedAutoCaptureTexts++;
                                 }
                                 else {
-                                    eligibleTexts.push(normalized);
+                                    targetTexts.push(normalized);
+                                    conversationTurns.push({ role: role, text: normalized });
                                 }
                                 continue;
                             }
@@ -2912,7 +3092,8 @@ const memoryLanceDBProPlugin = {
                                             skippedAutoCaptureTexts++;
                                         }
                                         else {
-                                            eligibleTexts.push(normalized);
+                                            targetTexts.push(normalized);
+                                            conversationTurns.push({ role: role, text: normalized });
                                         }
                                     }
                                 }
@@ -2925,18 +3106,39 @@ const memoryLanceDBProPlugin = {
                         if (conversationKey) {
                             autoCapturePendingIngressTexts.delete(conversationKey);
                         }
+                        const minMessages = config.extractMinMessages ?? 4;
                         const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
                         let newTexts = eligibleTexts;
+                        let watermarkAdvanceOverride = null;
                         if (pendingIngressTexts.length > 0) {
                             newTexts = pendingIngressTexts;
                         }
                         else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
                             newTexts = eligibleTexts.slice(previousSeenCount);
                         }
+                        else if (previousSeenCount === 0 && eligibleTexts.length > minMessages) {
+                            // issue #417 item 5: a genuinely unknown watermark (first-ever
+                            // run, or persisted state lost) meeting a history-carrying
+                            // payload must not ingest the entire transcript in one call.
+                            // Cap to the most recent batch and forfeit the rest by marking
+                            // it seen below, rather than queueing it for a later turn.
+                            newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
+                            watermarkAdvanceOverride = eligibleTexts.length;
+                        }
                         // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
-                        const cumulativeCount = previousSeenCount + newTexts.length;
-                        autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
-                        pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newTexts.length);
+                        await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
+                        // Once per session per process (not persisted, not per turn): a
+                        // restart re-emits this, which is exactly when you want to
+                        // re-confirm the payload shape in the new process. This single
+                        // INFO line answers the delta-only-vs-history-carrying question
+                        // and the gate's fire/skip decision without reconstructing them
+                        // from DEBUG-only evidence across unrelated log lines.
+                        if (!autoCapturePayloadShapeLoggedSessions.has(sessionKey)) {
+                            autoCapturePayloadShapeLoggedSessions.add(sessionKey);
+                            pruneSetIfOver(autoCapturePayloadShapeLoggedSessions, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                            api.logger.info(`memory-lancedb-pro: auto-capture payload shape for agent ${agentId} (sessionKey=${sessionKey}): messages=${event.messages.length}, eligible=${eligibleTexts.length}, previousSeen=${previousSeenCount}, cumulative=${cumulativeCount}, fired=${cumulativeCount >= minMessages ? "yes" : "no"}`);
+                        }
                         const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
                         let texts = newTexts;
                         if (texts.length === 1 &&
@@ -2949,7 +3151,13 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
-                        const minMessages = config.extractMinMessages ?? 4;
+                        const priorAssistantContextTexts = autoCaptureRecentAssistantTexts.get(sessionKey) || [];
+                        let assistantContextForRun = priorAssistantContextTexts;
+                        if (assistantContextTexts.length > 0) {
+                            assistantContextForRun = [...priorAssistantContextTexts, ...assistantContextTexts].slice(-6);
+                            autoCaptureRecentAssistantTexts.set(sessionKey, assistantContextForRun);
+                            pruneMapIfOver(autoCaptureRecentAssistantTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        }
                         if (skippedAutoCaptureTexts > 0) {
                             api.logger.debug(`memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`);
                         }
@@ -3005,10 +3213,17 @@ const memoryLanceDBProPlugin = {
                             if (cumulativeCount >= minMessages) {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
                                 const conversationText = cleanTexts.join("\n");
+                                const finalConversationTurns = buildConversationTurnsForExtraction({
+                                    messageLoopTurns: conversationTurns,
+                                    eligibleTexts,
+                                    newUserTexts: cleanTexts,
+                                    assistantContextForRun,
+                                    assistantContextTexts,
+                                });
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun, conversationTurns: finalConversationTurns });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
@@ -3027,11 +3242,18 @@ const memoryLanceDBProPlugin = {
                                     // turn re-read and re-extract the entire history. Record the
                                     // consumed history length there instead, so the next turn
                                     // only sees the delta.
-                                    autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
+                                    await persistAutoCaptureWatermark(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
+                                    autoCaptureRecentAssistantTexts.delete(sessionKey);
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
                                     api.logger.info(`memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`);
+                                    // A valid-empty result (the LLM genuinely ran and confirmed
+                                    // nothing worth storing) is just as conclusive as a
+                                    // successful extraction for watermark purposes -- reset the
+                                    // same way (issue #417 Fix #5), or the next turn re-fires on
+                                    // just one new message instead of waiting for a fresh window.
+                                    autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
                                     return;
                                 }
                                 api.logger.info(`memory-lancedb-pro: smart extraction skipped ${stats.boundarySkipped} USER.md-exclusive candidate(s) for agent ${agentId}; continuing to regex fallback for non-boundary texts`);
@@ -3039,6 +3261,32 @@ const memoryLanceDBProPlugin = {
                             }
                             else {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (cumulative=${cumulativeCount} < minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
+                                // Below-threshold turns are deferred, never handed to the raw
+                                // regex fallback (which stores text verbatim, bypassing the
+                                // grounding filter and admission control). For history-carrying
+                                // sessions, roll the cursor back so the next turn's slice
+                                // re-includes these texts in the extraction input. Ingress-fed sessions
+                                // keep their accumulator advance instead (rolling the counter back alone
+                                // would stall it below threshold forever, since only fresh
+                                // message_received events grow it) and re-queue the consumed pending
+                                // texts so the actual content, not just the count, survives for the
+                                // next turn to pick up. Previously the content was silently discarded
+                                // here: only the counter advanced, so by the time it crossed
+                                // minMessages on a later turn, every earlier deferred turn's text was
+                                // already gone.
+                                if (pendingIngressTexts.length === 0) {
+                                    await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
+                                }
+                                else if (conversationKey) {
+                                    const requeuedIngressTexts = [
+                                        ...pendingIngressTexts,
+                                        ...(autoCapturePendingIngressTexts.get(conversationKey) || []),
+                                    ].slice(-6);
+                                    autoCapturePendingIngressTexts.set(conversationKey, requeuedIngressTexts);
+                                    pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                                }
+                                api.logger.debug(`memory-lancedb-pro: auto-capture deferred below-threshold turn for agent ${agentId}; regex fallback skipped (smart extraction enabled)`);
+                                return;
                             }
                         }
                         api.logger.debug(`memory-lancedb-pro: auto-capture running regex fallback for agent ${agentId}`);
@@ -3103,6 +3351,24 @@ const memoryLanceDBProPlugin = {
                                 api.logger.info(`memory-lancedb-pro: skipped duplicate-in-batch text for agent ${agentId}: "${text.slice(0, 40)}"`);
                                 continue;
                             }
+                            // Fallback captures go through the same admission gate as
+                            // extraction candidates when admission control is active;
+                            // passthrough when it is disabled (or when smart extraction is
+                            // off, in which case no controller instance exists to borrow).
+                            const fallbackGate = await gateRegexFallbackCapture({
+                                admissionController: smartExtractor?.getAdmissionController() ?? null,
+                                attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+                                text,
+                                storeCategory: category,
+                                vector,
+                                conversationText: texts.join("\n"),
+                                scopeFilter: accessibleScopes ?? [defaultScope],
+                                warnLog: (msg) => api.logger.warn(msg),
+                            });
+                            if (!fallbackGate.admit) {
+                                api.logger.info(`memory-lancedb-pro: admission rejected regex-fallback capture "${text.slice(0, 40)}" provenance=auto-capture-regex-fallback: ${fallbackGate.reason ?? "no reason"}`);
+                                continue;
+                            }
                             // Build metadata; if it fails, skip this entry rather than propagating
                             // the exception and leaving capturedEntries in a partial state.
                             let metadata;
@@ -3126,6 +3392,7 @@ const memoryLanceDBProPlugin = {
                                     injected_count: 0,
                                     bad_recall_count: 0,
                                     suppressed_until_turn: 0,
+                                    ...(fallbackGate.auditJson ? { admission_audit: fallbackGate.auditJson } : {}),
                                 }));
                             }
                             catch (metadataErr) {
@@ -3562,7 +3829,8 @@ const memoryLanceDBProPlugin = {
                                 reflectionDerivedSuppressionBySession.delete(sessionKey);
                             const scopes = resolveScopeFilter(scopeManager, agentId);
                             const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-                            const derivedLines = derivedCache?.derived?.length
+                            const derivedCacheFresh = derivedCache && Date.now() - derivedCache.updatedAt < DEFAULT_REFLECTION_CACHE_TTL_MS;
+                            const derivedLines = derivedCacheFresh && derivedCache.derived.length
                                 ? derivedCache.derived
                                 : (await loadAgentReflectionSlices(agentId, scopes)).derived;
                             if (derivedLines.length > 0) {
@@ -3642,7 +3910,13 @@ const memoryLanceDBProPlugin = {
                 const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {});
                 const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
                 let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
-                const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+                const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
+                const sourceAgentId = parsedAgentId || "main";
+                // Ownership written into persisted reflection metadata must never be minted as
+                // "main" when the sessionKey fails to resolve to a real agent, that would silently
+                // misattribute the reflection to (and make it inheritable by) an unrelated agent.
+                // isOwnedByAgent() treats an empty owner as non-inheritable.
+                const ownerAgentId = parsedAgentId || "";
                 const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
                 if (isSessionBoundaryReflectionAction(action)) {
                     const now = Date.now();
@@ -3777,7 +4051,16 @@ const memoryLanceDBProPlugin = {
                     const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
                     const targetScope = isSystemBypassId(sourceAgentId)
                         ? config.scopes?.default ?? "global"
-                        : scopeManager.getDefaultScope(sourceAgentId);
+                        : parsedAgentId
+                            ? scopeManager.getDefaultScope(sourceAgentId)
+                            // A session that never resolved to a real agent must not be routed into
+                            // main's default scope: ownerAgentId is already blanked for exactly this
+                            // case so the row is not inheritable via isOwnedByAgent(), but a plain
+                            // scope-filtered read (list/vectorSearch/etc. with no ownership check)
+                            // would still see it if it landed in "agent:main". Route it into a scope
+                            // no agent's getAccessibleScopes() ever grants instead, so it stays
+                            // findable by an unrestricted/admin read but invisible to every agent.
+                            : "unattributed:reflection";
                     const toolErrorSignals = sessionKey
                         ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
                         : [];
@@ -3875,8 +4158,11 @@ const memoryLanceDBProPlugin = {
                     const MAX_MAPPED_ENTRIES = 100;
                     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
                     const mappedEntries = [];
+                    // Per-row embed + near-duplicate pre-check first, collecting the
+                    // gate-eligible rows so the whole burst can share one admission call.
+                    const gateEligible = [];
                     for (const mapped of mappedReflectionMemories) {
-                        if (mappedEntries.length >= MAX_MAPPED_ENTRIES) {
+                        if (gateEligible.length >= MAX_MAPPED_ENTRIES) {
                             api.logger.warn(`memory-reflection: mapped entries cap (${MAX_MAPPED_ENTRIES}) reached, skipping remaining items`);
                             break;
                         }
@@ -3893,14 +4179,54 @@ const memoryLanceDBProPlugin = {
                         if (searchFailed) {
                             continue;
                         }
+                        // Near-duplicate pre-check ahead of admission gating. This is the only dedup mapped
+                        // rows get: a single vector-similarity threshold, direct skip, no LLM-mediated
+                        // merge/contextualize/contradict decision. Extraction candidates own deduplicate()
+                        // (src/smart-extractor.ts) is a genuinely different, richer pipeline (a 0.7
+                        // pre-filter feeding an LLM decision, not a single hard cutoff) - deliberately not
+                        // reused here yet. AdmissionController's "pass_to_dedup" decision for a mapped row
+                        // is therefore always treated as "admit, subject to this cheaper pre-check" below,
+                        // not "route through the same merge pipeline extraction candidates get".
                         if (existing.length > 0 && existing[0].score > 0.95) {
+                            continue;
+                        }
+                        gateEligible.push({ mapped, vector });
+                    }
+                    // Writer-1 admission routing: mapped rows previously bypassed
+                    // admission control entirely. Gate the whole burst through the same
+                    // AdmissionController as extraction candidates: one batched judge
+                    // call per burst when the controller supports evaluateBatch, the
+                    // historical per-row path otherwise; passthrough when admission
+                    // control (or smart extraction) is disabled.
+                    const mappedGateResults = await gateMappedReflectionEntries({
+                        admissionController: resolveMappedRowAdmissionController(admissionControllerReflectionLane, smartExtractor?.getAdmissionController() ?? null),
+                        attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+                        rows: gateEligible.map(({ mapped, vector }) => ({
+                            text: mapped.text,
+                            category: mapped.category,
+                            heading: mapped.heading,
+                            vector,
+                        })),
+                        // The real transcript, not reflectionText (the distiller's own generated
+                        // output mapped rows are parsed FROM): using the distillate as its own
+                        // grounding evidence would let a hallucinated line appear self-grounded.
+                        conversationText: conversation,
+                        scopeFilter: [targetScope],
+                        warnLog: (msg) => api.logger.warn(msg),
+                    });
+                    // Consume the per-row gate results in input order.
+                    for (let gateIndex = 0; gateIndex < gateEligible.length; gateIndex++) {
+                        const { mapped, vector } = gateEligible[gateIndex];
+                        const mappedGate = mappedGateResults[gateIndex];
+                        if (!mappedGate.admit) {
+                            api.logger.info(`memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`);
                             continue;
                         }
                         const importance = mapped.category === "decision" ? 0.85 : 0.8;
                         const baseMetadata = buildReflectionMappedMetadata({
                             mappedItem: mapped,
                             eventId: reflectionEventId,
-                            agentId: sourceAgentId,
+                            agentId: ownerAgentId,
                             sessionKey,
                             sessionId: currentSessionId || "unknown",
                             runAt: nowTs,
@@ -3910,6 +4236,9 @@ const memoryLanceDBProPlugin = {
                         });
                         // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
                         baseMetadata._reflectionHeading = mapped.heading;
+                        if (mappedGate.auditJson) {
+                            baseMetadata.admission_audit = mappedGate.auditJson;
+                        }
                         const metadata = JSON.stringify(baseMetadata);
                         mappedEntries.push({
                             text: mapped.text,
@@ -3943,7 +4272,7 @@ const memoryLanceDBProPlugin = {
                             reflectionText,
                             sessionKey,
                             sessionId: currentSessionId || "unknown",
-                            agentId: sourceAgentId,
+                            agentId: ownerAgentId,
                             command: String(event.action || "unknown"),
                             scope: targetScope,
                             toolErrorSignals,
@@ -3955,10 +4284,24 @@ const memoryLanceDBProPlugin = {
                             embedPassage: (text) => embedder.embedPassage(text),
                             vectorSearch: (vector, limit, minScore, scopeFilter) => store.vectorSearch(vector, limit, minScore, scopeFilter),
                             store: (entry) => store.store(entry),
+                            onPersisted: mdMirror
+                                ? async (entry, kind) => {
+                                    const source = kind === "event" ? "reflection-slice:event"
+                                        : kind === "item-invariant" ? "reflection-slice:invariant"
+                                            : "reflection-slice:derived";
+                                    await mdMirror({ text: entry.text, category: entry.category, scope: entry.scope, timestamp: entry.timestamp }, { source, agentId: sourceAgentId });
+                                }
+                                : undefined,
                         });
                         if (sessionKey && stored.slices.derived.length > 0 && !isSessionBoundaryReflectionAction(action)) {
                             reflectionDerivedBySession.set(sessionKey, {
-                                updatedAt: nowTs,
+                                // Deliberately Date.now(), not nowTs (which mirrors the host-supplied
+                                // event.timestamp and can be skewed/future-dated): this field is a TTL
+                                // bookkeeping mark, and DEFAULT_REFLECTION_CACHE_TTL_MS above compares it
+                                // against a fresh Date.now() on every read. A skewed updatedAt can make
+                                // "Date.now() - updatedAt" go negative, which is always < the TTL, so the
+                                // cache would read as fresh indefinitely until wall-clock time caught up.
+                                updatedAt: Date.now(),
                                 derived: stored.slices.derived,
                             });
                         }
@@ -4159,7 +4502,10 @@ const memoryLanceDBProPlugin = {
                     return;
                 }
                 await mkdir(backupDir, { recursive: true });
-                const allMemories = await store.list(undefined, undefined, 10000, 0);
+                // excludeInactive:false -- this is the automated backup dump and must
+                // keep full-dump semantics, including invalidated/superseded rows
+                // (item 6, PR #946).
+                const allMemories = await store.list(undefined, undefined, 10000, 0, { excludeInactive: false });
                 if (allMemories.length === 0)
                     return;
                 const dateStr = new Date().toISOString().split("T")[0];
@@ -4650,7 +4996,7 @@ export function parsePluginConfig(value) {
             }
             return s;
         })(),
-        captureAssistant: cfg.captureAssistant === true,
+        captureAssistant: cfg.captureAssistant === "context" ? "context" : cfg.captureAssistant === true,
         retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null
             ? (() => {
                 const retrieval = { ...cfg.retrieval };

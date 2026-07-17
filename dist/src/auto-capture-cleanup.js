@@ -119,6 +119,60 @@ export function normalizeAutoCaptureText(role, text, shouldSkipMessage) {
     return normalized;
 }
 /**
+ * Renders turns oldest-first as a continuous "Label: text" transcript, one
+ * line per turn, no blank lines or per-turn metadata between them. `userLabel`
+ * replaces the generic "User" label when a configured name is known;
+ * assistant turns always render as "Assistant" (no per-agent name surface).
+ */
+export function formatConversationTranscript(turns, userLabel = "User") {
+    return turns
+        .map((turn) => `${turn.role === "user" ? userLabel : "Assistant"}: ${turn.text}`)
+        .join("\n");
+}
+/**
+ * Assembles the ordered turn sequence for the extraction prompt's transcript
+ * from this call's true message-loop order, without recomputing any
+ * eligibility or watermark decision -- it only consumes their already-decided
+ * results:
+ * - `newUserTexts` narrower than `eligibleTexts` (watermark tail-slice):
+ *   drop that many leading user turns, keep every assistant-context turn.
+ * - `assistantContextForRun` longer than this call's own `assistantContextTexts`
+ *   (rolling window carried a prior call's context forward): prepend the
+ *   carried-over entries as leading assistant turns, chronologically ahead
+ *   of this call's turns.
+ * - `newUserTexts` not a tail-slice of `eligibleTexts` at all (pending-ingress
+ *   replay from a different source, no per-message role correlation
+ *   available): fall back to flat user turns for the replayed content, still
+ *   preceded by any carried-over assistant context.
+ */
+export function buildConversationTurnsForExtraction(params) {
+    const { messageLoopTurns, eligibleTexts, newUserTexts, assistantContextForRun, assistantContextTexts } = params;
+    const leadingCount = Math.max(0, assistantContextForRun.length - assistantContextTexts.length);
+    const leadingAssistantTurns = assistantContextForRun
+        .slice(0, leadingCount)
+        .map((text) => ({ role: "assistant", text }));
+    const isTailSliceOfEligible = newUserTexts.length <= eligibleTexts.length &&
+        eligibleTexts
+            .slice(eligibleTexts.length - newUserTexts.length)
+            .every((text, i) => text === newUserTexts[i]);
+    if (!isTailSliceOfEligible) {
+        const userTurns = newUserTexts.map((text) => ({ role: "user", text }));
+        return [...leadingAssistantTurns, ...userTurns];
+    }
+    const skipUserCount = eligibleTexts.length - newUserTexts.length;
+    const thisCallTurns = [];
+    let userSeen = 0;
+    for (const turn of messageLoopTurns) {
+        if (turn.role === "user") {
+            userSeen++;
+            if (userSeen <= skipUserCount)
+                continue;
+        }
+        thisCallTurns.push(turn);
+    }
+    return [...leadingAssistantTurns, ...thisCallTurns];
+}
+/**
  * Bounds the extraction input when a session's watermark is genuinely
  * unknown (first-ever run, or persisted state lost) and its eligible-text
  * history is larger than one batch's worth -- ingesting the entire history
