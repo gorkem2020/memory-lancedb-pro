@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { formatCandidateBlock } from "./extraction-prompts.js";
 import type { LlmClient } from "./llm-client.js";
 import type { CandidateMemory, MemoryCategory } from "./memory-categories.js";
 import type { MemorySearchResult, MemoryStore } from "./store.js";
@@ -460,40 +461,9 @@ function cosineSimilarity(left: number[], right: number[]): number {
   return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 }
 
-/**
- * Formats one candidate as a numbered block: `N. Category: <cat>` with the
- * number inline on the first line, then each remaining field on its own line
- * indented under the candidate. Multi-line field values (stored overviews
- * commonly carry bulleted markdown like "- Name: ...") are split per line,
- * any leading markdown list marker (`- ` / `* `) is stripped while the
- * line's own inner indentation is kept, and every continuation line is
- * indented under the candidate so the block stays visually grouped. Without
- * this, content-carried bullets land at column 0 inside the numbered list
- * and (in markdown renderers) break the list apart; other content markdown
- * (e.g. `##` headings) is deliberately left as-is.
- *
- * Every admission-prompt path (standalone, batch, and the batch prompt's own
- * few-shot example) must emit candidate blocks through this one function so
- * the shapes can never drift apart.
- */
-function formatCandidateBlock(n: number, candidate: CandidateMemory): string {
-  const lines = [`${n}. Category: ${candidate.category}`];
-  const fields: Array<[string, string]> = [
-    ["Abstract", candidate.abstract],
-    ["Overview", candidate.overview],
-    ["Content", candidate.content],
-  ];
-  for (const [label, value] of fields) {
-    const valueLines = String(value ?? "")
-      .split("\n")
-      .map((line) => line.replace(/^(\s*)(?:[-*] )+/, "$1"));
-    lines.push(`   ${label}: ${valueLines[0]}`);
-    for (const continuation of valueLines.slice(1)) {
-      lines.push(`   ${continuation}`);
-    }
-  }
-  return lines.join("\n");
-}
+// formatCandidateBlock moved to extraction-prompts.ts so the admission,
+// batched-dedup, and batched-merge prompts all render candidate blocks
+// through the one shared formatter (imported above).
 
 /**
  * The admission judge scores solely on what extraction provided (the
