@@ -1101,8 +1101,8 @@ export class SmartExtractor {
      */
     async llmDedupDecisionBatch(items) {
         const out = new Array(items.length);
-        for (let chunkStart = 0; chunkStart < items.length; chunkStart += DEDUP_BATCH_MAX_SIZE) {
-            const chunk = items.slice(chunkStart, chunkStart + DEDUP_BATCH_MAX_SIZE);
+        for (let chunkStart = 0; chunkStart < items.length; chunkStart += this.batchChunkSize()) {
+            const chunk = items.slice(chunkStart, chunkStart + this.batchChunkSize());
             const sliced = chunk.map((item) => item.topSimilar.slice(0, MAX_SIMILAR_FOR_PROMPT));
             const { system, user } = buildBatchDedupPrompt(chunk.map((item, i) => ({
                 candidate: item.candidate,
@@ -1359,8 +1359,8 @@ export class SmartExtractor {
      */
     async llmMergeContentBatch(jobs) {
         const out = new Array(jobs.length).fill(null);
-        for (let chunkStart = 0; chunkStart < jobs.length; chunkStart += MERGE_BATCH_MAX_SIZE) {
-            const chunk = jobs.slice(chunkStart, chunkStart + MERGE_BATCH_MAX_SIZE);
+        for (let chunkStart = 0; chunkStart < jobs.length; chunkStart += this.batchChunkSize()) {
+            const chunk = jobs.slice(chunkStart, chunkStart + this.batchChunkSize());
             const { system, user } = buildBatchMergePrompt(chunk.map((job) => ({
                 category: job.category,
                 existing: job.existing,
@@ -1666,6 +1666,13 @@ export class SmartExtractor {
      * collide with an external lane's builders.
      */
     externalEntryBuilders = new WeakMap();
+    /** Per-call chunk bound for the batched dedup decider and merge writer. */
+    batchChunkSize() {
+        const raw = this.config.batchChunkSize;
+        return typeof raw === "number" && Number.isFinite(raw) && raw >= 1
+            ? Math.min(50, Math.floor(raw))
+            : DEDUP_BATCH_MAX_SIZE;
+    }
     buildStoreEntry(candidate, vector, sessionKey, targetScope, admissionAudit) {
         const external = this.externalEntryBuilders.get(candidate);
         if (external) {

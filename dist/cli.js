@@ -12,6 +12,7 @@ import { parseSmartMetadata, buildSmartMetadata, stringifySmartMetadata, } from 
 import { createRetriever } from "./src/retriever.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import { runConsolidate, formatConsolidateCostPreview } from "./src/consolidate.js";
+import { clampBatchChunkSize } from "./src/memory-categories.js";
 import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSupported, listOAuthProviders, normalizeOauthModel, normalizeOAuthProviderId, performOAuthLogin, } from "./src/llm-oauth.js";
 // ============================================================================
 // Utility Functions
@@ -2012,6 +2013,7 @@ function registerConsolidateCommand(memory, context) {
                 includeReflectionSlices: options.includeReflectionSlices,
                 apply: options.apply === true,
                 autoConfirm: options.yes === true,
+                mergeChunkSize: clampBatchChunkSize(context.pluginConfig?.batchChunkSize),
                 settledFingerprints: new Set(settledLedger[scope] ?? []),
             });
             if (result.status === "aborted") {

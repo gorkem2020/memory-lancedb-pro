@@ -42,6 +42,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         auditMetadata: true,
         persistRejectedAudits: true,
         rejectedAuditFilePath: undefined,
+        batchChunkSize: 10,
     },
     conservative: {
         preset: "conservative",
@@ -72,6 +73,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         auditMetadata: true,
         persistRejectedAudits: true,
         rejectedAuditFilePath: undefined,
+        batchChunkSize: 10,
     },
     "high-recall": {
         preset: "high-recall",
@@ -102,6 +104,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         auditMetadata: true,
         persistRejectedAudits: true,
         rejectedAuditFilePath: undefined,
+        batchChunkSize: 10,
     },
 };
 export const DEFAULT_ADMISSION_CONTROL_CONFIG = ADMISSION_CONTROL_PRESETS.balanced;
@@ -200,6 +203,9 @@ export function normalizeAdmissionControlConfig(raw) {
             halfLifeDays: clampPositiveInt(recencyRaw.halfLifeDays, base.recency.halfLifeDays, 365),
         },
         typePriors: normalizeTypePriors(obj.typePriors, base.typePriors),
+        batchChunkSize: obj.batchChunkSize === undefined
+            ? base.batchChunkSize
+            : clampPositiveInt(obj.batchChunkSize, base.batchChunkSize, 50),
         auditMetadata: typeof obj.auditMetadata === "boolean"
             ? obj.auditMetadata
             : base.auditMetadata,
@@ -809,9 +815,10 @@ export class AdmissionController {
     async evaluateBatch(items) {
         if (items.length === 0)
             return [];
+        const chunkSize = this.config.batchChunkSize || BATCH_UTILITY_MAX_SIZE;
         const chunks = [];
-        for (let i = 0; i < items.length; i += BATCH_UTILITY_MAX_SIZE) {
-            chunks.push(items.slice(i, i + BATCH_UTILITY_MAX_SIZE));
+        for (let i = 0; i < items.length; i += chunkSize) {
+            chunks.push(items.slice(i, i + chunkSize));
         }
         const results = [];
         for (const chunk of chunks) {

@@ -263,12 +263,12 @@ export function parseConsolidateBatchVerdicts(raw, units) {
 // ============================================================================
 /** Max merge jobs written in one batched merge-content LLM call; larger batches are chunked. */
 export const CONSOLIDATE_MERGE_BATCH_MAX_SIZE = 10;
-export function computeConsolidateCostPreview(units) {
+export function computeConsolidateCostPreview(units, mergeChunkSize = CONSOLIDATE_MERGE_BATCH_MAX_SIZE) {
     const maxMergeJobs = units.length;
     return {
         clusterCount: units.length,
         maxMergeJobs,
-        maxMergeContentCalls: Math.ceil(maxMergeJobs / CONSOLIDATE_MERGE_BATCH_MAX_SIZE),
+        maxMergeContentCalls: Math.ceil(maxMergeJobs / mergeChunkSize),
     };
 }
 export function formatConsolidateCostPreview(preview) {
@@ -294,10 +294,10 @@ export function formatConsolidateCostPreview(preview) {
  * that chunk the same way. Never throws, never fans back out into per-member
  * LLM calls.
  */
-async function buildMergePlanContentsBatch(deps, jobs, log) {
+async function buildMergePlanContentsBatch(deps, jobs, mergeChunkSize = CONSOLIDATE_MERGE_BATCH_MAX_SIZE, log) {
     const out = new Array(jobs.length);
-    for (let chunkStart = 0; chunkStart < jobs.length; chunkStart += CONSOLIDATE_MERGE_BATCH_MAX_SIZE) {
-        const chunk = jobs.slice(chunkStart, chunkStart + CONSOLIDATE_MERGE_BATCH_MAX_SIZE);
+    for (let chunkStart = 0; chunkStart < jobs.length; chunkStart += mergeChunkSize) {
+        const chunk = jobs.slice(chunkStart, chunkStart + mergeChunkSize);
         const prompt = buildConsolidateBatchMergePrompt(chunk.map(({ members, verdict }) => {
             const survivor = members[verdict.survivorIndex - 1];
             return {
@@ -454,7 +454,7 @@ export function computeClusterFingerprint(members) {
     const parts = members
         .map((m) => `${m.id}\n${m.metadata ?? ""}`)
         .sort()
-        .join(" ");
+        .join("\u0000");
     return createHash("sha256").update(parts).digest("hex");
 }
 /**
@@ -536,6 +536,7 @@ export async function runConsolidate(deps, options) {
         .sort((a, b) => (a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0));
     const similarityThreshold = options.similarityThreshold ?? DEFAULT_SIMILARITY_THRESHOLD;
     const clusterCap = options.clusterCap ?? DEFAULT_CLUSTER_CAP;
+    const mergeChunkSize = Math.min(50, Math.max(1, Math.floor(options.mergeChunkSize ?? CONSOLIDATE_MERGE_BATCH_MAX_SIZE)));
     const clusterIndexGroups = clusterConsolidateCandidates(candidates, similarityThreshold);
     const byId = (a, b) => a.entry.id < b.entry.id ? -1 : a.entry.id > b.entry.id ? 1 : 0;
     // Flatten every cluster (and any cluster chunked past clusterCap) into a
@@ -584,7 +585,7 @@ export async function runConsolidate(deps, options) {
     // confirmCost is treated identically: a safe abort, never assumed consent.
     let costPreview;
     if (units.length > 0) {
-        costPreview = computeConsolidateCostPreview(units);
+        costPreview = computeConsolidateCostPreview(units, mergeChunkSize);
         if (!options.autoConfirm) {
             const message = formatConsolidateCostPreview(costPreview);
             const proceed = deps.confirmCost ? await deps.confirmCost(message) : false;
@@ -725,7 +726,7 @@ export async function runConsolidate(deps, options) {
         // build spends ceil(M/CONSOLIDATE_MERGE_BATCH_MAX_SIZE) LLM calls
         // instead of one call per absorbed member.
         if (pendingMergeContent.length > 0) {
-            const contents = await buildMergePlanContentsBatch(deps, pendingMergeContent, deps.log);
+            const contents = await buildMergePlanContentsBatch(deps, pendingMergeContent, mergeChunkSize, deps.log);
             pendingMergeContent.forEach((pending, i) => {
                 pending.cluster.mergedContent = contents[i];
             });
