@@ -41,7 +41,7 @@ import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.j
 import { gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, } from "./src/auto-capture-cleanup.js";
+import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
 import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
@@ -2004,7 +2004,7 @@ function _initPluginState(api) {
     const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureRecentTexts = new Map();
-    const autoCaptureRecentAssistantTexts = new Map();
+    const autoCaptureRecentPairTurns = new Map();
     const autoCapturePayloadShapeLoggedSessions = new Set();
     const autoCaptureLastEligibleLength = new Map();
     return {
@@ -2036,7 +2036,7 @@ function _initPluginState(api) {
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
         autoCaptureRecentTexts,
-        autoCaptureRecentAssistantTexts,
+        autoCaptureRecentPairTurns,
         autoCapturePayloadShapeLoggedSessions,
         autoCaptureLastEligibleLength,
     };
@@ -2150,7 +2150,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, admissionControllerReflectionLane, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentAssistantTexts, autoCapturePayloadShapeLoggedSessions, autoCaptureLastEligibleLength, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, admissionControllerReflectionLane, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentPairTurns, autoCapturePayloadShapeLoggedSessions, autoCaptureLastEligibleLength, } = singleton;
         // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
         // must also go through here so the on-disk watermark never drifts from the
         // in-memory Map -- a process restart rehydrates from exactly what was last
@@ -3161,12 +3161,23 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
-                        const priorAssistantContextTexts = autoCaptureRecentAssistantTexts.get(sessionKey) || [];
-                        let assistantContextForRun = priorAssistantContextTexts;
-                        if (assistantContextTexts.length > 0) {
-                            assistantContextForRun = [...priorAssistantContextTexts, ...assistantContextTexts].slice(-6);
-                            autoCaptureRecentAssistantTexts.set(sessionKey, assistantContextForRun);
-                            pruneMapIfOver(autoCaptureRecentAssistantTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        // Rolling PAIR window (operator spec: extractMinMessages counts
+                        // user<->assistant pairs, and captureAssistant context rides the
+                        // same window). This call's new pairs -- kept user turns with the
+                        // assistant replies interleaved in true order -- extend what
+                        // earlier calls buffered, bounded to extractMinMessages user turns
+                        // (or this call's own new-user count when larger, so unextracted
+                        // user turns are never trimmed out of their own transcript).
+                        const thisCallPairTurns = buildConversationTurnsForExtraction({
+                            messageLoopTurns: conversationTurns,
+                            eligibleTexts,
+                            newUserTexts: newTexts,
+                        });
+                        const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
+                        const pairWindowTurns = trimTurnsToUserCap([...priorPairTurns, ...thisCallPairTurns], Math.max(minMessages, thisCallPairTurns.filter((turn) => turn.role === "user").length));
+                        if (thisCallPairTurns.length > 0) {
+                            autoCaptureRecentPairTurns.set(sessionKey, pairWindowTurns);
+                            pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
                         if (skippedAutoCaptureTexts > 0) {
                             api.logger.debug(`memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`);
@@ -3223,17 +3234,17 @@ const memoryLanceDBProPlugin = {
                             if (cumulativeCount >= minMessages) {
                                 api.logger.debug(`memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`);
                                 const conversationText = cleanTexts.join("\n");
-                                const finalConversationTurns = buildConversationTurnsForExtraction({
-                                    messageLoopTurns: conversationTurns,
-                                    eligibleTexts,
-                                    newUserTexts: cleanTexts,
-                                    assistantContextForRun,
-                                    assistantContextTexts,
-                                });
+                                // The pair window is the transcript; user turns the noise
+                                // filter dropped stay out of it so they cannot become sources.
+                                const noiseDroppedTexts = new Set(texts.filter((text) => !cleanTexts.includes(text)));
+                                const finalConversationTurns = pairWindowTurns.filter((turn) => !(turn.role === "user" && noiseDroppedTexts.has(turn.text)));
+                                const assistantWindowTexts = finalConversationTurns
+                                    .filter((turn) => turn.role === "assistant")
+                                    .map((turn) => turn.text);
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantContextForRun, conversationTurns: finalConversationTurns });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantWindowTexts, conversationTurns: finalConversationTurns });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
@@ -3253,7 +3264,7 @@ const memoryLanceDBProPlugin = {
                                     // consumed history length there instead, so the next turn
                                     // only sees the delta.
                                     await persistAutoCaptureWatermark(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
-                                    autoCaptureRecentAssistantTexts.delete(sessionKey);
+                                    autoCaptureRecentPairTurns.delete(sessionKey);
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
