@@ -50,6 +50,8 @@ export interface AdmissionControlConfig {
   auditMetadata: boolean;
   persistRejectedAudits: boolean;
   rejectedAuditFilePath?: string;
+  /** Per-call candidate bound for the batched utility judge (1-50, default 10). */
+  batchChunkSize: number;
   /** Absolute override: when set, every admission LLM call uses this model, regardless of lane. */
   model?: string;
   /**
@@ -166,6 +168,7 @@ export const ADMISSION_CONTROL_PRESETS: Record<AdmissionControlPreset, Admission
     auditMetadata: true,
     persistRejectedAudits: true,
     rejectedAuditFilePath: undefined,
+    batchChunkSize: 10,
   },
   conservative: {
     preset: "conservative",
@@ -196,6 +199,7 @@ export const ADMISSION_CONTROL_PRESETS: Record<AdmissionControlPreset, Admission
     auditMetadata: true,
     persistRejectedAudits: true,
     rejectedAuditFilePath: undefined,
+    batchChunkSize: 10,
   },
   "high-recall": {
     preset: "high-recall",
@@ -226,6 +230,7 @@ export const ADMISSION_CONTROL_PRESETS: Record<AdmissionControlPreset, Admission
     auditMetadata: true,
     persistRejectedAudits: true,
     rejectedAuditFilePath: undefined,
+    batchChunkSize: 10,
   },
 };
 
@@ -348,6 +353,10 @@ export function normalizeAdmissionControlConfig(raw: unknown): AdmissionControlC
       ),
     },
     typePriors: normalizeTypePriors(obj.typePriors, base.typePriors),
+    batchChunkSize:
+      obj.batchChunkSize === undefined
+        ? base.batchChunkSize
+        : clampPositiveInt(obj.batchChunkSize, base.batchChunkSize, 50),
     auditMetadata:
       typeof obj.auditMetadata === "boolean"
         ? obj.auditMetadata
@@ -1133,9 +1142,10 @@ export class AdmissionController {
   ): Promise<AdmissionEvaluation[]> {
     if (items.length === 0) return [];
 
+    const chunkSize = this.config.batchChunkSize || BATCH_UTILITY_MAX_SIZE;
     const chunks: (typeof items)[] = [];
-    for (let i = 0; i < items.length; i += BATCH_UTILITY_MAX_SIZE) {
-      chunks.push(items.slice(i, i + BATCH_UTILITY_MAX_SIZE));
+    for (let i = 0; i < items.length; i += chunkSize) {
+      chunks.push(items.slice(i, i + chunkSize));
     }
 
     const results: AdmissionEvaluation[] = [];

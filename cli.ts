@@ -22,6 +22,7 @@ import { createMemoryUpgrader } from "./src/memory-upgrader.js";
 import type { LlmClient } from "./src/llm-client.js";
 import type { MdMirrorWriter } from "./src/tools.js";
 import { runConsolidate, formatConsolidateCostPreview, type ClusterPlanReport } from "./src/consolidate.js";
+import { clampBatchChunkSize } from "./src/memory-categories.js";
 import {
   getDefaultOauthModelForProvider,
   getOAuthProviderLabel,
@@ -2430,6 +2431,7 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
             includeReflectionSlices: options.includeReflectionSlices,
             apply: options.apply === true,
             autoConfirm: options.yes === true,
+            mergeChunkSize: clampBatchChunkSize((context.pluginConfig as Record<string, unknown> | undefined)?.batchChunkSize),
             settledFingerprints: new Set(settledLedger[scope] ?? []),
           },
         );

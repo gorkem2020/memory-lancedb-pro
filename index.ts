@@ -70,6 +70,7 @@ import { buildReflectionMappedMetadata, getReflectionMappedMemoryCategory } from
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.js";
 import { createMemoryCLI } from "./cli.js";
+import { clampBatchChunkSize } from "./src/memory-categories.js";
 import { isNoise } from "./src/noise-filter.js";
 import {
   normalizeAutoCaptureText,
@@ -278,6 +279,8 @@ interface PluginConfig {
     thinkLevel?: string;
   };
   extractMinMessages?: number;
+  /** Per-call chunk bound for every batched pipeline stage (1-50, default 10). */
+  batchChunkSize?: number;
   extractMaxChars?: number;
   scopes?: {
     default?: string;
@@ -2661,6 +2664,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
 
         smartExtractor = new SmartExtractor(store, embedder, llmClient, {
           user: "User",
+          batchChunkSize: config.batchChunkSize,
           extractMinMessages: config.extractMinMessages ?? 4,
           extractMaxChars: config.extractMaxChars ?? 8000,
           defaultScope: config.scopes?.default ?? "global",
@@ -6416,6 +6420,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       })()
       : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+    batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize),
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
     enableManagementTools: cfg.enableManagementTools === true,
@@ -6509,7 +6514,11 @@ export function parsePluginConfig(value: unknown): PluginConfig {
             : undefined,
         }
         : undefined,
-    admissionControl: normalizeAdmissionControlConfig(cfg.admissionControl),
+    admissionControl: normalizeAdmissionControlConfig(
+      cfg.admissionControl && typeof cfg.admissionControl === "object"
+        ? { batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize), ...(cfg.admissionControl as Record<string, unknown>) }
+        : cfg.admissionControl,
+    ),
     memoryCompaction: (() => {
       const raw =
         typeof cfg.memoryCompaction === "object" && cfg.memoryCompaction !== null

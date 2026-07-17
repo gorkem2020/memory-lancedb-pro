@@ -165,6 +165,7 @@ export const CI_TEST_MANIFEST = [
   // Delete/delete-bulk must synchronously invalidate in-process reflection read caches
   { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/memory-id-prefix-resolution.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/batch-chunk-size-knob.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-fallback-gating.test.mjs", args: ["--test"] },
 ];
 

@@ -348,6 +348,8 @@ export interface SmartExtractorConfig {
   user?: string;
   /** Minimum conversation messages before extraction triggers. */
   extractMinMessages?: number;
+  /** Per-call chunk bound for the batched dedup decider and merge writer (1-50, default 10). */
+  batchChunkSize?: number;
   /** Maximum characters of conversation text to process. */
   extractMaxChars?: number;
   /** Default scope for new memories. */
@@ -1654,8 +1656,8 @@ export class SmartExtractor {
     items: Array<{ candidate: CandidateMemory; topSimilar: MemorySearchResult[] }>,
   ): Promise<DedupResult[]> {
     const out: DedupResult[] = new Array(items.length);
-    for (let chunkStart = 0; chunkStart < items.length; chunkStart += DEDUP_BATCH_MAX_SIZE) {
-      const chunk = items.slice(chunkStart, chunkStart + DEDUP_BATCH_MAX_SIZE);
+    for (let chunkStart = 0; chunkStart < items.length; chunkStart += this.batchChunkSize()) {
+      const chunk = items.slice(chunkStart, chunkStart + this.batchChunkSize());
       const sliced = chunk.map((item) => item.topSimilar.slice(0, MAX_SIMILAR_FOR_PROMPT));
       const { system, user } = buildBatchDedupPrompt(
         chunk.map((item, i) => ({
@@ -2070,8 +2072,8 @@ export class SmartExtractor {
   ): Promise<Array<{ abstract: string; overview: string; content: string } | null>> {
     const out: Array<{ abstract: string; overview: string; content: string } | null> =
       new Array(jobs.length).fill(null);
-    for (let chunkStart = 0; chunkStart < jobs.length; chunkStart += MERGE_BATCH_MAX_SIZE) {
-      const chunk = jobs.slice(chunkStart, chunkStart + MERGE_BATCH_MAX_SIZE);
+    for (let chunkStart = 0; chunkStart < jobs.length; chunkStart += this.batchChunkSize()) {
+      const chunk = jobs.slice(chunkStart, chunkStart + this.batchChunkSize());
       const { system, user } = buildBatchMergePrompt(
         chunk.map((job) => ({
           category: job.category,
@@ -2538,6 +2540,14 @@ export class SmartExtractor {
     CandidateMemory,
     (vector: number[]) => StoreEntry
   >();
+
+  /** Per-call chunk bound for the batched dedup decider and merge writer. */
+  private batchChunkSize(): number {
+    const raw = (this.config as { batchChunkSize?: number }).batchChunkSize;
+    return typeof raw === "number" && Number.isFinite(raw) && raw >= 1
+      ? Math.min(50, Math.floor(raw))
+      : DEDUP_BATCH_MAX_SIZE;
+  }
 
   private buildStoreEntry(
     candidate: CandidateMemory,
