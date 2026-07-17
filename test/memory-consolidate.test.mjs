@@ -795,7 +795,11 @@ describe("memory consolidate: orchestration", () => {
           ],
         };
       }
-      return { abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "User orders an oat milk latte, extra hot." };
+      return {
+        results: [
+          { index: 1, abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "User orders an oat milk latte, extra hot." },
+        ],
+      };
     };
 
     const result = await runConsolidate({ ...store, completeJson }, { scope: "global", apply: true, autoConfirm: true, now: ts + 100_000 });
@@ -1260,7 +1264,11 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
               ],
             };
           }
-          return { abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "merged content" };
+          return {
+            results: [
+              { index: 1, abstract: "Coffee order: oat milk latte, extra hot", overview: "", content: "merged content" },
+            ],
+          };
         },
         getLastError: () => null,
       },
@@ -1278,8 +1286,8 @@ describe("memory consolidate: CLI system-prompt wiring", () => {
     assert.match(decide.system, /consolidation decider/i);
     assert.equal(decide.temperature, 0, "the CLI adapter dropped the decider's temperature override");
 
-    const merge = calls.find((c) => c.label === "consolidate-merge");
-    assert.ok(merge, "expected a consolidate-merge completeJson call");
+    const merge = calls.find((c) => c.label === "consolidate-merge-batch");
+    assert.ok(merge, "expected a consolidate-merge-batch completeJson call");
     assert.ok(merge.system, "the CLI adapter dropped the merge writer's system prompt");
     assert.match(merge.system, /merge writer/i);
   });
