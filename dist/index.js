@@ -3852,7 +3852,7 @@ const memoryLanceDBProPlugin = {
                     const MAX_MAPPED_ENTRIES = 100;
                     const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
                     const mappedEntries = [];
-                    // Phase 1: per-row embed + near-duplicate pre-check, collecting the
+                    // Per-row embed + near-duplicate pre-check first, collecting the
                     // gate-eligible rows so the whole burst can share one admission call.
                     const gateEligible = [];
                     for (const mapped of mappedReflectionMemories) {
