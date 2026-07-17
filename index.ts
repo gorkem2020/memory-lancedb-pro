@@ -4886,7 +4886,13 @@ const memoryLanceDBProPlugin = {
         const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
         const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
         let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
-        const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+        const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
+        const sourceAgentId = parsedAgentId || "main";
+        // Ownership written into persisted reflection metadata must never be minted as
+        // "main" when the sessionKey fails to resolve to a real agent, that would silently
+        // misattribute the reflection to (and make it inheritable by) an unrelated agent.
+        // isOwnedByAgent() treats an empty owner as non-inheritable.
+        const ownerAgentId = parsedAgentId || "";
         const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
         if (isSessionBoundaryReflectionAction(action)) {
           const now = Date.now();
@@ -5045,7 +5051,16 @@ const memoryLanceDBProPlugin = {
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
           const targetScope = isSystemBypassId(sourceAgentId)
             ? config.scopes?.default ?? "global"
-            : scopeManager.getDefaultScope(sourceAgentId);
+            : parsedAgentId
+              ? scopeManager.getDefaultScope(sourceAgentId)
+              // A session that never resolved to a real agent must not be routed into
+              // main's default scope: ownerAgentId is already blanked for exactly this
+              // case so the row is not inheritable via isOwnedByAgent(), but a plain
+              // scope-filtered read (list/vectorSearch/etc. with no ownership check)
+              // would still see it if it landed in "agent:main". Route it into a scope
+              // no agent's getAccessibleScopes() ever grants instead, so it stays
+              // findable by an unrestricted/admin read but invisible to every agent.
+              : "unattributed:reflection";
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
@@ -5208,7 +5223,7 @@ const memoryLanceDBProPlugin = {
             const baseMetadata = buildReflectionMappedMetadata({
               mappedItem: mapped,
               eventId: reflectionEventId,
-              agentId: sourceAgentId,
+              agentId: ownerAgentId,
               sessionKey,
               sessionId: currentSessionId || "unknown",
               runAt: nowTs,
@@ -5258,7 +5273,7 @@ const memoryLanceDBProPlugin = {
               reflectionText,
               sessionKey,
               sessionId: currentSessionId || "unknown",
-              agentId: sourceAgentId,
+              agentId: ownerAgentId,
               command: String(event.action || "unknown"),
               scope: targetScope,
               toolErrorSignals,
