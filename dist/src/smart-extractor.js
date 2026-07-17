@@ -6,8 +6,9 @@
  *
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, } from "./extraction-prompts.js";
+import { formatConversationTranscript, } from "./auto-capture-cleanup.js";
 import { AdmissionController, } from "./admission-control.js";
-import { ALWAYS_MERGE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
+import { ALWAYS_MERGE_CATEGORIES, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
 import { isUserMdExclusiveMemory, } from "./workspace-boundary.js";
@@ -169,16 +170,6 @@ const VALID_DECISIONS = new Set([
     "contradict",
     "supersede",
 ]);
-/**
- * Formats one existing-memory candidate for the dedup prompt's numbered
- * list. Continuation lines of a multi-line overview are indented to match
- * the "Overview: " label so its markdown stays nested under this item
- * instead of landing flush-left and visually escaping the list.
- */
-export function formatExistingMemoryForDedupPrompt(index, category, abstract, overview, score) {
-    const indentedOverview = overview.replace(/\n/g, "\n   ");
-    return `${index}. [${category}] ${abstract}\n   Overview: ${indentedOverview}\n   Score: ${score.toFixed(3)}`;
-}
 export class SmartExtractor {
     store;
     embedder;
@@ -243,7 +234,7 @@ export class SmartExtractor {
             : [targetScope];
         const agentId = options.agentId;
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText);
+        const extraction = await this.extractCandidates(conversationText, options.assistantContextTexts, options.conversationTurns);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
@@ -511,20 +502,32 @@ export class SmartExtractor {
     // Step 1: LLM Extraction
     // --------------------------------------------------------------------------
     /**
-     * Call LLM to extract candidate memories from conversation text.
+     * Call LLM to extract candidate memories from conversation text. Assembles
+     * the single interleaved conversation-turns transcript: `conversationTurns`
+     * (oldest-first, real per-message roles) when the caller has them, else a
+     * fallback of one user turn from `conversationText` followed by
+     * `assistantContextTexts` as trailing assistant turns. Assistant turns are
+     * context only -- the extractor must never source a candidate from one
+     * directly (enforced by prompt instruction, not a deterministic gate).
      */
-    async extractCandidates(conversationText) {
+    async extractCandidates(conversationText, assistantContextTexts, conversationTurns) {
         const maxChars = this.config.extractMaxChars ?? 8000;
-        const truncated = conversationText.length > maxChars
-            ? conversationText.slice(-maxChars)
-            : conversationText;
+        const user = this.config.user ?? "User";
         // Strip platform envelope metadata injected by OpenClaw channels
         // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
         // These pollute extraction if treated as conversation content.
-        const cleaned = stripEnvelopeMetadata(truncated);
-        const user = this.config.user ?? "User";
-        const { system, user: userPrompt } = buildExtractionPrompt(cleaned, user);
-        const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
+        const turns = conversationTurns
+            ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
+            : [
+                ...(conversationText
+                    ? [{ role: "user", text: stripEnvelopeMetadata(conversationText) }]
+                    : []),
+                ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant", text })),
+            ];
+        const rawTranscript = formatConversationTranscript(turns, user);
+        const transcript = rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
+        const prompt = buildExtractionPrompt(transcript, user);
+        const result = await this.llm.completeJson(prompt, "extract-candidates");
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");
             return { status: "llm_failure", candidates: [] };
@@ -743,12 +746,12 @@ export class SmartExtractor {
             catch { }
             const abstract = metaObj.l0_abstract || r.entry.text;
             const overview = metaObj.l1_overview || "";
-            return formatExistingMemoryForDedupPrompt(i + 1, metaObj.memory_category || r.entry.category, abstract, overview, r.score);
+            return `${i + 1}. [${metaObj.memory_category || r.entry.category}] ${abstract}\n   Overview: ${overview}\n   Score: ${r.score.toFixed(3)}`;
         })
             .join("\n");
-        const { system, user: userPrompt } = buildDedupPrompt(candidate.abstract, candidate.overview, candidate.content, existingFormatted);
+        const prompt = buildDedupPrompt(candidate.abstract, candidate.overview, candidate.content, existingFormatted);
         try {
-            const data = await this.llm.completeJson(userPrompt, "dedup-decision", system);
+            const data = await this.llm.completeJson(prompt, "dedup-decision");
             if (!data) {
                 this.log("memory-pro: smart-extractor: dedup LLM returned unparseable response, defaulting to CREATE");
                 return { decision: "create", reason: "LLM response unparseable" };
@@ -859,8 +862,8 @@ export class SmartExtractor {
             return;
         }
         // Call LLM to merge
-        const { system, user: userPrompt } = buildMergePrompt(existingAbstract, existingOverview, existingContent, candidate.abstract, candidate.overview, candidate.content, candidate.category);
-        const merged = await this.llm.completeJson(userPrompt, "merge-memory", system);
+        const prompt = buildMergePrompt(existingAbstract, existingOverview, existingContent, candidate.abstract, candidate.overview, candidate.content, candidate.category);
+        const merged = await this.llm.completeJson(prompt, "merge-memory");
         if (!merged) {
             this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
             return;
@@ -1159,17 +1162,23 @@ export class SmartExtractor {
     /**
      * Map 6-category to existing 5-category store type for backward compatibility.
      */
-    /**
-     * Map a smart register onto its legacy storage category, delegating to the
-     * shared SMART_TO_STORAGE_CATEGORY constant (memory-categories) so the
-     * mapping has a single source of truth. Note: "reflection" is a legacy
-     * storage category minted only by the reflection writer and is deliberately
-     * absent from this map; smart extraction never produces reflection rows.
-     * The "other" fallback covers non-union values arriving from untyped
-     * callers at runtime, matching the old switch's default arm.
-     */
     mapToStoreCategory(category) {
-        return getStorageCategoryForMemoryCategory(category) ?? "other";
+        switch (category) {
+            case "profile":
+                return "fact";
+            case "preferences":
+                return "preference";
+            case "entities":
+                return "entity";
+            case "events":
+                return "decision";
+            case "cases":
+                return "fact";
+            case "patterns":
+                return "other";
+            default:
+                return "other";
+        }
     }
     /**
      * Get default importance score by category.

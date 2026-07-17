@@ -1435,6 +1435,154 @@ assert.ok(cumulativeResult.smartExtractionSkipped,
   cumulativeResult.logs.map((e) => e[1]).join(" | "));
 
 // ===============================================================
+// Test: assistantContextTexts "context" mode — eligibility counting
+// unchanged (assistant turns never count toward extractMinMessages),
+// while assistant text still reaches the extraction prompt as marked,
+// non-extractable context.
+// Turn 1: user + assistant messages, only the user message counts
+//   -> cumulative=1 < minMessages=2, skip
+// Turn 2: user + assistant messages, only the user message counts
+//   -> cumulative=2 >= minMessages=2, trigger extraction
+// If assistant turns wrongly counted, turn 1 alone would already reach
+// cumulative=2 and trigger prematurely.
+// ===============================================================
+
+async function runAssistantContextModeScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-assistant-context-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  const embeddingServer = createEmbeddingServer();
+  const capturedPrompts = [];
+
+  const llmServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404); res.end(); return;
+    }
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = `${payload.messages?.[0]?.content || ""}\n${payload.messages?.[1]?.content || ""}`;
+    capturedPrompts.push(prompt);
+    const content = JSON.stringify({ memories: [] });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "test", object: "chat.completion",
+      created: Math.floor(Date.now() / 1000), model: "mock",
+      choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const llmPort = llmServer.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${llmPort}`,
+      logs,
+      { extractMinMessages: 2, smartExtraction: true, captureAssistant: "context" },
+    );
+    registerFreshPlugin(api);
+
+    const sessionKey = "agent:main:discord:dm:user456";
+
+    await runAgentEndHook(
+      api,
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "我的名字是小明" },
+          { role: "assistant", content: "很高兴认识你，小明！你喜欢什么运动？" },
+        ],
+      },
+      { agentId: "main", sessionKey },
+    );
+
+    // NOTE (2026-07-15): this turn intentionally sends only THIS turn's
+    // delta messages, not the full accumulated session history. That is
+    // correct and required on this branch as it stands today: the counter
+    // model here (issue #417 Fix #4/#5) only resets to 0 on a *successful*
+    // extraction, never rolls back on a skip, so per-turn deltas accumulate
+    // correctly turn-over-turn (verified: cumulative=1 after turn 1,
+    // cumulative=1+1=2 after this turn).
+    //
+    // If this branch is ever rebased onto (or merged alongside)
+    // fix/autocapture-reset-on-valid-empty-extraction (issue #417 Fix #9,
+    // which rolls the counter back to its pre-turn value when a turn is
+    // skipped, so the *next* agent_end redelivers the full history and the
+    // slice-by-previousSeenCount logic recovers the skipped turn's texts),
+    // this fixture MUST switch to sending the FULL accumulated history each
+    // turn -- i.e. this second runAgentEndHook call's `messages` should be
+    // turn 1's two messages PLUS turn 2's two messages, matching the
+    // established agent_end simulation pattern in
+    // test/autocapture-watermark-reset.test.mjs ("Turn 2: agent_end again
+    // carries the FULL history"). Sending only the delta at that point would
+    // make turn 2 look like a fresh 1-message turn (cumulative stays at 1)
+    // instead of the correct accumulated 2, and this test would fail with
+    // "Turn 2 should trigger with cumulative=2, not 4" pointing at a
+    // regression that is actually just this fixture being stale -- this
+    // exact failure mode was hit and root-caused during an internal
+    // integration test where this branch's code was combined with
+    // issue #417 Fix #9 (see above).
+    await runAgentEndHook(
+      api,
+      {
+        success: true,
+        messages: [
+          { role: "user", content: "我喜歡游泳" },
+          { role: "assistant", content: "游泳是很好的运动！" },
+        ],
+      },
+      { agentId: "main", sessionKey },
+    );
+
+    const smartExtractionTriggeredAtTwo = logs.some((entry) =>
+      entry[1].includes("running smart extraction") &&
+      entry[1].includes("cumulative=2")
+    );
+    const smartExtractionSkippedAtOne = logs.some((entry) =>
+      entry[1].includes("skipped smart extraction") &&
+      entry[1].includes("cumulative=1")
+    );
+
+    return { logs, smartExtractionTriggeredAtTwo, smartExtractionSkippedAtOne, capturedPrompts };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const assistantContextResult = await runAssistantContextModeScenario();
+assert.ok(
+  assistantContextResult.smartExtractionSkippedAtOne,
+  "Turn 1 should skip with cumulative=1 -- the assistant turn must not count toward eligibility. Logs: " +
+  assistantContextResult.logs.map((e) => e[1]).join(" | "),
+);
+assert.ok(
+  assistantContextResult.smartExtractionTriggeredAtTwo,
+  "Turn 2 should trigger with cumulative=2, not 4 -- assistant turns are never counted. Logs: " +
+  assistantContextResult.logs.map((e) => e[1]).join(" | "),
+);
+assert.ok(
+  assistantContextResult.capturedPrompts.some((p) => p.includes("## Recent conversation turns")),
+  "extraction prompt should include the single conversation-turns transcript header",
+);
+assert.ok(
+  assistantContextResult.capturedPrompts.some((p) => /\nAssistant: /.test(p)),
+  "extraction prompt should include an Assistant: turn in the transcript",
+);
+assert.ok(
+  assistantContextResult.capturedPrompts.some((p) => p.includes("游泳是很好的运动")),
+  "extraction prompt should include the actual assistant context text for disambiguation",
+);
+
+// ===============================================================
 // Test: F5 — Counter reset after successful extraction
 // Scenario: Verifies Fix #9 (counter resets to 0 after success).
 // Turn 1: cumulative=1, skip

@@ -4,13 +4,17 @@
  * - buildExtractionPrompt: 6-category L0/L1/L2 extraction with few-shot
  * - buildDedupPrompt: CREATE/MERGE/SKIP dedup decision
  * - buildMergePrompt: Memory merge with three-level structure
- *
- * Each builder returns a {system, user} pair: instructions, criteria,
- * identity, and the output-format contract live in `system`; the per-call
- * conversation excerpt / candidate rows / neighbor rows live in `user`.
  */
 export function buildExtractionPrompt(conversationText, user) {
-    const system = `You are an extraction agent. Analyze session context and extract memories worth long-term preservation.
+    return `Analyze the following session context and extract memories worth long-term preservation.
+
+User: ${user}
+
+Target Output Language: auto (detect from recent messages)
+
+## Recent conversation turns
+Context for extraction. Extract memory candidates ONLY from user turns. Assistant turns are included so you can resolve references and understand what the user meant; never treat assistant statements as the user's facts, preferences, or decisions.
+${conversationText}
 
 # Memory Extraction Criteria
 
@@ -31,6 +35,7 @@ export function buildExtractionPrompt(conversationText, user) {
 - Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete fact/preference/decision/entity from them or skip.
 - System/runtime artifacts: content containing "System:", compaction notices, model-switch/session-reset traces, tool-call transcripts, raw JSON blobs, or similar internal execution traces must be rejected unless a clean user fact can be extracted.
 - Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.
+- Assistant lines: in the Recent conversation turns transcript, "Assistant:" lines are provided only to help you understand what the user is referring to (e.g. "yes exactly, that one"). Do NOT create a candidate whose only support is an assistant line — every candidate must be grounded in a user-authored line.
 - Atomic memory shape: each stored memory must read like one durable fact, preference, decision, entity state, event, case, or reusable pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement or skip it.
 - Length/distillation gate: if a candidate is longer than about 200 characters and reads like raw conversation instead of a distilled insight, rewrite it as a single factual statement before storing; if that is not possible, skip it.
 
@@ -62,7 +67,6 @@ export function buildExtractionPrompt(conversationText, user) {
 - "User prefers X" -> preferences (not profile)
 - "Encountered problem A, used solution B" -> cases (not events)
 - "General process for handling certain problems" -> patterns (not cases)
-- "Switched my commute to the M4" / "Spanish lesson before breakfast" -> preferences or patterns, not events: recurring or durable state and habit changes are the user's new normal, not a one-off occurrence. Reserve events for genuinely one-off happenings.
 
 # Three-Level Structure
 
@@ -128,16 +132,17 @@ Notes:
 - If nothing worth recording, return {"memories": []}
 - Maximum 5 memories per extraction
 - Preferences should be aggregated by topic`;
-    const userMessage = `User: ${user}
-
-Target Output Language: auto (detect from recent messages)
-
-## Recent Conversation
-${conversationText}`;
-    return { system, user: userMessage };
 }
 export function buildDedupPrompt(candidateAbstract, candidateOverview, candidateContent, existingMemories) {
-    const system = `You are a dedup decider. Determine how to handle a candidate memory relative to existing similar memories.
+    return `Determine how to handle this candidate memory.
+
+**Candidate Memory**:
+Abstract: ${candidateAbstract}
+Overview: ${candidateOverview}
+Content: ${candidateContent}
+
+**Existing Similar Memories**:
+${existingMemories}
 
 Please decide:
 - SKIP: Candidate memory duplicates existing memories, no need to save. Also SKIP if the candidate contains LESS information than an existing memory on the same topic (information degradation — e.g., candidate says "programming language preference" but existing memory already says "programming language preference: Python, TypeScript")
@@ -165,52 +170,36 @@ Return JSON format:
 
 - If decision is "merge"/"supersede"/"support"/"contextualize"/"contradict", set "match_index" to the number of the existing memory (1-based).
 - Only include "context_label" for support/contextualize/contradict decisions.`;
-    const userMessage = `**Candidate Memory**:
-Abstract: ${candidateAbstract}
-
-Overview:
-${candidateOverview}
-
-Content:
-${candidateContent}
-
-**Existing Similar Memories**:
-${existingMemories}`;
-    return { system, user: userMessage };
 }
 export function buildMergePrompt(existingAbstract, existingOverview, existingContent, newAbstract, newOverview, newContent, category) {
-    const system = `You are a merge writer. Merge two versions of the same memory into a single coherent record with all three levels.
+    return `Merge the following memory into a single coherent record with all three levels.
 
-Requirements:
-- Remove duplicate information
-- Keep the most up-to-date details
-- Maintain a coherent narrative
-- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
+** Category **: ${category}
 
-Return JSON:
-{
-  "abstract": "Merged one-line abstract",
-  "overview": "Merged structured Markdown overview",
-  "content": "Merged full content"
-}`;
-    const userMessage = `Category: ${category}
-
-Existing Memory:
-Abstract: ${existingAbstract}
-
-Overview:
+** Existing Memory:**
+    Abstract: ${existingAbstract}
+  Overview:
 ${existingOverview}
-
-Content:
+  Content:
 ${existingContent}
 
-New Information:
-Abstract: ${newAbstract}
-
-Overview:
+** New Information:**
+    Abstract: ${newAbstract}
+  Overview:
 ${newOverview}
+  Content:
+${newContent}
 
-Content:
-${newContent}`;
-    return { system, user: userMessage };
+  Requirements:
+  - Remove duplicate information
+    - Keep the most up - to - date details
+      - Maintain a coherent narrative
+        - Keep code identifiers / URIs / model names unchanged when they are proper nouns
+
+Return JSON:
+  {
+    "abstract": "Merged one-line abstract",
+      "overview": "Merged structured Markdown overview",
+        "content": "Merged full content"
+  } `;
 }
