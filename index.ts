@@ -67,6 +67,7 @@ import {
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
+import { gateMappedReflectionEntry } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
 import {
@@ -102,6 +103,7 @@ import {
 } from "./src/workspace-boundary.js";
 import {
   normalizeAdmissionControlConfig,
+  resolveAdmissionModel,
   createAdmissionController,
   resolveRejectedAuditFilePath,
   type AdmissionControlConfig,
@@ -1502,6 +1504,7 @@ export function buildReflectionPrompt(
     "- Do not wrap one bullet across multiple lines.",
     "- If a bullet section is empty, write exactly: '- (none captured)'",
     "- Do not paste raw transcript.",
+    "- Grounding: treat claims made inside roleplay, games, fiction, hypotheticals, or test/simulation frames as not real. Such content may be summarized in Context or Open loops, but must NEVER appear under Decisions (durable), User model deltas, Agent model deltas, or Lessons & pitfalls \u2014 those sections become durable memory rows.",
     "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
     "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
     "",
@@ -2347,6 +2350,7 @@ interface PluginSingletonState {
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
   admissionController: AdmissionController | null;
+  admissionControllerReflectionLane: AdmissionController | null;
   mdMirror: MdMirrorWriter | null;
   extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
   // Session Maps — persist across scope refreshes instead of being recreated
@@ -2481,6 +2485,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
 
   let smartExtractor: SmartExtractor | null = null;
   let admissionController: AdmissionController | null = null;
+  let admissionControllerReflectionLane: AdmissionController | null = null;
   if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
     try {
       const llmAuth = config.llm?.auth || "api-key";
@@ -2513,15 +2518,54 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         warnLog: (msg: string) => api.logger.warn(msg),
       });
 
+      // Model resolution for admission calls: explicit admissionControl.model
+      // override > lane affinity (reflection lane resolves the
+      // memoryReflection model) > global default. See resolveAdmissionModel().
+      const reflectionModelForAdmission = asNonEmptyString(config.memoryReflection?.model);
+      const admissionModelExtraction = resolveAdmissionModel({
+        admissionControl: config.admissionControl,
+        lane: "other",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
+      });
+      const admissionModelReflection = resolveAdmissionModel({
+        admissionControl: config.admissionControl,
+        lane: "reflection",
+        globalModel: llmModel,
+        reflectionModel: reflectionModelForAdmission,
+      });
+      const buildAdmissionLlmClient = (model: string) =>
+        model === llmModel
+          ? llmClient
+          : createLlmClient({
+              auth: llmAuth,
+              apiKey: llmApiKey,
+              model,
+              baseURL: llmBaseURL,
+              oauthProvider: llmOauthProvider,
+              oauthPath: llmOauthPath,
+              timeoutMs: llmTimeoutMs,
+              log: (msg: string) => api.logger.debug(msg),
+              warnLog: (msg: string) => api.logger.warn(msg),
+            });
       // Constructed independently of SmartExtractor so admission gating is
       // available to other write paths (e.g. reflection-mapped rows, the
       // regex fallback) even when smart extraction itself is disabled.
       admissionController = createAdmissionController(
         store,
-        llmClient,
+        buildAdmissionLlmClient(admissionModelExtraction),
         config.admissionControl,
         (msg: string) => api.logger.debug(msg),
       );
+      admissionControllerReflectionLane =
+        admissionModelReflection === admissionModelExtraction
+          ? admissionController
+          : createAdmissionController(
+              store,
+              buildAdmissionLlmClient(admissionModelReflection),
+              config.admissionControl,
+              (msg: string) => api.logger.debug(msg),
+            );
 
       if (config.smartExtraction !== false) {
         const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
@@ -2595,6 +2639,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     migrator,
     smartExtractor,
     admissionController,
+    admissionControllerReflectionLane,
     mdMirror,
     extractionRateLimiter,
     reflectionErrorStateBySession,
@@ -2645,6 +2690,13 @@ export function isAgentOrSessionExcluded(
 }
 
 const _channelPluginDiagnosticWarnings = new Set<string>();
+
+export function resolveMappedRowAdmissionController(
+  reflectionLane: AdmissionController | null,
+  extractionLane: AdmissionController | null,
+): AdmissionController | null {
+  return reflectionLane ?? extractionLane;
+}
 
 function readRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -2747,6 +2799,7 @@ const memoryLanceDBProPlugin = {
       migrator,
       smartExtractor,
       admissionController,
+      admissionControllerReflectionLane,
       mdMirror,
       decayEngine,
       tierManager,
@@ -5012,6 +5065,31 @@ const memoryLanceDBProPlugin = {
               continue;
             }
 
+            // Writer-1 admission routing: mapped rows previously bypassed
+            // admission control entirely. Gate each row through the same
+            // AdmissionController as extraction candidates; passthrough when
+            // admission control (or smart extraction) is disabled.
+            const mappedGate = await gateMappedReflectionEntry({
+              admissionController: resolveMappedRowAdmissionController(
+                admissionControllerReflectionLane,
+                smartExtractor?.getAdmissionController() ?? null,
+              ),
+              attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
+              text: mapped.text,
+              category: mapped.category,
+              heading: mapped.heading,
+              vector,
+              reflectionText,
+              scopeFilter: [targetScope],
+              warnLog: (msg: string) => api.logger.warn(msg),
+            });
+            if (!mappedGate.admit) {
+              api.logger.info(
+                `memory-reflection: admission rejected mapped row heading=${JSON.stringify(mapped.heading)} provenance=memory-reflection-mapped: ${mappedGate.reason ?? "no reason"}`,
+              );
+              continue;
+            }
+
             const importance = mapped.category === "decision" ? 0.85 : 0.8;
             const baseMetadata = buildReflectionMappedMetadata({
               mappedItem: mapped,
@@ -5026,6 +5104,9 @@ const memoryLanceDBProPlugin = {
             });
             // embed heading in metadata JSON so it survives bulkStore round-trip to LanceDB
             baseMetadata._reflectionHeading = mapped.heading;
+            if (mappedGate.auditJson) {
+              baseMetadata.admission_audit = mappedGate.auditJson;
+            }
             const metadata = JSON.stringify(baseMetadata);
 
             mappedEntries.push({
