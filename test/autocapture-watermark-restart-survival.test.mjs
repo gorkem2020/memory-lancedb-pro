@@ -231,7 +231,7 @@ describe("auto-capture watermark survives a simulated process restart", () => {
 
   it("an ingress-fed, delta-only session resumes counting from where it left off after a restart and fires once cumulative crosses minMessages", async () => {
     const pluginConfig = buildPluginConfig({ workspaceDir, embeddingPort, llmPort, extractMinMessages: 2 });
-    const ctx = { sessionKey: "agent:terry:webchat", agentId: "terry", channelId: "webchat" };
+    const ctx = { sessionKey: "agent:agent-one:webchat", agentId: "agent-one", channelId: "webchat" };
 
     // --- "process 1" ---
     const harness1 = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig });
@@ -277,7 +277,7 @@ describe("auto-capture watermark survives a simulated process restart", () => {
 
   it("a history-carrying session's slice cursor survives a restart without re-extracting already-consumed history", async () => {
     const pluginConfig = buildPluginConfig({ workspaceDir, embeddingPort, llmPort, extractMinMessages: 4 });
-    const ctx = { sessionKey: "agent:dave:main", agentId: "dave" };
+    const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
 
     const TURN_1_TEXTS = [
       "I keep my synthetic dotfiles in a bare repository named quartz.",
@@ -361,7 +361,7 @@ describe("auto-capture watermark rollback-on-skip (pinned so restart-survivabili
     const embeddingPort = embeddingServer.address().port;
     const llmPort = llmServer.address().port;
     const pluginConfig = buildPluginConfig({ workspaceDir, embeddingPort, llmPort, extractMinMessages: 6 });
-    const ctx = { sessionKey: "agent:dave:main", agentId: "dave" };
+    const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
 
     const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig });
     memoryLanceDBProPlugin.register(harness.api);

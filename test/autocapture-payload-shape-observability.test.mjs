@@ -208,7 +208,7 @@ describe("auto-capture payload-shape INFO line", () => {
 
   it("logs one INFO line on the first turn with messages/eligible/previousSeen/cumulative/fired, then stays silent on later turns in the same process", async () => {
     const pluginConfig = buildPluginConfig(4);
-    const ctx = { sessionKey: "agent:terry:webchat", agentId: "terry" };
+    const ctx = { sessionKey: "agent:agent-one:webchat", agentId: "agent-one" };
     const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig });
     memoryLanceDBProPlugin.register(harness.api);
     const hook = getAutoCaptureHook(harness.eventHandlers);
@@ -239,18 +239,18 @@ describe("auto-capture payload-shape INFO line", () => {
     memoryLanceDBProPlugin.register(harness.api);
     const hook = getAutoCaptureHook(harness.eventHandlers);
 
-    await fireAgentEnd(hook, userMessages("alpha turn content"), { sessionKey: "agent:terry:webchat", agentId: "terry" });
-    await fireAgentEnd(hook, userMessages("zulu turn content"), { sessionKey: "agent:dave:main", agentId: "dave" });
+    await fireAgentEnd(hook, userMessages("alpha turn content"), { sessionKey: "agent:agent-one:webchat", agentId: "agent-one" });
+    await fireAgentEnd(hook, userMessages("zulu turn content"), { sessionKey: "agent:agent-two:main", agentId: "agent-two" });
 
     const lines = payloadShapeLines(harness.logs);
     assert.equal(lines.length, 2, "each distinct session gets its own first-turn payload-shape line");
-    assert.ok(lines.some((l) => l.includes("agent:terry:webchat")));
-    assert.ok(lines.some((l) => l.includes("agent:dave:main")));
+    assert.ok(lines.some((l) => l.includes("agent:agent-one:webchat")));
+    assert.ok(lines.some((l) => l.includes("agent:agent-two:main")));
   });
 
   it("logs again after a simulated restart (rate limit is per-process, not persisted)", async () => {
     const pluginConfig = buildPluginConfig(4);
-    const ctx = { sessionKey: "agent:terry:webchat", agentId: "terry" };
+    const ctx = { sessionKey: "agent:agent-one:webchat", agentId: "agent-one" };
 
     const harness1 = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig });
     memoryLanceDBProPlugin.register(harness1.api);
@@ -273,7 +273,7 @@ describe("auto-capture payload-shape INFO line", () => {
 
   it("reports fired=yes once cumulative reaches minMessages", async () => {
     const pluginConfig = buildPluginConfig(2);
-    const ctx = { sessionKey: "agent:dave:main", agentId: "dave" };
+    const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
     const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig });
     memoryLanceDBProPlugin.register(harness.api);
     const hook = getAutoCaptureHook(harness.eventHandlers);

@@ -60,14 +60,14 @@ describe("auto-capture watermark persistence", () => {
 
   it("round-trips a saved map through load", async () => {
     const original = new Map([
-      ["agent:terry:webchat", 1],
-      ["agent:dave:main", 4],
+      ["agent:agent-one:webchat", 1],
+      ["agent:agent-two:main", 4],
     ]);
     await saveAutoCaptureWatermarks(dbPath, original);
     const reloaded = loadAutoCaptureWatermarks(dbPath);
     assert.equal(reloaded.size, 2);
-    assert.equal(reloaded.get("agent:terry:webchat"), 1);
-    assert.equal(reloaded.get("agent:dave:main"), 4);
+    assert.equal(reloaded.get("agent:agent-one:webchat"), 1);
+    assert.equal(reloaded.get("agent:agent-two:main"), 4);
   });
 
   it("writes the watermark file next to the LanceDB dir, not inside it (matches the compaction-state.json convention)", async () => {
