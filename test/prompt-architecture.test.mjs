@@ -31,7 +31,7 @@ const jiti = jitiFactory(import.meta.url, {
     "openclaw/plugin-sdk": pluginSdkStubPath,
   },
 });
-const { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt } = jiti(
+const { buildExtractionPrompt, buildDedupPrompt, buildBatchDedupPrompt, buildMergePrompt } = jiti(
   "../src/extraction-prompts.ts",
 );
 const { createLlmClient } = jiti("../src/llm-client.ts");
@@ -92,6 +92,27 @@ describe("buildDedupPrompt system/user split", () => {
     assert.match(system, /\bMERGE\b/);
     assert.match(system, /\bSUPERSEDE\b/);
     assert.match(system, /context_label/);
+  });
+
+  // Live-fleet trace (terry, 2026-07-18): the judge invented a category wall
+  // ("existing similar memories are patterns, not preferences -> CREATE").
+  // Every category mention in the prompt is a restriction (events/cases
+  // verdict gate, preferences/entities supersede scoping), so the model
+  // generalized "category = wall". The doctrine bullet states the anti-rule.
+  it("system teaches that categories alone do not wall off verdicts", () => {
+    assert.match(system, /Category labels NEVER decide the verdict/);
+    assert.match(system, /judge the CONTENT/);
+  });
+
+  it("the batch dedup builder carries the same category doctrine", () => {
+    const batch = buildBatchDedupPrompt([
+      {
+        candidate: { category: "preferences", abstract: abstractMarker, overview: "o", content: "c" },
+        existingMemories: "1. [patterns] existing meta-rule (similarity: 0.74)",
+      },
+    ]);
+    assert.match(batch.system, /Category labels NEVER decide the verdict/);
+    assert.match(batch.system, /judge the CONTENT/);
   });
 
   it("user carries only the candidate and existing-memory data", () => {

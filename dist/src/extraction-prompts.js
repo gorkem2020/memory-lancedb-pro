@@ -259,7 +259,7 @@ Please decide:
 
 IMPORTANT:
 - "events" and "cases" categories are independent records — they do NOT support MERGE/SUPERSEDE/SUPPORT/CONTEXTUALIZE/CONTRADICT. For these categories, only use SKIP or CREATE.
-- Category labels NEVER decide the verdict by themselves. Outside the events/cases rule above, a candidate and an existing memory in DIFFERENT categories (profile, preferences, entities, patterns) can still describe the same fact — judge the CONTENT. If an existing memory in another category already covers the candidate with equal or more detail, SKIP; if the candidate replaces that fact's current truth, SUPERSEDE it. Never give "different category" or "no existing memory in this category" as the reason for CREATE.
+- Category labels NEVER decide the verdict by themselves. Outside the events/cases rule above, a candidate and an existing memory in DIFFERENT categories (profile, preferences, entities, patterns) can still describe the same fact — judge the CONTENT. If an existing memory in another category already covers the candidate with equal or more detail, SKIP; if the candidate replaces that fact's current truth, SUPERSEDE it.
 - If the candidate appears to be derived from a recall question (e.g., "Do you remember X?" / "你记得X吗？") and an existing memory already covers topic X with equal or more detail, you MUST choose SKIP.
 - A candidate with less information than an existing memory on the same topic should NEVER be CREATED or MERGED — always SKIP.
 - For "preferences" and "entities", use SUPERSEDE when the candidate replaces the current truth instead of adding detail or context. Example: existing "Preferred editor: VS Code", candidate "Preferred editor: Zed".
@@ -330,7 +330,7 @@ For each candidate, decide:
 
 IMPORTANT:
 - "events" and "cases" categories are independent records — they do NOT support MERGE/SUPERSEDE/SUPPORT/CONTEXTUALIZE/CONTRADICT. For these categories, only use SKIP or CREATE.
-- Category labels NEVER decide the verdict by themselves. Outside the events/cases rule above, a candidate and an existing memory in DIFFERENT categories (profile, preferences, entities, patterns) can still describe the same fact — judge the CONTENT. If an existing memory in another category already covers the candidate with equal or more detail, SKIP; if the candidate replaces that fact's current truth, SUPERSEDE it. Never give "different category" or "no existing memory in this category" as the reason for CREATE.
+- Category labels NEVER decide the verdict by themselves. Outside the events/cases rule above, a candidate and an existing memory in DIFFERENT categories (profile, preferences, entities, patterns) can still describe the same fact — judge the CONTENT. If an existing memory in another category already covers the candidate with equal or more detail, SKIP; if the candidate replaces that fact's current truth, SUPERSEDE it.
 - If the candidate appears to be derived from a recall question (e.g., "Do you remember X?" / "你记得X吗？") and an existing memory already covers topic X with equal or more detail, you MUST choose SKIP.
 - A candidate with less information than an existing memory on the same topic should NEVER be CREATED or MERGED — always SKIP.
 - For "preferences" and "entities", use SUPERSEDE when the candidate replaces the current truth instead of adding detail or context. Example: existing "Preferred editor: VS Code", candidate "Preferred editor: Zed".
