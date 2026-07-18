@@ -435,7 +435,7 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
 
   it("system carries the distiller identity and every heading/rule/template instruction", () => {
     const { system } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, []);
-    assert.match(system, /You are generating a durable MEMORY REFLECTION entry/i);
+    assert.match(system, /You are a memory reflection distiller agent/i);
     assert.match(system, /## Context \(session background\)/);
     assert.match(system, /## Derived/);
     assert.match(system, /Hard rules:/);
@@ -446,7 +446,7 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
 
   it("user carries only the per-call payload (tool error signals + the conversation input), no identity or instruction duplication", () => {
     const { user } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, []);
-    assert.doesNotMatch(user, /You are generating a durable MEMORY REFLECTION entry/i);
+    assert.doesNotMatch(user, /You are a memory reflection distiller agent/i);
     assert.doesNotMatch(user, /Hard rules:/);
     assert.doesNotMatch(user, /OUTPUT TEMPLATE/);
     assert.match(user, /Recent tool error signals:/);
@@ -471,5 +471,56 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
     const joined = `${system}\n\n${user}`;
     assert.match(joined, /- This run showed \.\.\.\n\nRecent tool error signals:\n1\. \[bash\] flaky retry/);
     assert.match(joined, /INPUT:\n```\nuser: hello\nassistant: hi\n```$/);
+  });
+});
+
+// ============================================================================
+// Identity-first openers + transcript fencing + assistant-line policy
+// (operator rules, 2026-07-18)
+// ============================================================================
+
+describe("identity-first prompt openers", () => {
+  const openers = {
+    extraction: buildExtractionPrompt("transcript", "User").system,
+    dedup: buildDedupPrompt(
+      { category: "preferences", abstract: "a", overview: "o", content: "c" },
+      "existing",
+    ).system,
+    batchDedup: buildBatchDedupPrompt([
+      {
+        candidate: { category: "preferences", abstract: "a", overview: "o", content: "c" },
+        existingMemories: "",
+      },
+    ]).system,
+    distiller: buildReflectionPromptParts("user: hi", 4000).system,
+  };
+
+  it("all open with a 'You are ...' identity sentence", () => {
+    for (const [name, system] of Object.entries(openers)) {
+      assert.match(system, /^You are (a|an) /, `${name} must open with an identity sentence`);
+    }
+  });
+
+  it("the distiller identifies itself as a memory reflection distiller agent", () => {
+    assert.match(openers.distiller, /^You are a memory reflection distiller agent\./);
+  });
+});
+
+describe("extraction transcript block and assistant-line policy", () => {
+  it("fences the recent conversation block like the distiller's INPUT block", () => {
+    const { user } = buildExtractionPrompt("User: hi\nAssistant: hello", "User");
+    assert.match(user, /## Recent Conversation\n```\nUser: hi\nAssistant: hello\n```/);
+  });
+
+  it("defaults assistant lines to context-only grounding", () => {
+    const { system } = buildExtractionPrompt("t", "User");
+    assert.match(system, /provided only to help you understand/);
+    assert.doesNotMatch(system, /eligible sources in this configuration/);
+  });
+
+  it("flips the assistant-line rule when assistant turns are capture-eligible", () => {
+    const { system } = buildExtractionPrompt("t", "User", { assistantEligible: true });
+    assert.match(system, /eligible sources in this configuration/);
+    assert.doesNotMatch(system, /provided only to help you understand/);
   });
 });

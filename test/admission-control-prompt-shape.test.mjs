@@ -444,7 +444,7 @@ describe("batched prompt slot conformance (system = static, user = per-call data
         "The memory system stores six categories:",
         "Score each candidate's future usefulness independently",
         "--- EXAMPLE (not your current batch) ---",
-        "Return JSON only, with exactly one entry per candidate",
+        "Return JSON only (the raw object, no markdown code fences), with exactly one entry per candidate",
       ],
       userOpener: "## Candidates",
     });
@@ -462,7 +462,7 @@ describe("batched prompt slot conformance (system = static, user = per-call data
         "The memory system stores six categories:",
         "- SKIP: Candidate memory duplicates existing memories",
         "IMPORTANT:",
-        "Return JSON only, with exactly one entry per candidate",
+        "Return JSON only (the raw object, no markdown code fences), with exactly one entry per candidate",
       ],
       userOpener: "## Candidates",
     });
@@ -484,7 +484,7 @@ describe("batched prompt slot conformance (system = static, user = per-call data
         "You are a memory merge writer.",
         "The memory system stores six categories:",
         "Requirements:",
-        "Return JSON only, with exactly one entry per job",
+        "Return JSON only (the raw object, no markdown code fences), with exactly one entry per job",
       ],
       userOpener: "## Merge jobs",
     });

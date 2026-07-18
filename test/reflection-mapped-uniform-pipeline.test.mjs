@@ -213,3 +213,71 @@ describe("reflection mapped rows: uniform dedup -> merge pipeline", () => {
     assert.equal(createdEntries.length, 1);
   });
 });
+
+describe("lane-affinity llm override", () => {
+  it("routes the dedup decider and merge writer through options.llmOverride, never the extractor's base llm", async () => {
+    const neighbor = neighborRow("row-000001", "Existing pattern about tea");
+    const store = makeStore({ neighbors: [neighbor] });
+    const baseCalls = [];
+    const laneCalls = [];
+    const baseLlm = {
+      async completeJson(_p, label) {
+        baseCalls.push(label);
+        return null;
+      },
+    };
+    const laneLlm = {
+      async completeJson(_p, label) {
+        laneCalls.push(label);
+        if (label === "dedup-decision-batch") {
+          return { results: [{ index: 1, decision: "merge", match_index: 1, reason: "same fact" }] };
+        }
+        if (label === "merge-memory-batch") {
+          return { results: [{ index: 1, abstract: "merged", overview: "o", content: "c" }] };
+        }
+        return null;
+      },
+    };
+    const extractor = new SmartExtractor(store, makeEmbedder(), baseLlm, {
+      user: "User",
+      extractMinMessages: 1,
+      extractMaxChars: 8000,
+      defaultScope: "agent:probe",
+      log() {},
+      debugLog() {},
+    });
+    const candidate = {
+      category: "patterns",
+      abstract: "Existing pattern about tea, restated with the same meaning",
+      overview: "## Pattern",
+      content: "restated tea pattern",
+    };
+    const result = await extractor.persistGatedCandidates(
+      [
+        {
+          candidate,
+          vector: vectorFor(candidate.abstract),
+          buildEntry: (vector) => ({
+            text: candidate.abstract,
+            vector,
+            category: "reflection",
+            scope: "agent:probe",
+            importance: 0.8,
+            timestamp: 1_700_000_400_000,
+            metadata: JSON.stringify({
+              memory_category: "patterns",
+              l0_abstract: candidate.abstract,
+              l1_overview: candidate.overview,
+              l2_content: candidate.content,
+            }),
+          }),
+        },
+      ],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], llmOverride: laneLlm },
+    );
+    assert.equal(result.stats.merged, 1, "the merge verdict must apply through the override client");
+    assert.ok(laneCalls.includes("dedup-decision-batch"));
+    assert.ok(laneCalls.includes("merge-memory-batch"));
+    assert.deepEqual(baseCalls, [], "base llm must stay untouched when a lane override is provided");
+  });
+});

@@ -350,6 +350,8 @@ export interface SmartExtractorConfig {
   extractMinMessages?: number;
   /** Per-call chunk bound for the batched dedup decider and merge writer (1-50, default 10). */
   batchChunkSize?: number;
+  /** Mirrors captureAssistant === true: the extraction prompt then treats assistant lines as eligible grounding sources instead of context-only. */
+  captureAssistantEligible?: boolean;
   /** Maximum characters of conversation text to process. */
   extractMaxChars?: number;
   /** Default scope for new memories. */
@@ -817,6 +819,8 @@ export class SmartExtractor {
       scopeFilter?: string[];
       agentId?: string;
       conversationText?: string;
+      /** Lane-affinity client for the dedup decider and merge writer; falls back to the extractor's own llm. */
+      llmOverride?: LlmClient;
     },
   ): Promise<{ stats: ExtractionStats; createdEntries: import("./store.js").MemoryEntry[] }> {
     const stats: ExtractionStats = { created: 0, merged: 0, skipped: 0, boundarySkipped: 0 };
@@ -824,6 +828,7 @@ export class SmartExtractor {
     const targetScope = options.targetScope;
     const scopeFilter = options.scopeFilter ?? [targetScope];
     const conversationText = options.conversationText ?? "";
+    const llm = options.llmOverride ?? this.llm;
 
     for (const item of items) {
       this.externalEntryBuilders.set(item.candidate, item.buildEntry);
@@ -859,7 +864,7 @@ export class SmartExtractor {
       }
     }
     if (dedupLlmItems.length > 0) {
-      const verdicts = await this.llmDedupDecisionBatch(dedupLlmItems);
+      const verdicts = await this.llmDedupDecisionBatch(dedupLlmItems, llm);
       dedupLlmItems.forEach((item, i) => {
         precomputedDedups.set(item.index, verdicts[i]);
       });
@@ -894,7 +899,7 @@ export class SmartExtractor {
       }
     }
 
-    await this.flushPendingMerges(pendingMerges, stats);
+    await this.flushPendingMerges(pendingMerges, stats, llm);
 
     let createdEntries: import("./store.js").MemoryEntry[] = [];
     if (createEntries.length > 0) {
@@ -1145,7 +1150,9 @@ export class SmartExtractor {
     const transcript =
       rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
 
-    const { system, user: userPrompt } = buildExtractionPrompt(transcript, user);
+    const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
+      assistantEligible: this.config.captureAssistantEligible === true,
+    });
 
     const result = await this.llm.completeJson<{
       conversation_register?: string;
@@ -1654,6 +1661,7 @@ export class SmartExtractor {
    */
   private async llmDedupDecisionBatch(
     items: Array<{ candidate: CandidateMemory; topSimilar: MemorySearchResult[] }>,
+    llm: LlmClient = this.llm,
   ): Promise<DedupResult[]> {
     const out: DedupResult[] = new Array(items.length);
     for (let chunkStart = 0; chunkStart < items.length; chunkStart += this.batchChunkSize()) {
@@ -1666,7 +1674,7 @@ export class SmartExtractor {
         })),
       );
       try {
-        const response = await this.llm.completeJson<{
+        const response = await llm.completeJson<{
           results?: Array<{
             index?: number;
             decision?: string;
@@ -2029,11 +2037,12 @@ export class SmartExtractor {
   private async flushPendingMerges(
     pendingMerges: PendingMergeJob[],
     stats: ExtractionStats,
+    llm: LlmClient = this.llm,
   ): Promise<void> {
     if (pendingMerges.length === 0) {
       return;
     }
-    const contents = await this.llmMergeContentBatch(pendingMerges);
+    const contents = await this.llmMergeContentBatch(pendingMerges, llm);
     for (let i = 0; i < pendingMerges.length; i++) {
       const job = pendingMerges[i];
       const merged = contents[i];
@@ -2069,6 +2078,7 @@ export class SmartExtractor {
    */
   private async llmMergeContentBatch(
     jobs: PendingMergeJob[],
+    llm: LlmClient = this.llm,
   ): Promise<Array<{ abstract: string; overview: string; content: string } | null>> {
     const out: Array<{ abstract: string; overview: string; content: string } | null> =
       new Array(jobs.length).fill(null);
@@ -2086,7 +2096,7 @@ export class SmartExtractor {
         })),
       );
       try {
-        const response = await this.llm.completeJson<{
+        const response = await llm.completeJson<{
           results?: Array<{ index?: number; abstract?: string; overview?: string; content?: string }>;
         }>(user, "merge-memory-batch", system);
 

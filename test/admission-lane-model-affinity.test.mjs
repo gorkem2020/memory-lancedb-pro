@@ -194,7 +194,7 @@ describe("admission lane model affinity", () => {
     );
   });
 
-  it("lets an explicit admissionControl.model override beat lane affinity for both lanes", () => {
+  it("lets an explicit admissionControl.model override beat lane affinity for admission calls, while the lane pipeline client still rides the reflection model", () => {
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,
       pluginConfig: baseConfig(workspaceDir, {
@@ -207,6 +207,13 @@ describe("admission lane model affinity", () => {
 
     assert.ok(requestedModels.includes("global-model"), "the plain extraction client is still built");
     assert.ok(requestedModels.includes("override-model"), "admission calls use the explicit override");
-    assert.ok(!requestedModels.includes("reflection-model"), "the override beats lane affinity entirely");
+    // Since the whole-lane affinity extension (operator ruling 2026-07-18),
+    // "lane" also builds the reflection-lane client for the dedup decider and
+    // merge writer; the admission-specific model override governs admission
+    // calls only, not the lane pipeline client.
+    assert.ok(
+      requestedModels.includes("reflection-model"),
+      "lane affinity still builds the reflection-lane pipeline client (dedup/merge) alongside the admission override",
+    );
   });
 });

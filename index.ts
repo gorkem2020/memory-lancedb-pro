@@ -1528,7 +1528,7 @@ export function buildReflectionPromptParts(
       .join("\n")
     : "- (none)";
   const system = [
-    "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+    "You are a memory reflection distiller agent. You distill a completed session into one durable MEMORY REFLECTION entry for an AI assistant system.",
     "",
     "Output Markdown only. No intro text. No outro text. No extra headings.",
     "",
@@ -2417,6 +2417,7 @@ interface PluginSingletonState {
   smartExtractor: SmartExtractor | null;
   admissionController: AdmissionController | null;
   admissionControllerReflectionLane: AdmissionController | null;
+  reflectionLaneLlm: ReturnType<typeof createLlmClient> | undefined;
   mdMirror: MdMirrorWriter | null;
   extractionRateLimiter: ReturnType<typeof createExtractionRateLimiter>;
   // Session Maps — persist across scope refreshes instead of being recreated
@@ -2555,6 +2556,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   let smartExtractor: SmartExtractor | null = null;
   let admissionController: AdmissionController | null = null;
   let admissionControllerReflectionLane: AdmissionController | null = null;
+  let reflectionLaneLlm: ReturnType<typeof createLlmClient> | undefined;
   if (config.smartExtraction !== false || config.admissionControl.enabled === true) {
     try {
       const llmAuth = config.llm?.auth || "api-key";
@@ -2617,8 +2619,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         globalModel: llmModel,
         reflectionModel: reflectionModelForAdmission,
       });
-      const buildAdmissionLlmClient = (model: string) =>
-        model === llmModel
+      const globalThinkLevel = config.llm?.thinkLevel;
+      const buildAdmissionLlmClient = (model: string, thinkLevel: string | undefined = globalThinkLevel) =>
+        model === llmModel && thinkLevel === globalThinkLevel
           ? llmClient
           : createLlmClient({
               auth: llmAuth,
@@ -2629,7 +2632,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
               oauthPath: llmOauthPath,
               timeoutMs: llmTimeoutMs,
               transport: config.llm?.transport,
-              thinkLevel: config.llm?.thinkLevel,
+              thinkLevel,
               runtimeLlmComplete: resolveRuntimeLlmComplete(api),
               log: (msg: string) => api.logger.debug(msg),
               warnLog: (msg: string) => api.logger.warn(msg),
@@ -2644,15 +2647,29 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         config.admissionControl,
         (msg: string) => api.logger.debug(msg),
       );
+      // modelAffinity "lane": the whole reflection pipeline (judge, dedup
+      // decider, merge writer) rides the reflection lane's model AND
+      // thinkLevel; "global" keeps every stage on the plugin llm + its
+      // thinkLevel, judge included.
+      const laneAffinity = config.admissionControl?.modelAffinity === "lane";
+      const reflectionThinkLevel = laneAffinity
+        ? (asNonEmptyString(config.memoryReflection?.thinkLevel) ?? globalThinkLevel)
+        : globalThinkLevel;
       admissionControllerReflectionLane =
-        admissionModelReflection === admissionModelExtraction
+        admissionModelReflection === admissionModelExtraction && reflectionThinkLevel === globalThinkLevel
           ? admissionController
           : createAdmissionController(
               store,
-              buildAdmissionLlmClient(admissionModelReflection),
+              buildAdmissionLlmClient(admissionModelReflection, reflectionThinkLevel),
               config.admissionControl,
               (msg: string) => api.logger.debug(msg),
             );
+      reflectionLaneLlm = laneAffinity
+        ? buildAdmissionLlmClient(
+            asNonEmptyString(config.memoryReflection?.model) ?? llmModel,
+            reflectionThinkLevel,
+          )
+        : undefined;
 
       if (config.smartExtraction !== false) {
         const noiseBank = new NoisePrototypeBank((msg: string) => api.logger.debug(msg));
@@ -2665,6 +2682,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         smartExtractor = new SmartExtractor(store, embedder, llmClient, {
           user: "User",
           batchChunkSize: config.batchChunkSize,
+          captureAssistantEligible: config.captureAssistant === true,
           extractMinMessages: config.extractMinMessages ?? 4,
           extractMaxChars: config.extractMaxChars ?? 8000,
           defaultScope: config.scopes?.default ?? "global",
@@ -2735,6 +2753,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     smartExtractor,
     admissionController,
     admissionControllerReflectionLane,
+    reflectionLaneLlm,
     mdMirror,
     extractionRateLimiter,
     reflectionErrorStateBySession,
@@ -2898,6 +2917,7 @@ const memoryLanceDBProPlugin = {
       smartExtractor,
       admissionController,
       admissionControllerReflectionLane,
+      reflectionLaneLlm,
       mdMirror,
       decayEngine,
       tierManager,
@@ -5473,6 +5493,7 @@ const memoryLanceDBProPlugin = {
               scopeFilter: [targetScope],
               agentId: ownerAgentId,
               conversationText: conversation,
+              llmOverride: reflectionLaneLlm,
             });
             api.logger.info(
               `memory-reflection: mapped rows through uniform pipeline: ${gatedResult.createdEntries.length} created, ${gatedResult.stats.merged} merged, ${gatedResult.stats.skipped} skipped`,

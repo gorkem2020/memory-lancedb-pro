@@ -44,7 +44,11 @@ export interface SplitPrompt {
 export function buildExtractionPrompt(
   conversationText: string,
   user: string,
+  options: { assistantEligible?: boolean } = {},
 ): SplitPrompt {
+  const assistantLinesRule = options.assistantEligible
+    ? `- Assistant lines: "Assistant:" lines are eligible sources in this configuration. A candidate may be grounded in an assistant-authored line when it states a concrete durable fact about the user, their entities, or their work that went uncorrected — but never the assistant's own greetings, suggestions, speculation, or self-description. When the same fact has both a user-authored and an assistant-authored source, ground it in the user's line.`
+    : `- Assistant lines: in the Recent conversation turns transcript, "Assistant:" lines are provided only to help you understand what the user is referring to (e.g. "yes exactly, that one"). Do NOT create a candidate whose only support is an assistant line — every candidate must be grounded in a user-authored line. The assistant greeting or addressing the user by a name is NOT the user introducing themselves; the assistant proposing, summarizing, or confirming something is NOT the user asserting it. If the user never stated or explicitly confirmed the fact themselves, do not extract it.`;
   const system = `${EXTRACTION_AGENT_IDENTITY} Analyze session context and extract memories worth long-term preservation.
 
 # Memory Extraction Criteria
@@ -66,7 +70,7 @@ export function buildExtractionPrompt(
 - Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete profile detail, preference, entity state, event, case, or pattern from them or skip.
 - System/runtime artifacts: content containing "System:", compaction notices, model-switch/session-reset traces, tool-call transcripts, raw JSON blobs, or similar internal execution traces must be rejected unless a clean user fact can be extracted.
 - Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.
-- Assistant lines: in the Recent conversation turns transcript, "Assistant:" lines are provided only to help you understand what the user is referring to (e.g. "yes exactly, that one"). Do NOT create a candidate whose only support is an assistant line — every candidate must be grounded in a user-authored line. The assistant greeting or addressing the user by a name is NOT the user introducing themselves; the assistant proposing, summarizing, or confirming something is NOT the user asserting it. If the user never stated or explicitly confirmed the fact themselves, do not extract it.
+${assistantLinesRule}
 - Atomic memory shape: each stored memory must read like one durable fact, preference, decision, entity state, event, case, or reusable pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement or skip it.
 - Length/distillation gate: if a candidate is longer than about 200 characters and reads like raw conversation instead of a distilled insight, rewrite it as a single factual statement before storing; if that is not possible, skip it.
 
@@ -260,7 +264,9 @@ Notes:
 Target Output Language: auto (detect from recent messages)
 
 ## Recent Conversation
-${conversationText}`;
+\`\`\`
+${conversationText}
+\`\`\``;
 
   return { system, user: userMessage };
 }
@@ -296,7 +302,7 @@ IMPORTANT:
 - For "preferences" and "entities", use SUPERSEDE when the candidate replaces the current truth instead of adding detail or context. Example: existing "Preferred editor: VS Code", candidate "Preferred editor: Zed".
 - For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
 
-Return JSON only:
+Return JSON only (the raw object, no markdown code fences):
 ${jsonBlock(`{
   "decision": "skip|create|merge|supersede|support|contextualize|contradict",
   "match_index": 1,
@@ -330,7 +336,7 @@ Requirements:
 - Maintain a coherent narrative
 - Keep code identifiers / URIs / model names unchanged when they are proper nouns
 
-Return JSON only:
+Return JSON only (the raw object, no markdown code fences):
 ${jsonBlock(`{
   "abstract": "Merged one-line abstract",
   "overview": "Merged structured Markdown overview",
@@ -387,7 +393,7 @@ IMPORTANT:
 - For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
 - "match_index" always refers to the numbering of that candidate's OWN "Existing similar memories" list (1-based), never to another candidate's list and never to the candidate numbering itself.
 
-Return JSON only, with exactly one entry per candidate, in this shape:
+Return JSON only (the raw object, no markdown code fences), with exactly one entry per candidate, in this shape:
 ${jsonBlock(`{
   "results": [
     { "index": 1, "decision": "skip|create|merge|supersede|support|contextualize|contradict", "match_index": 1, "reason": "Decision reason", "context_label": "evening" }
@@ -439,7 +445,7 @@ Requirements:
 - Maintain a coherent narrative
 - Keep code identifiers / URIs / model names unchanged when they are proper nouns
 
-Return JSON only, with exactly one entry per job, in this shape:
+Return JSON only (the raw object, no markdown code fences), with exactly one entry per job, in this shape:
 ${jsonBlock(`{
   "results": [
     { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
@@ -485,7 +491,7 @@ Requirements:
 - Maintain a coherent narrative
 - Keep code identifiers, URIs, and model names unchanged when they are proper nouns
 
-Return JSON only:
+Return JSON only (the raw object, no markdown code fences):
 ${jsonBlock(`{
   "abstract": "Merged one-line abstract",
   "overview": "Merged structured Markdown overview",
@@ -552,7 +558,7 @@ ${CONSOLIDATE_APPEND_ONLY_RULE} — that never blocks you from merging or supers
 
 ${CONSOLIDATE_SOURCE_LEGEND}
 
-Return JSON only:
+Return JSON only (the raw object, no markdown code fences):
 ${jsonBlock(`{
   "verdict": "skip|merge|supersede|contradict",
   "survivor_index": 1,
@@ -603,7 +609,7 @@ ${CONSOLIDATE_APPEND_ONLY_RULE} -- that never blocks you from merging or superse
 
 ${CONSOLIDATE_SOURCE_LEGEND}
 
-Return JSON only:
+Return JSON only (the raw object, no markdown code fences):
 ${jsonBlock(`{
   "verdicts": [
     { "cluster_index": 1, "verdict": "skip|merge|supersede|contradict", "survivor_index": 1, "absorbed_indices": [2, 3], "reason": "short explanation" }
@@ -645,7 +651,7 @@ Requirements:
 - Maintain a coherent narrative
 - Keep code identifiers, URIs, and model names unchanged when they are proper nouns
 
-Return JSON only, with exactly one entry per job, in this shape:
+Return JSON only (the raw object, no markdown code fences), with exactly one entry per job, in this shape:
 ${jsonBlock(`{
   "results": [
     { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
