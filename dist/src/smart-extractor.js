@@ -7,7 +7,6 @@
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, buildBatchDedupPrompt, buildBatchMergePrompt, } from "./extraction-prompts.js";
 import { formatExistingMemoryEntry } from "./prompt-blocks.js";
-import { AdmissionController, } from "./admission-control.js";
 import { ALWAYS_MERGE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
@@ -207,10 +206,19 @@ export class SmartExtractor {
                 config.admissionControl.auditMetadata !== false;
         this.onAdmissionRejected = config.onAdmissionRejected;
         this.onPersisted = config.onPersisted;
-        this.admissionController =
-            config.admissionControl?.enabled === true
-                ? new AdmissionController(this.store, this.llm, config.admissionControl, this.debugLog)
-                : null;
+        this.admissionController = config.admissionController ?? null;
+    }
+    /**
+     * Expose the admission controller so sibling write paths (reflection
+     * mapped rows) gate through the same instance and config as extraction
+     * candidates. Null when admission control is disabled.
+     */
+    getAdmissionController() {
+        return this.admissionController;
+    }
+    /** Whether admitted entries should carry the admission audit in metadata. */
+    shouldPersistAdmissionAudit() {
+        return this.persistAdmissionAudit;
     }
     /**
      * Notify the onPersisted sink (e.g. markdown mirror) after a successful
@@ -921,7 +929,7 @@ export class SmartExtractor {
                 existingMemories: this.formatExistingMemoriesForDedup(sliced[i]),
             })));
             try {
-                const response = await this.llm.completeJson(user, "dedup-decision-batch", system);
+                const response = await llm.completeJson(user, "dedup-decision-batch", system);
                 const byIndex = new Map();
                 for (const entry of response && Array.isArray(response.results) ? response.results : []) {
                     if (!entry || typeof entry.index !== "number")
@@ -1142,11 +1150,11 @@ export class SmartExtractor {
      * itself fails degrades every job in that chunk the same way. Never
      * throws, never fans back out into per-job LLM calls.
      */
-    async flushPendingMerges(pendingMerges, stats) {
+    async flushPendingMerges(pendingMerges, stats, llm = this.llm) {
         if (pendingMerges.length === 0) {
             return;
         }
-        const contents = await this.llmMergeContentBatch(pendingMerges);
+        const contents = await this.llmMergeContentBatch(pendingMerges, llm);
         for (let i = 0; i < pendingMerges.length; i++) {
             const job = pendingMerges[i];
             const merged = contents[i];
@@ -1169,7 +1177,7 @@ export class SmartExtractor {
      * levels as strings with a non-empty abstract, so a malformed entry can
      * never write garbage over an existing row.
      */
-    async llmMergeContentBatch(jobs) {
+    async llmMergeContentBatch(jobs, llm = this.llm) {
         const out = new Array(jobs.length).fill(null);
         for (let chunkStart = 0; chunkStart < jobs.length; chunkStart += this.batchChunkSize()) {
             const chunk = jobs.slice(chunkStart, chunkStart + this.batchChunkSize());
@@ -1183,7 +1191,7 @@ export class SmartExtractor {
                 })),
             })));
             try {
-                const response = await this.llm.completeJson(user, "merge-memory-batch", system);
+                const response = await llm.completeJson(user, "merge-memory-batch", system);
                 const byIndex = new Map();
                 for (const entry of response && Array.isArray(response.results) ? response.results : []) {
                     if (!entry || typeof entry.index !== "number")

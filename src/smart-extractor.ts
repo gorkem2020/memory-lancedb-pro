@@ -318,6 +318,14 @@ export interface SmartExtractorConfig {
   workspaceBoundary?: WorkspaceBoundaryConfig;
   /** Optional admission-control governance layer before downstream dedup/persistence. */
   admissionControl?: AdmissionControlConfig;
+  /**
+   * Pre-built admission controller, constructed independently of the
+   * extractor (e.g. by createAdmissionController) so admission gating works
+   * the same whether or not smart extraction itself is enabled. When
+   * provided, this instance is used as-is; the extractor never builds its
+   * own. Null/omitted means admission control is unavailable.
+   */
+  admissionController?: AdmissionController | null;
   /** Optional sink for durable reject-audit logging. */
   onAdmissionRejected?: (entry: AdmissionRejectionAuditEntry) => Promise<void> | void;
   /** Optional sink invoked after a memory is successfully created or merged (e.g. markdown mirror). */
@@ -377,15 +385,21 @@ export class SmartExtractor {
       config.admissionControl.auditMetadata !== false;
     this.onAdmissionRejected = config.onAdmissionRejected;
     this.onPersisted = config.onPersisted;
-    this.admissionController =
-      config.admissionControl?.enabled === true
-        ? new AdmissionController(
-            this.store,
-            this.llm,
-            config.admissionControl,
-            this.debugLog,
-          )
-        : null;
+    this.admissionController = config.admissionController ?? null;
+  }
+
+  /**
+   * Expose the admission controller so sibling write paths (reflection
+   * mapped rows) gate through the same instance and config as extraction
+   * candidates. Null when admission control is disabled.
+   */
+  getAdmissionController(): AdmissionController | null {
+    return this.admissionController;
+  }
+
+  /** Whether admitted entries should carry the admission audit in metadata. */
+  shouldPersistAdmissionAudit(): boolean {
+    return this.persistAdmissionAudit;
   }
 
   /**
@@ -1357,7 +1371,7 @@ export class SmartExtractor {
         })),
       );
       try {
-        const response = await this.llm.completeJson<{
+        const response = await llm.completeJson<{
           results?: Array<{
             index?: number;
             decision?: string;
@@ -1720,11 +1734,12 @@ export class SmartExtractor {
   private async flushPendingMerges(
     pendingMerges: PendingMergeJob[],
     stats: ExtractionStats,
+    llm: LlmClient = this.llm,
   ): Promise<void> {
     if (pendingMerges.length === 0) {
       return;
     }
-    const contents = await this.llmMergeContentBatch(pendingMerges);
+    const contents = await this.llmMergeContentBatch(pendingMerges, llm);
     for (let i = 0; i < pendingMerges.length; i++) {
       const job = pendingMerges[i];
       const merged = contents[i];
@@ -1760,6 +1775,7 @@ export class SmartExtractor {
    */
   private async llmMergeContentBatch(
     jobs: PendingMergeJob[],
+    llm: LlmClient = this.llm,
   ): Promise<Array<{ abstract: string; overview: string; content: string } | null>> {
     const out: Array<{ abstract: string; overview: string; content: string } | null> =
       new Array(jobs.length).fill(null);
@@ -1777,7 +1793,7 @@ export class SmartExtractor {
         })),
       );
       try {
-        const response = await this.llm.completeJson<{
+        const response = await llm.completeJson<{
           results?: Array<{ index?: number; abstract?: string; overview?: string; content?: string }>;
         }>(user, "merge-memory-batch", system);
 
