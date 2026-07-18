@@ -498,6 +498,13 @@
             "maximum": 1,
             "default": 0.6
           },
+          "utilityVetoThreshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.25,
+            "description": "Utility scores at or below this are rejected regardless of the weighted composite (0 disables the veto)"
+          },
           "noveltyCandidatePoolSize": {
             "type": "integer",
             "minimum": 1,

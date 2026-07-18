@@ -34,6 +34,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         weights: DEFAULT_WEIGHTS,
         rejectThreshold: 0.45,
         admitThreshold: 0.6,
+        utilityVetoThreshold: 0.25,
         noveltyCandidatePoolSize: 8,
         recency: {
             halfLifeDays: 14,
@@ -58,6 +59,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         },
         rejectThreshold: 0.52,
         admitThreshold: 0.68,
+        utilityVetoThreshold: 0.25,
         noveltyCandidatePoolSize: 10,
         recency: {
             halfLifeDays: 10,
@@ -89,6 +91,7 @@ export const ADMISSION_CONTROL_PRESETS = {
         },
         rejectThreshold: 0.34,
         admitThreshold: 0.52,
+        utilityVetoThreshold: 0.25,
         noveltyCandidatePoolSize: 6,
         recency: {
             halfLifeDays: 21,
@@ -182,6 +185,7 @@ export function normalizeAdmissionControlConfig(raw) {
     const rejectThreshold = clamp01(obj.rejectThreshold, base.rejectThreshold);
     const admitThreshold = clamp01(obj.admitThreshold, base.admitThreshold);
     const normalizedAdmit = Math.max(admitThreshold, rejectThreshold);
+    const utilityVetoThreshold = clamp01(obj.utilityVetoThreshold, base.utilityVetoThreshold);
     const recencyRaw = typeof obj.recency === "object" && obj.recency !== null
         ? obj.recency
         : {};
@@ -198,6 +202,7 @@ export function normalizeAdmissionControlConfig(raw) {
         weights: normalizeWeights(obj.weights, base.weights),
         rejectThreshold,
         admitThreshold: normalizedAdmit,
+        utilityVetoThreshold,
         noveltyCandidatePoolSize: clampPositiveInt(obj.noveltyCandidatePoolSize, base.noveltyCandidatePoolSize, 20),
         recency: {
             halfLifeDays: clampPositiveInt(recencyRaw.halfLifeDays, base.recency.halfLifeDays, 365),
@@ -754,20 +759,24 @@ export class AdmissionController {
             (featureScores.novelty * this.config.weights.novelty) +
             (featureScores.recency * this.config.weights.recency) +
             (featureScores.typePrior * this.config.weights.typePrior);
-        const decision = score < this.config.rejectThreshold ? "reject" : "pass_to_dedup";
+        const utilityVetoed = this.config.utilityVetoThreshold > 0 &&
+            featureScores.utility <= this.config.utilityVetoThreshold;
+        const decision = utilityVetoed || score < this.config.rejectThreshold ? "reject" : "pass_to_dedup";
         const hint = decision === "reject"
             ? undefined
             : score >= this.config.admitThreshold && novelty.maxSimilarity < 0.55
                 ? "add"
                 : "update_or_merge";
-        const reason = buildReason({
-            decision,
-            hint,
-            score,
-            rejectThreshold: this.config.rejectThreshold,
-            maxSimilarity: novelty.maxSimilarity,
-            utilityReason: utility.reason,
-        });
+        const reason = utilityVetoed
+            ? `Admission rejected by utility veto (utility ${featureScores.utility.toFixed(2)} <= ${this.config.utilityVetoThreshold.toFixed(2)}; composite ${score.toFixed(3)}).${utility.reason ? ` Utility: ${utility.reason}` : ""}`
+            : buildReason({
+                decision,
+                hint,
+                score,
+                rejectThreshold: this.config.rejectThreshold,
+                maxSimilarity: novelty.maxSimilarity,
+                utilityReason: utility.reason,
+            });
         const audit = {
             version: "amac-v1",
             decision,
@@ -778,6 +787,7 @@ export class AdmissionController {
             thresholds: {
                 reject: this.config.rejectThreshold,
                 admit: this.config.admitThreshold,
+                utilityVeto: this.config.utilityVetoThreshold,
             },
             weights: this.config.weights,
             feature_scores: featureScores,

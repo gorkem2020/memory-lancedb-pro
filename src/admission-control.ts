@@ -44,6 +44,12 @@ export interface AdmissionControlConfig {
   weights: AdmissionWeights;
   rejectThreshold: number;
   admitThreshold: number;
+  /**
+   * The utility judge's floor of authority: a candidate whose LLM utility
+   * score is at or below this is rejected outright, regardless of the
+   * weighted composite (which the type prior otherwise dominates). 0 disables.
+   */
+  utilityVetoThreshold: number;
   noveltyCandidatePoolSize: number;
   recency: AdmissionRecencyConfig;
   typePriors: AdmissionTypePriors;
@@ -81,6 +87,7 @@ export interface AdmissionAuditRecord {
   thresholds: {
     reject: number;
     admit: number;
+    utilityVeto?: number;
   };
   weights: AdmissionWeights;
   feature_scores: AdmissionFeatureScores;
@@ -160,6 +167,7 @@ export const ADMISSION_CONTROL_PRESETS: Record<AdmissionControlPreset, Admission
     weights: DEFAULT_WEIGHTS,
     rejectThreshold: 0.45,
     admitThreshold: 0.6,
+    utilityVetoThreshold: 0.25,
     noveltyCandidatePoolSize: 8,
     recency: {
       halfLifeDays: 14,
@@ -184,6 +192,7 @@ export const ADMISSION_CONTROL_PRESETS: Record<AdmissionControlPreset, Admission
     },
     rejectThreshold: 0.52,
     admitThreshold: 0.68,
+    utilityVetoThreshold: 0.25,
     noveltyCandidatePoolSize: 10,
     recency: {
       halfLifeDays: 10,
@@ -215,6 +224,7 @@ export const ADMISSION_CONTROL_PRESETS: Record<AdmissionControlPreset, Admission
     },
     rejectThreshold: 0.34,
     admitThreshold: 0.52,
+    utilityVetoThreshold: 0.25,
     noveltyCandidatePoolSize: 6,
     recency: {
       halfLifeDays: 21,
@@ -321,6 +331,7 @@ export function normalizeAdmissionControlConfig(raw: unknown): AdmissionControlC
   const rejectThreshold = clamp01(obj.rejectThreshold, base.rejectThreshold);
   const admitThreshold = clamp01(obj.admitThreshold, base.admitThreshold);
   const normalizedAdmit = Math.max(admitThreshold, rejectThreshold);
+  const utilityVetoThreshold = clamp01(obj.utilityVetoThreshold, base.utilityVetoThreshold);
   const recencyRaw =
     typeof obj.recency === "object" && obj.recency !== null
       ? (obj.recency as Record<string, unknown>)
@@ -340,6 +351,7 @@ export function normalizeAdmissionControlConfig(raw: unknown): AdmissionControlC
     weights: normalizeWeights(obj.weights, base.weights),
     rejectThreshold,
     admitThreshold: normalizedAdmit,
+    utilityVetoThreshold,
     noveltyCandidatePoolSize: clampPositiveInt(
       obj.noveltyCandidatePoolSize,
       base.noveltyCandidatePoolSize,
@@ -1065,7 +1077,11 @@ export class AdmissionController {
       (featureScores.recency * this.config.weights.recency) +
       (featureScores.typePrior * this.config.weights.typePrior);
 
-    const decision = score < this.config.rejectThreshold ? "reject" : "pass_to_dedup";
+    const utilityVetoed =
+      this.config.utilityVetoThreshold > 0 &&
+      featureScores.utility <= this.config.utilityVetoThreshold;
+    const decision =
+      utilityVetoed || score < this.config.rejectThreshold ? "reject" : "pass_to_dedup";
     const hint =
       decision === "reject"
         ? undefined
@@ -1073,14 +1089,16 @@ export class AdmissionController {
           ? "add"
           : "update_or_merge";
 
-    const reason = buildReason({
-      decision,
-      hint,
-      score,
-      rejectThreshold: this.config.rejectThreshold,
-      maxSimilarity: novelty.maxSimilarity,
-      utilityReason: utility.reason,
-    });
+    const reason = utilityVetoed
+      ? `Admission rejected by utility veto (utility ${featureScores.utility.toFixed(2)} <= ${this.config.utilityVetoThreshold.toFixed(2)}; composite ${score.toFixed(3)}).${utility.reason ? ` Utility: ${utility.reason}` : ""}`
+      : buildReason({
+          decision,
+          hint,
+          score,
+          rejectThreshold: this.config.rejectThreshold,
+          maxSimilarity: novelty.maxSimilarity,
+          utilityReason: utility.reason,
+        });
 
     const audit: AdmissionAuditRecord = {
       version: "amac-v1",
@@ -1092,6 +1110,7 @@ export class AdmissionController {
       thresholds: {
         reject: this.config.rejectThreshold,
         admit: this.config.admitThreshold,
+        utilityVeto: this.config.utilityVetoThreshold,
       },
       weights: this.config.weights,
       feature_scores: featureScores,
