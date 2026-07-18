@@ -623,7 +623,7 @@ export async function runConsolidate(deps, options) {
         const verdictMap = !decideCallFailed
             ? parseConsolidateBatchVerdicts(raw, units.map((u) => ({ clusterIndex: u.clusterIndex, memberCount: u.members.length })))
             : new Map();
-        // Item 8: build the COMPLETE plan now, regardless of apply/dry-run --
+        // Build the COMPLETE plan now, regardless of apply/dry-run --
         // every merge verdict gets its content generated here (moved from
         // apply time), so execution later is pure store writes with zero
         // further LLM calls.

@@ -1435,8 +1435,8 @@ describe("memory consolidate: CLI journal-mirror agent identity", () => {
   function buildRows() {
     const ts = 1_700_000_000_000;
     return [
-      makeRow({ scope: "agent:terry", abstract: "Coffee order: oat milk latte", content: "a", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
-      makeRow({ scope: "agent:terry", abstract: "Coffee order: oat milk latte, extra hot", content: "b", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1000 }),
+      makeRow({ scope: "agent:agent-one", abstract: "Coffee order: oat milk latte", content: "a", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
+      makeRow({ scope: "agent:agent-one", abstract: "Coffee order: oat milk latte, extra hot", content: "b", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1000 }),
     ];
   }
 
@@ -1451,11 +1451,11 @@ describe("memory consolidate: CLI journal-mirror agent identity", () => {
 
     await program.parseAsync([
       "node", "openclaw", "memory-pro", "consolidate",
-      "--apply", "--agent", "terry", "--yes",
+      "--apply", "--agent", "agent-one", "--yes",
     ]);
 
     assert.equal(mirrorCalls.length, 1, "expected exactly one journal-mirror write for the applied merge");
-    assert.equal(mirrorCalls[0].meta.agentId, "terry", "the CLI's --agent value must reach the journal writer");
+    assert.equal(mirrorCalls[0].meta.agentId, "agent-one", "the CLI's --agent value must reach the journal writer");
     assert.match(mirrorCalls[0].meta.source, /memory-consolidate/);
   });
 
