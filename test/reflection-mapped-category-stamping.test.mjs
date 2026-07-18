@@ -101,3 +101,23 @@ describe("reflection-mapped write-time memory_category stamping", () => {
     assert.notEqual(parsed.memory_category, "preferences");
   });
 });
+
+describe("reflection-mapped write-time L0/L1/L2 minting", () => {
+  it("mints the three levels deterministically: line as abstract/content, heading-based overview", () => {
+    const metadata = buildReflectionMappedMetadata(buildParams({
+      text: "Prefers dark roast coffee in the morning",
+      category: "preference",
+      heading: "User model deltas (about the human)",
+      mappedKind: "user-model",
+      ordinal: 0,
+      groupSize: 1,
+    }));
+    assert.equal(metadata.l0_abstract, "Prefers dark roast coffee in the morning");
+    assert.equal(
+      metadata.l1_overview,
+      "## User model deltas (about the human)\n- Prefers dark roast coffee in the morning",
+    );
+    assert.equal(metadata.l2_content, "Prefers dark roast coffee in the morning");
+    assert.notEqual(metadata.l1_overview, metadata.l0_abstract, "the overview must carry section context, not echo the line");
+  });
+});
