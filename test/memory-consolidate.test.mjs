@@ -525,7 +525,7 @@ describe("memory consolidate: batched prompt slot conformance", () => {
       staticSentinels: [
         "You are a memory consolidation decider.",
         "Decision criteria: apply these checks in order",
-        "Return JSON only:",
+        "Return JSON only (the raw object, no markdown code fences):",
         "Source legend:",
       ],
       userOpener: "## Cluster 1",
@@ -546,7 +546,7 @@ describe("memory consolidate: batched prompt slot conformance", () => {
       staticSentinels: [
         "You are a memory consolidation merge writer.",
         "Requirements:",
-        "Return JSON only, with exactly one entry per job",
+        "Return JSON only (the raw object, no markdown code fences), with exactly one entry per job",
       ],
       userOpener: "## Merge jobs",
     });

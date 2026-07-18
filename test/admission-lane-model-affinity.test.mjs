@@ -194,6 +194,27 @@ describe("admission lane model affinity", () => {
     );
   });
 
+  it("normalizes a core-style provider-prefixed reflection model for the plugin's direct client (live 400 catch, 2026-07-18)", () => {
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: baseConfig(workspaceDir, {
+        admissionControl: { enabled: true, modelAffinity: "lane" },
+        memoryReflection: { model: "openrouter/anthropic/claude-opus-4-8" },
+      }),
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    assert.ok(
+      requestedModels.includes("anthropic/claude-opus-4-8"),
+      "the lane clients must get the provider-stripped id a direct OpenRouter call accepts",
+    );
+    assert.ok(
+      !requestedModels.includes("openrouter/anthropic/claude-opus-4-8"),
+      "the raw core-style catalog ref must never reach a direct client",
+    );
+  });
+
   it("lets an explicit admissionControl.model override beat lane affinity for admission calls, while the lane pipeline client still rides the reflection model", () => {
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,

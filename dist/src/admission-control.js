@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { DURABLE_CATEGORIES } from "./memory-categories.js";
 import { parseSmartMetadata } from "./smart-metadata.js";
-import { ADMISSION_JUDGE_IDENTITY, CATEGORY_TAXONOMY, SCORE_TIER_RUBRIC, formatCandidateBlock, jsonBlock, } from "./prompt-blocks.js";
+import { ADMISSION_JUDGE_IDENTITY, CATEGORY_TAXONOMY, SCORE_TIER_RUBRIC, formatCandidateBlock, jsonShape, } from "./prompt-blocks.js";
 const DEFAULT_WEIGHTS = {
     utility: 0.1,
     confidence: 0.1,
@@ -356,7 +356,7 @@ ${SCORE_TIER_RUBRIC}
 Grounding rule: this candidate's own grounding tag already passed the deterministic pre-admission check (a "constructed" tag is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If the candidate's own content shows such a constructed frame and its claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
 
 Return JSON only (the raw object, no markdown code fences):
-${jsonBlock(`{
+${jsonShape(`{
   "utility": 0.0,
   "reason": "short explanation"
 }`)}`;
@@ -435,7 +435,7 @@ Example of absolute scoring across a mixed-quality batch:
 ${exampleCandidateBlocks}
 
 Example response:
-${jsonBlock(`{"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}`)}
+${jsonShape(`{"results":[{"index":1,"utility":0.9,"reason":"durable identity fact"},{"index":2,"utility":0.05,"reason":"one-off greeting, no lasting value"},{"index":3,"utility":0.85,"reason":"durable project/entity fact"}]}`)}
 
 Candidate 2 scores low even though candidates 1 and 3 score high in the same batch: each item is judged on its own merit, never curved against its neighbors.
 --- END EXAMPLE ---
@@ -443,7 +443,7 @@ Candidate 2 scores low even though candidates 1 and 3 score high in the same bat
 Grounding rule: every candidate in this batch already passed the deterministic pre-admission check (a "constructed" tag is rejected before this scoring ever runs), but a mistagged or legacy candidate can still describe a claim that is true only WITHIN a fiction — a persona's invented trait from roleplay, a game's rules or score, drafted fiction, a hypothetical, or sample data. If a candidate's own content shows such a constructed frame and its claim lives inside it rather than being a claim ABOUT the fiction (e.g. that a session/game happened), score it near zero for the durable categories (profile, preferences, entities, cases, patterns) regardless of how well-formed it looks. A session-scoped events note that the participants did the activity is a claim ABOUT the fiction and may still score moderately.
 
 Return JSON only (the raw object, no markdown code fences), with exactly one entry per candidate, in this shape:
-${jsonBlock(`{
+${jsonShape(`{
   "results": [
     { "index": 1, "utility": 0.0, "reason": "short explanation" }
   ]

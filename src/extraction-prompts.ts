@@ -33,7 +33,7 @@ import {
   formatCandidateBlock,
   formatExistingMemoriesSection,
   formatMemoryFieldLines,
-  jsonBlock,
+  jsonShape,
 } from "./prompt-blocks.js";
 
 export interface SplitPrompt {
@@ -156,7 +156,6 @@ Each memory contains three levels:
 Each example is a full output batch, because register and grounding are judged together.
 
 ## Ordinary working conversation (register "real", single memory)
-\`\`\`json
 {
   "conversation_register": "real",
   "memories": [
@@ -169,10 +168,8 @@ Each example is a full output batch, because register and grounding are judged t
     }
   ]
 }
-\`\`\`
 
 ## Ordinary personal conversation (register "real", two memories)
-\`\`\`json
 {
   "conversation_register": "real",
   "memories": [
@@ -192,11 +189,9 @@ Each example is a full output batch, because register and grounding are judged t
     }
   ]
 }
-\`\`\`
 
 ## Mid-game conversation (register "fiction", session note is real; canon is not extracted)
 Input was one round of an in-character guessing game where a persona claimed to live on a moon base and named an invented drink.
-\`\`\`json
 {
   "conversation_register": "fiction",
   "memories": [
@@ -209,11 +204,9 @@ Input was one round of an in-character guessing game where a persona claimed to 
     }
   ]
 }
-\`\`\`
 Note: the persona's home, the invented drink, the house rule, and the bet are NOT extracted at all — not as profile, not as preferences, not as entities. This session note is a true statement about a real session (the session happened), so it carries grounding "real" even though the batch register is "fiction" — about-the-fiction is real.
 
 ## Game with a genuine out-of-character aside (register "mixed")
-\`\`\`json
 {
   "conversation_register": "mixed",
   "memories": [
@@ -233,12 +226,11 @@ Note: the persona's home, the invented drink, the house rule, and the bet are NO
     }
   ]
 }
-\`\`\`
 
 # Output Format
 
 Return JSON only (the raw object, no markdown code fences):
-${jsonBlock(`{
+${jsonShape(`{
   "conversation_register": "real|mixed|fiction",
   "memories": [
     {
@@ -303,7 +295,7 @@ IMPORTANT:
 - For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
 
 Return JSON only (the raw object, no markdown code fences):
-${jsonBlock(`{
+${jsonShape(`{
   "decision": "skip|create|merge|supersede|support|contextualize|contradict",
   "match_index": 1,
   "reason": "Decision reason",
@@ -337,7 +329,7 @@ Requirements:
 - Keep code identifiers / URIs / model names unchanged when they are proper nouns
 
 Return JSON only (the raw object, no markdown code fences):
-${jsonBlock(`{
+${jsonShape(`{
   "abstract": "Merged one-line abstract",
   "overview": "Merged structured Markdown overview",
   "content": "Merged full content"
@@ -394,7 +386,7 @@ IMPORTANT:
 - "match_index" always refers to the numbering of that candidate's OWN "Existing similar memories" list (1-based), never to another candidate's list and never to the candidate numbering itself.
 
 Return JSON only (the raw object, no markdown code fences), with exactly one entry per candidate, in this shape:
-${jsonBlock(`{
+${jsonShape(`{
   "results": [
     { "index": 1, "decision": "skip|create|merge|supersede|support|contextualize|contradict", "match_index": 1, "reason": "Decision reason", "context_label": "evening" }
   ]
@@ -446,7 +438,7 @@ Requirements:
 - Keep code identifiers / URIs / model names unchanged when they are proper nouns
 
 Return JSON only (the raw object, no markdown code fences), with exactly one entry per job, in this shape:
-${jsonBlock(`{
+${jsonShape(`{
   "results": [
     { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
   ]
@@ -492,7 +484,7 @@ Requirements:
 - Keep code identifiers, URIs, and model names unchanged when they are proper nouns
 
 Return JSON only (the raw object, no markdown code fences):
-${jsonBlock(`{
+${jsonShape(`{
   "abstract": "Merged one-line abstract",
   "overview": "Merged structured Markdown overview",
   "content": "Merged full content"
@@ -559,7 +551,7 @@ ${CONSOLIDATE_APPEND_ONLY_RULE} — that never blocks you from merging or supers
 ${CONSOLIDATE_SOURCE_LEGEND}
 
 Return JSON only (the raw object, no markdown code fences):
-${jsonBlock(`{
+${jsonShape(`{
   "verdict": "skip|merge|supersede|contradict",
   "survivor_index": 1,
   "absorbed_indices": [2, 3],
@@ -610,7 +602,7 @@ ${CONSOLIDATE_APPEND_ONLY_RULE} -- that never blocks you from merging or superse
 ${CONSOLIDATE_SOURCE_LEGEND}
 
 Return JSON only (the raw object, no markdown code fences):
-${jsonBlock(`{
+${jsonShape(`{
   "verdicts": [
     { "cluster_index": 1, "verdict": "skip|merge|supersede|contradict", "survivor_index": 1, "absorbed_indices": [2, 3], "reason": "short explanation" }
   ]
@@ -652,7 +644,7 @@ Requirements:
 - Keep code identifiers, URIs, and model names unchanged when they are proper nouns
 
 Return JSON only (the raw object, no markdown code fences), with exactly one entry per job, in this shape:
-${jsonBlock(`{
+${jsonShape(`{
   "results": [
     { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
   ]

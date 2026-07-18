@@ -470,12 +470,12 @@ describe("AdmissionController.evaluateBatch transport slots", () => {
     const call = calls[0];
     assert.equal(call.label, "admission-utility-batch");
     assert.ok(
-      typeof call.systemPrompt === "string" && call.systemPrompt.startsWith("You are an admission judge."),
+      typeof call.systemPrompt === "string" && call.systemPrompt.startsWith("You are a memory admission judge."),
       "system slot must carry the judge identity block",
     );
     assert.ok(call.prompt.startsWith("## Candidates"), "user slot must open with the candidate data header");
     assert.ok(
-      !call.prompt.includes("You are an admission judge."),
+      !call.prompt.includes("You are a memory admission judge."),
       "identity/static block must not be concatenated into the user slot",
     );
   });

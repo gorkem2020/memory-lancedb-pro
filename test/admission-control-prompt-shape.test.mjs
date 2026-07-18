@@ -217,8 +217,8 @@ describe("AdmissionController prompt shape: batch formatting standard", () => {
     assert.match(capturedPrompt, /\n\n### 3\. entities/);
     // Blank line between the last example candidate and the "Example response:" label.
     assert.match(capturedPrompt, /\n\nExample response:/);
-    // Blank line between the fenced example response JSON and the closing explanatory note.
-    assert.match(capturedPrompt, /```\n\nCandidate 2 scores low/);
+    // Blank line between the bare example response JSON and the closing explanatory note.
+    assert.match(capturedPrompt, /\}\n\nCandidate 2 scores low/);
   });
 
   it("emits the few-shot example through the live candidate formatter (same markdown block shape)", async () => {
@@ -440,7 +440,7 @@ describe("batched prompt slot conformance (system = static, user = per-call data
     const prompt = buildBatchUtilityPrompt([makeCandidate(1), makeCandidate(2)]);
     assertSlotSplit(prompt, {
       staticSentinels: [
-        "You are an admission judge.",
+        "You are a memory admission judge.",
         "The memory system stores six categories:",
         "Score each candidate's future usefulness independently",
         "--- EXAMPLE (not your current batch) ---",

@@ -22,7 +22,7 @@ export const SCORE_TIER_RUBRIC = `Use higher scores for durable profile facts, p
 Use moderate scores for events worth an episodic record.
 Use lower scores for one-off chatter, low-signal situational remarks, thin restatements, and low-value transient details.`;
 
-export const ADMISSION_JUDGE_IDENTITY = "You are an admission judge.";
+export const ADMISSION_JUDGE_IDENTITY = "You are a memory admission judge.";
 export const EXTRACTION_AGENT_IDENTITY = "You are a memory extraction agent.";
 export const DEDUP_JUDGE_IDENTITY =
   "You are a memory dedup judge. Decide how each candidate memory relates to the existing memories: new, duplicate, or an update.";
@@ -31,9 +31,14 @@ export const MERGE_WRITER_IDENTITY =
 export const CONSOLIDATE_DECIDER_IDENTITY = "You are a memory consolidation decider.";
 export const CONSOLIDATE_MERGE_WRITER_IDENTITY = "You are a memory consolidation merge writer.";
 
-/** Wraps a raw JSON example/contract in a fenced ```json code block. */
-export function jsonBlock(json: string): string {
-  return "```json\n" + json + "\n```";
+/**
+ * Renders a raw JSON example/contract exactly as the model must emit it:
+ * bare, unfenced. Prompts that showed fenced examples got fenced completions
+ * back from fence-mimicking models while the surrounding text demanded "no
+ * markdown code fences" (live catch: the reflection lane's judge, 2026-07-18).
+ */
+export function jsonShape(json: string): string {
+  return json;
 }
 
 /**

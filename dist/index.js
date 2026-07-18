@@ -48,7 +48,7 @@ import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
 import { NoisePrototypeBank } from "./src/noise-prototypes.js";
-import { createLlmClient } from "./src/llm-client.js";
+import { createLlmClient, normalizeDirectModelRef } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
@@ -1931,22 +1931,25 @@ function _initPluginState(api) {
                 reflectionModel: reflectionModelForAdmission,
             });
             const globalThinkLevel = config.llm?.thinkLevel;
-            const buildAdmissionLlmClient = (model, thinkLevel = globalThinkLevel) => model === llmModel && thinkLevel === globalThinkLevel
-                ? llmClient
-                : createLlmClient({
-                    auth: llmAuth,
-                    apiKey: llmApiKey,
-                    model,
-                    baseURL: llmBaseURL,
-                    oauthProvider: llmOauthProvider,
-                    oauthPath: llmOauthPath,
-                    timeoutMs: llmTimeoutMs,
-                    transport: config.llm?.transport,
-                    thinkLevel,
-                    runtimeLlmComplete: resolveRuntimeLlmComplete(api),
-                    log: (msg) => api.logger.debug(msg),
-                    warnLog: (msg) => api.logger.warn(msg),
-                });
+            const buildAdmissionLlmClient = (model, thinkLevel = globalThinkLevel) => {
+                const directModel = normalizeDirectModelRef(model);
+                return directModel === llmModel && thinkLevel === globalThinkLevel
+                    ? llmClient
+                    : createLlmClient({
+                        auth: llmAuth,
+                        apiKey: llmApiKey,
+                        model: directModel,
+                        baseURL: llmBaseURL,
+                        oauthProvider: llmOauthProvider,
+                        oauthPath: llmOauthPath,
+                        timeoutMs: llmTimeoutMs,
+                        transport: config.llm?.transport,
+                        thinkLevel,
+                        runtimeLlmComplete: resolveRuntimeLlmComplete(api),
+                        log: (msg) => api.logger.debug(msg),
+                        warnLog: (msg) => api.logger.warn(msg),
+                    });
+            };
             // Constructed independently of SmartExtractor so admission gating is
             // available to other write paths (e.g. reflection-mapped rows, the
             // regex fallback) even when smart extraction itself is disabled.

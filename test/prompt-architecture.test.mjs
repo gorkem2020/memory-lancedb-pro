@@ -36,6 +36,7 @@ const { buildExtractionPrompt, buildDedupPrompt, buildBatchDedupPrompt, buildMer
 );
 const { createLlmClient } = jiti("../src/llm-client.ts");
 const { formatExistingMemoryEntry } = jiti("../src/prompt-blocks.ts");
+const { buildBatchUtilityPrompt } = jiti("../src/admission-control.ts");
 const { buildReflectionPromptParts } = jiti("../index.ts");
 
 // ============================================================================
@@ -492,12 +493,25 @@ describe("identity-first prompt openers", () => {
         existingMemories: "",
       },
     ]).system,
+    merge: buildMergePrompt(
+      { abstract: "a", overview: "o", content: "c" },
+      { category: "preferences", abstract: "a2", overview: "o2", content: "c2" },
+    ).system,
+    batchUtility: buildBatchUtilityPrompt([
+      { category: "preferences", abstract: "a", overview: "o", content: "c" },
+    ]).system,
     distiller: buildReflectionPromptParts("user: hi", 4000).system,
   };
 
-  it("all open with a 'You are ...' identity sentence", () => {
+  it("all open with a 'You are a memory ...' identity sentence (symmetric memory-domain openers, operator rule 2026-07-18)", () => {
     for (const [name, system] of Object.entries(openers)) {
-      assert.match(system, /^You are (a|an) /, `${name} must open with an identity sentence`);
+      assert.match(system, /^You are a memory /, `${name} must open with a memory-domain identity sentence`);
+    }
+  });
+
+  it("no prompt shows a fenced JSON example (models mimic fences; live catch on the reflection lane's judge, 2026-07-18)", () => {
+    for (const [name, system] of Object.entries(openers)) {
+      assert.ok(!system.includes("```json"), `${name} system must show JSON shapes bare, never fenced`);
     }
   });
 
