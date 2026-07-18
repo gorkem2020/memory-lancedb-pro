@@ -214,7 +214,7 @@ Note: the persona's home, the invented drink, the house rule, and the bet are NO
 
 # Output Format
 
-Return JSON:
+Return JSON only (the raw object, no markdown code fences):
 ${jsonBlock(`{
   "conversation_register": "real|mixed|fiction",
   "memories": [

@@ -43,7 +43,7 @@ const {
 // Every static block of the distiller prompt, by its opening sentinel. These
 // must ALL live in the system slot and NONE may leak into the user slot.
 const STATIC_SENTINELS = [
-  "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+  "You are a memory reflection distiller agent.",
   "Use these headings exactly once, in this exact order, with exact spelling:",
   "Hard rules:",
   "Section rules:",
@@ -82,7 +82,7 @@ describe("buildReflectionPromptParts slot placement", () => {
   it("puts the identity opener and every static block in system, none of them in user", () => {
     const parts = buildReflectionPromptParts(CONVERSATION, 1000, []);
     assert.ok(
-      parts.system.startsWith("You are generating a durable MEMORY REFLECTION entry"),
+      parts.system.startsWith("You are a memory reflection distiller agent."),
       "system must open with the distiller identity line",
     );
     for (const sentinel of STATIC_SENTINELS) {

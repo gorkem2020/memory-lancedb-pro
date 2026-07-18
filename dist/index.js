@@ -1062,7 +1062,7 @@ export function buildReflectionPromptParts(conversation, maxInputChars, toolErro
     const system = [
         "You are a memory reflection distiller agent. You distill a completed session into one durable MEMORY REFLECTION entry for an AI assistant system.",
         "",
-        "Output Markdown only. No intro text. No outro text. No extra headings.",
+        "Output Markdown only. No intro text. No outro text. No extra headings. Do not wrap the output in a code fence.",
         "",
         "Use these headings exactly once, in this exact order, with exact spelling:",
         "## Context (session background)",

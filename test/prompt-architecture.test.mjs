@@ -512,6 +512,13 @@ describe("extraction transcript block and assistant-line policy", () => {
     assert.match(user, /## Recent Conversation\n```\nUser: hi\nAssistant: hello\n```/);
   });
 
+  it("extraction and distiller both forbid fencing their own output (live fence-mirroring catch, 2026-07-18)", () => {
+    const { system } = buildExtractionPrompt("t", "User");
+    assert.match(system, /Return JSON only \(the raw object, no markdown code fences\)/);
+    const distiller = buildReflectionPromptParts("user: hi", 4000).system;
+    assert.match(distiller, /Do not wrap the output in a code fence\./);
+  });
+
   it("defaults assistant lines to context-only grounding", () => {
     const { system } = buildExtractionPrompt("t", "User");
     assert.match(system, /provided only to help you understand/);
