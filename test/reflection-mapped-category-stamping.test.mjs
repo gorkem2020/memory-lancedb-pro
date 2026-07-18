@@ -12,6 +12,7 @@ Module._initPaths();
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { buildReflectionMappedMetadata } = jiti("../src/reflection-mapped-metadata.ts");
+const { buildReflectionItemPayloads } = jiti("../src/reflection-item-store.ts");
 const { parseSmartMetadata } = jiti("../src/smart-metadata.ts");
 
 function buildParams(mappedItem) {
@@ -119,5 +120,30 @@ describe("reflection-mapped write-time L0/L1/L2 minting", () => {
     );
     assert.equal(metadata.l2_content, "Prefers dark roast coffee in the morning");
     assert.notEqual(metadata.l1_overview, metadata.l0_abstract, "the overview must carry section context, not echo the line");
+  });
+});
+
+describe("reflection-item write-time L0/L1/L2 minting", () => {
+  it("mints the three levels for invariant and derived rows, section-based overview", () => {
+    const payloads = buildReflectionItemPayloads({
+      items: [
+        { itemKind: "invariant", section: "Invariants", ordinal: 0, groupSize: 2, text: "Always verify ids before deleting" },
+        { itemKind: "derived", section: "Derived", ordinal: 1, groupSize: 2, text: "User mixes real facts into roleplay asides" },
+      ],
+      eventId: "refl-test-1",
+      agentId: "agent-one",
+      sessionKey: "agent:agent-one:main",
+      sessionId: "session-1",
+      runAt: 1000,
+      usedFallback: false,
+      toolErrorSignals: [],
+    });
+    assert.equal(payloads.length, 2);
+    const [inv, der] = payloads;
+    assert.equal(inv.metadata.l0_abstract, "Always verify ids before deleting");
+    assert.equal(inv.metadata.l1_overview, "## Invariants\n- Always verify ids before deleting");
+    assert.equal(inv.metadata.l2_content, "Always verify ids before deleting");
+    assert.equal(der.metadata.l1_overview, "## Derived\n- User mixes real facts into roleplay asides");
+    assert.notEqual(der.metadata.l1_overview, der.metadata.l0_abstract, "the overview must carry section context, not echo the line");
   });
 });
