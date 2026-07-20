@@ -2025,6 +2025,7 @@ function _initPluginState(api) {
     const autoCaptureRecentTexts = new Map();
     const autoCaptureRecentPairTurns = new Map();
     const autoCapturePayloadShapeLoggedSessions = new Set();
+    const autoCaptureSessionIds = new Map();
     const autoCaptureLastEligibleLength = new Map();
     return {
         config,
@@ -2058,6 +2059,7 @@ function _initPluginState(api) {
         autoCaptureRecentTexts,
         autoCaptureRecentPairTurns,
         autoCapturePayloadShapeLoggedSessions,
+        autoCaptureSessionIds,
         autoCaptureLastEligibleLength,
     };
 }
@@ -2170,7 +2172,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, admissionControllerReflectionLane, reflectionLaneLlm, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentPairTurns, autoCapturePayloadShapeLoggedSessions, autoCaptureLastEligibleLength, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, admissionControllerReflectionLane, reflectionLaneLlm, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentPairTurns, autoCapturePayloadShapeLoggedSessions, autoCaptureSessionIds, autoCaptureLastEligibleLength, } = singleton;
         // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
         // must also go through here so the on-disk watermark never drifts from the
         // in-memory Map -- a process restart rehydrates from exactly what was last
@@ -3042,6 +3044,7 @@ const memoryLanceDBProPlugin = {
                 // as if they were conversation. Same guard convention as the sibling
                 // reflection injection hooks.
                 const hookSessionKey = ctx?.sessionKey || event.sessionKey;
+                const hookSessionId = typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0 ? ctx.sessionId : undefined;
                 if (isInternalReflectionSessionKey(hookSessionKey) || isMemorySubsessionKey(hookSessionKey)) {
                     api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 internal memory session '${hookSessionKey}'`);
                     return;
@@ -3131,6 +3134,23 @@ const memoryLanceDBProPlugin = {
                             autoCapturePendingIngressTexts.delete(conversationKey);
                         }
                         const minMessages = config.extractMinMessages ?? 4;
+                        // Session renewal detection: a rotated sessionId under a stable
+                        // sessionKey (e.g. /reset) means the persisted watermark counts a
+                        // conversation that no longer exists. A stale-HIGH cursor silently
+                        // swallows the fresh session's first messages as already-seen; a
+                        // stale-LOW cursor fires a spurious first-message extraction. Reset
+                        // to zero so the fresh session counts from its own start. The map
+                        // is deliberately in-memory: after a process restart it records
+                        // without resetting, preserving the watermark's restart survival.
+                        if (hookSessionId) {
+                            const recordedSessionId = autoCaptureSessionIds.get(sessionKey);
+                            if (recordedSessionId && recordedSessionId !== hookSessionId) {
+                                await persistAutoCaptureWatermark(sessionKey, 0);
+                                api.logger.info(`memory-lancedb-pro: auto-capture watermark reset for ${sessionKey} (session renewed: ${recordedSessionId.slice(0, 8)} -> ${hookSessionId.slice(0, 8)})`);
+                            }
+                            autoCaptureSessionIds.set(sessionKey, hookSessionId);
+                            pruneMapIfOver(autoCaptureSessionIds, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        }
                         const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
                         let newTexts = eligibleTexts;
                         let watermarkAdvanceOverride = null;

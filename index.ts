@@ -2435,6 +2435,7 @@ interface PluginSingletonState {
   autoCaptureRecentTexts: Map<string, string[]>;
   autoCaptureRecentPairTurns: Map<string, ConversationTurn[]>;
   autoCapturePayloadShapeLoggedSessions: Set<string>;
+  autoCaptureSessionIds: Map<string, string>;
   autoCaptureLastEligibleLength: Map<string, number>;
 }
 
@@ -2738,6 +2739,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureRecentTexts = new Map<string, string[]>();
   const autoCaptureRecentPairTurns = new Map<string, ConversationTurn[]>();
   const autoCapturePayloadShapeLoggedSessions = new Set<string>();
+  const autoCaptureSessionIds = new Map<string, string>();
   const autoCaptureLastEligibleLength = new Map<string, number>();
 
   return {
@@ -2772,6 +2774,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureRecentTexts,
     autoCaptureRecentPairTurns,
     autoCapturePayloadShapeLoggedSessions,
+    autoCaptureSessionIds,
     autoCaptureLastEligibleLength,
   };
 }
@@ -2938,6 +2941,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureRecentTexts,
       autoCaptureRecentPairTurns,
       autoCapturePayloadShapeLoggedSessions,
+      autoCaptureSessionIds,
       autoCaptureLastEligibleLength,
     } = singleton;
 
@@ -3992,6 +3996,8 @@ const memoryLanceDBProPlugin = {
         // as if they were conversation. Same guard convention as the sibling
         // reflection injection hooks.
         const hookSessionKey = ctx?.sessionKey || (event as any).sessionKey;
+        const hookSessionId =
+          typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0 ? ctx.sessionId : undefined;
         if (isInternalReflectionSessionKey(hookSessionKey) || isMemorySubsessionKey(hookSessionKey)) {
           api.logger.debug(
             `memory-lancedb-pro: auto-capture skip \u2014 internal memory session '${hookSessionKey}'`,
@@ -4098,6 +4104,26 @@ const memoryLanceDBProPlugin = {
           }
 
           const minMessages = config.extractMinMessages ?? 4;
+          // Session renewal detection: a rotated sessionId under a stable
+          // sessionKey (e.g. /reset) means the persisted watermark counts a
+          // conversation that no longer exists. A stale-HIGH cursor silently
+          // swallows the fresh session's first messages as already-seen; a
+          // stale-LOW cursor fires a spurious first-message extraction. Reset
+          // to zero so the fresh session counts from its own start. The map
+          // is deliberately in-memory: after a process restart it records
+          // without resetting, preserving the watermark's restart survival.
+          if (hookSessionId) {
+            const recordedSessionId = autoCaptureSessionIds.get(sessionKey);
+            if (recordedSessionId && recordedSessionId !== hookSessionId) {
+              await persistAutoCaptureWatermark(sessionKey, 0);
+              api.logger.info(
+                `memory-lancedb-pro: auto-capture watermark reset for ${sessionKey} (session renewed: ${recordedSessionId.slice(0, 8)} -> ${hookSessionId.slice(0, 8)})`,
+              );
+            }
+            autoCaptureSessionIds.set(sessionKey, hookSessionId);
+            pruneMapIfOver(autoCaptureSessionIds, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
+
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
           let newTexts = eligibleTexts;
           let watermarkAdvanceOverride: number | null = null;
