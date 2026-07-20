@@ -259,3 +259,154 @@ describe("auto-capture watermark after successful extraction (history flow)", ()
     }
   });
 });
+
+describe("auto-capture watermark invalidation on session renewal", () => {
+  let workspaceDir;
+  let embeddingServer;
+  let llmServer;
+  let extractionPrompts;
+
+  beforeEach(async () => {
+    workspaceDir = mkdtempSync(path.join(tmpdir(), "autocapture-renewal-"));
+    extractionPrompts = [];
+    embeddingServer = createEmbeddingServer();
+    llmServer = createLlmServer(extractionPrompts);
+    await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+    resetRegistration();
+  });
+
+  afterEach(async () => {
+    resetRegistration();
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => llmServer.close(resolve));
+    rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  function makeConfig() {
+    return {
+      dbPath: path.join(workspaceDir, "db"),
+      autoCapture: true,
+      autoRecall: false,
+      smartExtraction: true,
+      extractMinMessages: 2,
+      extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
+      sessionCompression: { enabled: false },
+      selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      embedding: {
+        apiKey: "test-api-key",
+        model: "mock-embedding-model",
+        baseURL: `http://127.0.0.1:${embeddingServer.address().port}/v1`,
+        dimensions: EMBEDDING_DIMENSIONS,
+      },
+      llm: {
+        apiKey: "test-api-key",
+        model: "mock-memory-model",
+        baseURL: `http://127.0.0.1:${llmServer.address().port}`,
+      },
+    };
+  }
+
+  it("resets the watermark when the sessionId rotates under a stable sessionKey (stale-HIGH swallow case)", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: makeConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+
+    // Session A: two texts, extraction fires, watermark now counts them.
+    await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS), {
+      sessionKey: "agent:dave:main",
+      agentId: "dave",
+      sessionId: "session-aaa",
+    });
+    assert.equal(extractionPrompts.length, 1, "session A must extract");
+
+    // Renewal: same key, NEW sessionId, and the fresh session's history is
+    // the same SIZE as the stale cursor. Without invalidation the payload
+    // reads as already-seen and is silently swallowed.
+    await fireAgentEnd(hook, userMessages(...TURN_2_TEXTS), {
+      sessionKey: "agent:dave:main",
+      agentId: "dave",
+      sessionId: "session-bbb",
+    });
+    assert.equal(extractionPrompts.length, 2, "the renewed session's first payload must extract, not be swallowed");
+    assert.ok(
+      extractionPrompts[1].includes(TURN_2_TEXTS[0]) && extractionPrompts[1].includes(TURN_2_TEXTS[1]),
+      "the renewed session's own texts must be extracted",
+    );
+    assert.ok(
+      harness.logs.info.some((m) => m.includes("watermark reset") && m.includes("session renewed")),
+      "the reset must be visible at the standard log level",
+    );
+  });
+
+  it("does not reset while the sessionId stays stable", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: makeConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const ctx = { sessionKey: "agent:dave:main", agentId: "dave", sessionId: "session-aaa" };
+
+    await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS), ctx);
+    await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS, ...TURN_2_TEXTS), ctx);
+
+    assert.equal(extractionPrompts.length, 2, "normal delta flow is unchanged");
+    assert.ok(
+      !extractionPrompts[1].includes(TURN_1_TEXTS[0]),
+      "the stable-session delta must not re-read extracted history",
+    );
+    assert.ok(
+      !harness.logs.info.some((m) => m.includes("session renewed")),
+      "no renewal reset may fire for a stable sessionId",
+    );
+  });
+
+  it("does not reset when the hook context carries no sessionId", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: makeConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const ctx = { sessionKey: "agent:dave:main", agentId: "dave" };
+
+    await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS), ctx);
+    await fireAgentEnd(hook, userMessages(...TURN_1_TEXTS, ...TURN_2_TEXTS), ctx);
+
+    assert.equal(extractionPrompts.length, 2);
+    assert.ok(
+      !harness.logs.info.some((m) => m.includes("session renewed")),
+      "a missing renewal signal must never trigger a reset",
+    );
+  });
+
+  it("records without resetting on the first sighting after a restart (restart survival preserved)", async () => {
+    const config = makeConfig();
+    const first = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: config });
+    memoryLanceDBProPlugin.register(first.api);
+    const firstHook = getAutoCaptureHook(first.eventHandlers);
+    const ctx = { sessionKey: "agent:dave:main", agentId: "dave", sessionId: "session-aaa" };
+
+    await fireAgentEnd(firstHook, userMessages(...TURN_1_TEXTS), ctx);
+    assert.equal(extractionPrompts.length, 1);
+
+    // Restart: fresh process state, same dbPath. The persisted watermark
+    // rehydrates; the in-memory sessionId map starts empty and must record
+    // the (unchanged) sessionId without resetting anything.
+    resetRegistration();
+    const second = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: config });
+    memoryLanceDBProPlugin.register(second.api);
+    const secondHook = getAutoCaptureHook(second.eventHandlers);
+
+    await fireAgentEnd(secondHook, userMessages(...TURN_1_TEXTS), ctx);
+    // The persisted watermark must rehydrate (previousSeen carries across the
+    // restart). Known separate limitation, deliberately NOT pinned here: the
+    // in-memory flow detector also resets, so the first post-restart history
+    // payload is re-counted as new and re-extracts once (dedup absorbs it);
+    // that is the restart-reclassification sibling of the delta-fed stall,
+    // tracked on the watermark family ticket.
+    assert.ok(
+      [...second.logs.info, ...second.logs.debug].some((m) => m.includes("previousSeen=2")),
+      "the persisted watermark must rehydrate after a restart",
+    );
+    assert.ok(
+      !second.logs.info.some((m) => m.includes("session renewed")),
+      "a restart must never masquerade as a session renewal",
+    );
+  });
+});
