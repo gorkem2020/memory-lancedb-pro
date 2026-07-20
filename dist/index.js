@@ -42,7 +42,7 @@ import { gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.j
 import { createMemoryCLI } from "./cli.js";
 import { clampBatchChunkSize } from "./src/memory-categories.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
+import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, trimTurnsToUserCap, dedupePairWindow, } from "./src/auto-capture-cleanup.js";
 import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
@@ -3194,7 +3194,7 @@ const memoryLanceDBProPlugin = {
                             newUserTexts: newTexts,
                         });
                         const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
-                        const pairWindowTurns = trimTurnsToUserCap([...priorPairTurns, ...thisCallPairTurns], Math.max(minMessages, thisCallPairTurns.filter((turn) => turn.role === "user").length));
+                        const pairWindowTurns = trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...thisCallPairTurns]), Math.max(minMessages, thisCallPairTurns.filter((turn) => turn.role === "user").length));
                         if (thisCallPairTurns.length > 0) {
                             autoCaptureRecentPairTurns.set(sessionKey, pairWindowTurns);
                             pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);

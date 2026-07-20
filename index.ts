@@ -78,6 +78,7 @@ import {
   buildConversationTurnsForExtraction,
   capUnknownWatermarkWindow,
   trimTurnsToUserCap,
+  dedupePairWindow,
 } from "./src/auto-capture-cleanup.js";
 import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 
@@ -4166,7 +4167,7 @@ const memoryLanceDBProPlugin = {
           });
           const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
           const pairWindowTurns = trimTurnsToUserCap(
-            [...priorPairTurns, ...thisCallPairTurns],
+            dedupePairWindow([...priorPairTurns, ...thisCallPairTurns]),
             Math.max(minMessages, thisCallPairTurns.filter((turn) => turn.role === "user").length),
           );
           if (thisCallPairTurns.length > 0) {
