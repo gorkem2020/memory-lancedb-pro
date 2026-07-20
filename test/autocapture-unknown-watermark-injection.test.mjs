@@ -234,15 +234,23 @@ describe("bounded injection when the watermark is unknown and history is large",
     // Second call: one more new message. The watermark must have jumped to
     // the FULL prior length (40, not just the 2-text window), so this turn
     // is a normal small delta -- not another oversized dump, and not a
-    // re-read of the forfeited prefix.
+    // re-read of the forfeited prefix. The retained rolling pair window DOES
+    // carry the immediately previous extracted turn back in as context
+    // (trimmed to the 2-user-turn cap), which is the retention feature
+    // working -- only the forfeited prefix and beyond-cap turns must stay
+    // out.
     await fireAgentEnd(hook, userMessages(...history, "synthetic turn 41 content here"), ctx);
     assert.equal(extractionPrompts.length, 2, "the next turn's single new message must fire a normal delta extraction");
     const secondPrompt = extractionPrompts[1];
     assert.ok(secondPrompt.includes("synthetic turn 41 content here"));
-    for (let i = 1; i <= 40; i++) {
+    assert.ok(
+      secondPrompt.includes("synthetic turn 40 content here"),
+      "the retained window carries the previous extracted turn as context",
+    );
+    for (let i = 1; i <= 39; i++) {
       assert.ok(
         !secondPrompt.includes(`synthetic turn ${i} content here`),
-        `turn 2 must not re-read forfeited or already-extracted turn ${i}`,
+        `turn 2 must not re-read forfeited or beyond-cap turn ${i}`,
       );
     }
   });
