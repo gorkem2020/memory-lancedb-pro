@@ -38,6 +38,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
   { group: "core-regression", runner: "node", file: "test/assistant-context-capture.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/extraction-transcript-speaker-tags.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/auto-capture-cleanup.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/assistant-context-capture-counting-symmetry.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },

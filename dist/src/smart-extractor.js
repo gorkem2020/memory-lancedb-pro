@@ -7,7 +7,7 @@
  */
 import { buildExtractionPrompt, buildDedupPrompt, buildMergePrompt, buildBatchDedupPrompt, buildBatchMergePrompt, } from "./extraction-prompts.js";
 import { formatExistingMemoryEntry } from "./prompt-blocks.js";
-import { formatConversationTranscript, } from "./auto-capture-cleanup.js";
+import { formatConversationTranscript, trimTranscriptToTagBoundary, } from "./auto-capture-cleanup.js";
 import { ALWAYS_MERGE_CATEGORIES, DURABLE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
@@ -764,7 +764,7 @@ export class SmartExtractor {
                 ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant", text })),
             ];
         const rawTranscript = formatConversationTranscript(turns, user);
-        const transcript = rawTranscript.length > maxChars ? rawTranscript.slice(-maxChars) : rawTranscript;
+        const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
         const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
             assistantEligible: this.config.captureAssistantEligible === true,
         });

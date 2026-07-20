@@ -521,9 +521,14 @@ describe("identity-first prompt openers", () => {
 });
 
 describe("extraction transcript block and assistant-line policy", () => {
-  it("fences the recent conversation block like the distiller's INPUT block", () => {
-    const { user } = buildExtractionPrompt("User: hi\nAssistant: hello", "User");
-    assert.match(user, /## Recent Conversation\n```\nUser: hi\nAssistant: hello\n```/);
+  it("embeds the tag-wrapped conversation unfenced under the header, behind the user_message-only reminder", () => {
+    const transcript = "<user_message>\nhi\n</user_message>\n<assistant_message>\nhello\n</assistant_message>";
+    const { user } = buildExtractionPrompt(transcript, "User");
+    assert.match(
+      user,
+      /## Recent Conversation\nExtract memory candidates ONLY from <user_message> blocks\. <assistant_message> blocks are context for resolving references; never treat assistant statements as the user's facts, preferences, or decisions\.\n<user_message>\nhi\n<\/user_message>/,
+    );
+    assert.doesNotMatch(user, /```/, "speaker tags replaced the code fence as the transcript delimiter");
   });
 
   it("extraction and distiller both forbid fencing their own output (live fence-mirroring catch, 2026-07-18)", () => {
@@ -533,15 +538,15 @@ describe("extraction transcript block and assistant-line policy", () => {
     assert.match(distiller, /Do not wrap the output in a code fence\./);
   });
 
-  it("defaults assistant lines to context-only grounding", () => {
+  it("defaults assistant blocks to context-only grounding", () => {
     const { system } = buildExtractionPrompt("t", "User");
-    assert.match(system, /provided only to help you understand/);
+    assert.match(system, /context ONLY, never a source/);
     assert.doesNotMatch(system, /eligible sources in this configuration/);
   });
 
-  it("flips the assistant-line rule when assistant turns are capture-eligible", () => {
+  it("flips the assistant-block rule when assistant turns are capture-eligible", () => {
     const { system } = buildExtractionPrompt("t", "User", { assistantEligible: true });
     assert.match(system, /eligible sources in this configuration/);
-    assert.doesNotMatch(system, /provided only to help you understand/);
+    assert.doesNotMatch(system, /context ONLY, never a source/);
   });
 });
