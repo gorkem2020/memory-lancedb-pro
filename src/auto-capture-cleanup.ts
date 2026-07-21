@@ -159,6 +159,16 @@ export interface ConversationTurn {
 }
 
 /**
+ * A literal speaker tag typed INSIDE a message could fake a block boundary
+ * (or defeat tag-boundary trimming, which trusts that literal tags only occur
+ * as real boundaries). Rewritten with guillemets the text stays readable but
+ * can no longer be confused with transcript structure.
+ */
+export function neutralizeSpeakerTagSpoof(text: string): string {
+  return text.replace(/<(\/?)((?:user|assistant)_message)>/g, "‹$1$2›");
+}
+
+/**
  * Renders turns oldest-first with each message wholly enclosed in
  * <user_message>/<assistant_message> tags. Line prefixes ("User:") mark only
  * the first line of a message, so a multi-paragraph assistant reply sheds its
@@ -174,8 +184,8 @@ export function formatConversationTranscript(
   return turns
     .map((turn) =>
       turn.role === "user"
-        ? `<user_message>\n${turn.text}\n</user_message>`
-        : `<assistant_message>\n${turn.text}\n</assistant_message>`,
+        ? `<user_message>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</user_message>`
+        : `<assistant_message>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</assistant_message>`,
     )
     .join("\n");
 }

@@ -446,13 +446,14 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
   });
 
   it("user carries only the per-call payload (tool error signals + the conversation input), no identity or instruction duplication", () => {
-    const { user } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, []);
+    const transcript = "<user_message>\nhello\n</user_message>\n<assistant_message>\nhi\n</assistant_message>";
+    const { user } = buildReflectionPromptParts(transcript, 1000, []);
     assert.doesNotMatch(user, /You are a memory reflection distiller agent/i);
     assert.doesNotMatch(user, /Hard rules:/);
     assert.doesNotMatch(user, /OUTPUT TEMPLATE/);
     assert.match(user, /Recent tool error signals:/);
     assert.match(user, /INPUT:/);
-    assert.match(user, /user: hello\nassistant: hi/);
+    assert.ok(user.includes(transcript));
   });
 
   it("does not leak this call's tool error signals or conversation input into system", () => {
@@ -465,13 +466,17 @@ describe("buildReflectionPrompt system/user split (reflection distiller)", () =>
     assert.doesNotMatch(system, /QWERTY/);
   });
 
-  it("joining system and user with a blank line reproduces the exact prior single-string prompt", () => {
-    const { system, user } = buildReflectionPromptParts("user: hello\nassistant: hi", 1000, [
+  it("joining system and user with a blank line reproduces the exact single-string prompt", () => {
+    const transcript = "<user_message>\nhello\n</user_message>\n<assistant_message>\nhi\n</assistant_message>";
+    const { system, user } = buildReflectionPromptParts(transcript, 1000, [
       { toolName: "bash", summary: "flaky retry", signatureHash: "deadbeef" },
     ]);
     const joined = `${system}\n\n${user}`;
     assert.match(joined, /- This run showed \.\.\.\n\nRecent tool error signals:\n1\. \[bash\] flaky retry/);
-    assert.match(joined, /INPUT:\n```\nuser: hello\nassistant: hi\n```$/);
+    assert.ok(
+      joined.endsWith(`INPUT:\n${transcript}`),
+      "the transcript rides unfenced at the tail (speaker tags are the delimiter, matching the extraction lane)",
+    );
   });
 });
 

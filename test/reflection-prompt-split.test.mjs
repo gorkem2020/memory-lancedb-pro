@@ -5,9 +5,9 @@
  * system = identity + every static block (task, headings contract, hard
  * rules, section/governance rules, notes, output template), delivered to the
  * embedded runner via systemPromptOverride (fleet core); user = ONLY the
- * dynamically generated content (tool error signals + the INPUT transcript
- * fence). The prompt TEXT itself is verbatim from the previous single-slot
- * form - this is slot placement only.
+ * dynamically generated content (tool error signals + the tagged INPUT
+ * transcript, unfenced -- a fence would break on any code block inside the
+ * conversation).
  *
  * The CLI fallback runner cannot set a system prompt (openclaw agent
  * --message carries a single user message), so it keeps the combined
@@ -53,7 +53,8 @@ const STATIC_SENTINELS = [
   "- This run showed ...",
 ];
 
-const CONVERSATION = "user: hello there\nassistant: hi, noted";
+const CONVERSATION =
+  "<user_message>\nhello there\n</user_message>\n<assistant_message>\nhi, noted\n</assistant_message>";
 
 // loadEmbeddedPiRunner caches the first Layer-1 runner it resolves
 // module-wide, so every test in this file shares ONE fake api and swaps
@@ -91,11 +92,12 @@ describe("buildReflectionPromptParts slot placement", () => {
     }
   });
 
-  it("user carries ONLY the dynamic content: tool error signals then the INPUT fence", () => {
+  it("user carries ONLY the dynamic content: tool error signals then the tagged INPUT transcript", () => {
     const parts = buildReflectionPromptParts(CONVERSATION, 1000, []);
     assert.ok(parts.user.startsWith("Recent tool error signals:"), "user must open with the tool-error block");
     assert.ok(parts.user.includes("- (none)"), "empty signals render the placeholder");
-    assert.ok(parts.user.includes(`INPUT:\n\`\`\`\n${CONVERSATION}\n\`\`\``), "user must carry the fenced transcript");
+    assert.ok(parts.user.includes(`INPUT:\n${CONVERSATION}`), "user must carry the tagged transcript unfenced");
+    assert.ok(!parts.user.includes("```"), "no code fence may wrap the transcript");
     assert.ok(!parts.user.includes("## Context (session background)"), "the headings contract must not leak into user");
     assert.ok(!parts.system.includes(CONVERSATION), "the transcript must not leak into system");
   });
@@ -115,7 +117,14 @@ describe("buildReflectionPromptParts slot placement", () => {
       combined.includes("- This run showed ...\n\nRecent tool error signals:"),
       "the static tail must flow into the dynamic block exactly as the legacy single-slot prompt did",
     );
-    assert.ok(combined.endsWith("```"), "the combined form still ends with the INPUT fence close");
+    assert.ok(combined.endsWith("</assistant_message>"), "the combined form ends with the transcript's closing tag");
+  });
+
+  it("documents the tag grammar in system", () => {
+    const parts = buildReflectionPromptParts(CONVERSATION, 1000, []);
+    assert.ok(parts.system.includes("The INPUT transcript is a sequence of tagged blocks in chronological order:"));
+    assert.ok(parts.system.includes("- <user_message>...</user_message> wraps ONE message written by the human user."));
+    assert.ok(parts.system.includes("- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant."));
   });
 
   it("clips the conversation to maxInputChars from the tail, in user only", () => {
@@ -123,6 +132,14 @@ describe("buildReflectionPromptParts slot placement", () => {
     const parts = buildReflectionPromptParts(long, 20, []);
     assert.ok(parts.user.includes("TAIL-MARKER"));
     assert.ok(!parts.user.includes("x".repeat(30)), "only the last maxInputChars survive");
+  });
+
+  it("snaps an over-limit clip to the next whole tagged block, never a headless half message", () => {
+    const transcript =
+      `<user_message>\n${"a".repeat(120)}\n</user_message>\n<assistant_message>\nkeep this tail reply\n</assistant_message>`;
+    const parts = buildReflectionPromptParts(transcript, 70, []);
+    assert.ok(parts.user.includes("INPUT:\n<assistant_message>"), "the clipped transcript must open at a block boundary");
+    assert.ok(!parts.user.includes("aaaa"), "the sliced-away user block must not bleed in headless");
   });
 });
 
