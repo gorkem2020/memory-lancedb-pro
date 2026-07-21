@@ -357,7 +357,7 @@ export interface SmartExtractorConfig {
   batchChunkSize?: number;
   /** Mirrors captureAssistant === true: the extraction prompt then treats assistant lines as eligible grounding sources instead of context-only. */
   captureAssistantEligible?: boolean;
-  /** JR-205 echo guard: drops candidates near-identical to a recent manual memory_store/memory_update text, pre-judge. */
+  /** Echo guard: drops candidates near-identical to a recent manual memory_store/memory_update text, pre-judge. */
   manualEchoLedger?: ManualEchoLedger;
   /** Maximum characters of conversation text to process. */
   extractMaxChars?: number;
@@ -542,7 +542,7 @@ export class SmartExtractor {
     );
     let candidates = extraction.candidates;
 
-    // JR-205 echo guard: candidates near-identical to a recent manual
+    // Echo guard: candidates near-identical to a recent manual
     // memory_store/memory_update text are echoes of a row that already
     // exists verbatim — drop them before any judge/dedup/merge spend.
     const echoLedger = this.config.manualEchoLedger;

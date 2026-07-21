@@ -2575,7 +2575,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const mdMirror = createMdMirrorWriter(api, config);
 
   let smartExtractor: SmartExtractor | null = null;
-  // JR-205 echo guard: shared between the manual store/update tools (record
+  // Echo guard: shared between the manual store/update tools (record
   // side) and the smart extractor (drop side); lives here so the tools keep
   // recording even when smart extraction is disabled.
   const manualEchoLedger = new ManualEchoLedger();

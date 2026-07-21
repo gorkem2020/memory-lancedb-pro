@@ -1,5 +1,5 @@
 /**
- * Manual-store echo guard (JR-205 class): when the user dictates a memory,
+ * Manual-store echo guard: when the user dictates a memory,
  * the same sentence reaches BOTH the manual store lane (memory_store /
  * memory_update, always-priority, verbatim) and auto-capture extraction,
  * which mints near-twin candidates the dedup layer cannot reliably collide —

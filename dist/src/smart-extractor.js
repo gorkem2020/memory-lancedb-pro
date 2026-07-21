@@ -288,7 +288,7 @@ export class SmartExtractor {
         // Step 1: LLM extraction
         const extraction = await this.extractCandidates(conversationText, options.assistantContextTexts, options.conversationTurns, policyMode);
         let candidates = extraction.candidates;
-        // JR-205 echo guard: candidates near-identical to a recent manual
+        // Echo guard: candidates near-identical to a recent manual
         // memory_store/memory_update text are echoes of a row that already
         // exists verbatim — drop them before any judge/dedup/merge spend.
         const echoLedger = this.config.manualEchoLedger;

@@ -120,19 +120,19 @@ describe("isNearIdenticalEcho", () => {
 describe("ManualEchoLedger", () => {
   it("records and matches per agent", () => {
     const ledger = new ManualEchoLedger();
-    ledger.record("terry", "favorite teacup: the red one");
+    ledger.record("agent-one", "favorite teacup: the red one");
     assert.ok(
-      ledger.match("terry", "User's favorite teacup is the red one"),
+      ledger.match("agent-one", "User's favorite teacup is the red one"),
     );
     assert.equal(
-      ledger.match("dave", "User's favorite teacup is the red one"),
+      ledger.match("agent-two", "User's favorite teacup is the red one"),
       null,
     );
   });
 
   it("returns null when nothing recorded", () => {
     const ledger = new ManualEchoLedger();
-    assert.equal(ledger.match("terry", "anything at all"), null);
+    assert.equal(ledger.match("agent-one", "anything at all"), null);
   });
 
   it("buckets undefined agent ids together", () => {
@@ -143,31 +143,31 @@ describe("ManualEchoLedger", () => {
 
   it("caps the ring and evicts the oldest entry", () => {
     const ledger = new ManualEchoLedger();
-    ledger.record("terry", "the very first manual fact about topic zero");
+    ledger.record("agent-one", "the very first manual fact about topic zero");
     for (let i = 1; i <= MANUAL_ECHO_RING_SIZE; i++) {
-      ledger.record("terry", `distinct manual fact number ${i} about topic ${i}`);
+      ledger.record("agent-one", `distinct manual fact number ${i} about topic ${i}`);
     }
     assert.equal(
-      ledger.match("terry", "the very first manual fact about topic zero"),
+      ledger.match("agent-one", "the very first manual fact about topic zero"),
       null,
     );
     assert.ok(
-      ledger.match("terry", `distinct manual fact number ${MANUAL_ECHO_RING_SIZE} about topic ${MANUAL_ECHO_RING_SIZE}`),
+      ledger.match("agent-one", `distinct manual fact number ${MANUAL_ECHO_RING_SIZE} about topic ${MANUAL_ECHO_RING_SIZE}`),
     );
   });
 
   it("ignores empty and whitespace-only records", () => {
     const ledger = new ManualEchoLedger();
-    ledger.record("terry", "   ");
-    assert.equal(ledger.match("terry", "   "), null);
+    ledger.record("agent-one", "   ");
+    assert.equal(ledger.match("agent-one", "   "), null);
   });
 
   it("clear() empties one agent's ring only", () => {
     const ledger = new ManualEchoLedger();
-    ledger.record("terry", "favorite teacup: the red one");
-    ledger.record("dave", "favorite teacup: the red one");
-    ledger.clear("terry");
-    assert.equal(ledger.match("terry", "favorite teacup: the red one"), null);
-    assert.ok(ledger.match("dave", "favorite teacup: the red one"));
+    ledger.record("agent-one", "favorite teacup: the red one");
+    ledger.record("agent-two", "favorite teacup: the red one");
+    ledger.clear("agent-one");
+    assert.equal(ledger.match("agent-one", "favorite teacup: the red one"), null);
+    assert.ok(ledger.match("agent-two", "favorite teacup: the red one"));
   });
 });

@@ -78,7 +78,7 @@ interface ToolContext {
   // row supersedes it instead of being rejected as a duplicate; the manual
   // text always lands verbatim.
   manualStoreSupersede?: boolean;
-  // JR-205 echo guard: manual store/update texts are recorded here so
+  // Echo guard: manual store/update texts are recorded here so
   // auto-capture extraction can drop near-identical echo candidates.
   manualEchoLedger?: ManualEchoLedger;
   // Mirrors MemoryCliContext's onMemoriesDeleted (cli.ts): lets the host invalidate
