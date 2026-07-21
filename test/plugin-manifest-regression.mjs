@@ -66,6 +66,7 @@ function createMockApi(pluginConfig, options = {}) {
 for (const key of [
   "smartExtraction",
   "extractMinMessages",
+  "autoCaptureContextTurns",
   "extractMaxChars",
   "llm",
   "autoRecallMaxItems",
@@ -95,6 +96,11 @@ assert.ok(
 assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthProvider"),
   "configSchema should declare llm.oauthProvider",
+);
+assert.equal(
+  manifest.configSchema.properties.autoCaptureContextTurns?.default,
+  0,
+  "autoCaptureContextTurns defaults to 0 (context retention disabled upstream)",
 );
 assert.equal(
   manifest.configSchema.properties.captureAssistant?.type,

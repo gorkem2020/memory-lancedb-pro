@@ -6,8 +6,10 @@
  * steady state — where history-carrying sessions extract every turn — each
  * call saw only the current pair and the "context continuity" the window
  * exists for never materialized. Valid-empty extractions already retained
- * the buffer; success must too. The window stays bounded by the existing
- * set-time trim (max(extractMinMessages, this call's new user turns)).
+ * the buffer; success must too. The window is sized by autoCaptureContextTurns
+ * (0 = disabled and nothing is retained between calls; when enabled the
+ * set-time trim keeps max(autoCaptureContextTurns, this call's new user
+ * turns)).
  *
  * Fixtures are entirely synthetic; no real fleet data.
  */
@@ -176,6 +178,7 @@ describe("pair-window retention across successful extractions", () => {
   let llmServer;
   let extractionPrompts;
   let hook;
+  let basePluginConfig;
 
   beforeEach(async () => {
     resetRegistration();
@@ -186,12 +189,13 @@ describe("pair-window retention across successful extractions", () => {
     await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
     await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
 
-    const pluginConfig = {
+    basePluginConfig = {
       dbPath: path.join(workspaceDir, "memory-db"),
       autoCapture: true,
       autoRecall: false,
       smartExtraction: true,
       extractMinMessages: 2,
+      autoCaptureContextTurns: 2,
       extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
       sessionCompression: { enabled: false },
       selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
@@ -207,10 +211,20 @@ describe("pair-window retention across successful extractions", () => {
         baseURL: `http://127.0.0.1:${llmServer.address().port}`,
       },
     };
-    const harness = createPluginApiHarness({ pluginConfig, resolveRoot: workspaceDir });
+    const harness = createPluginApiHarness({ pluginConfig: basePluginConfig, resolveRoot: workspaceDir });
     memoryLanceDBProPlugin.register(harness.api);
     hook = getAutoCaptureHook(harness.eventHandlers);
   });
+
+  function registerFresh(overrides) {
+    resetRegistration();
+    const harness = createPluginApiHarness({
+      pluginConfig: { ...basePluginConfig, ...overrides },
+      resolveRoot: workspaceDir,
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    return getAutoCaptureHook(harness.eventHandlers);
+  }
 
   afterEach(async () => {
     await new Promise((resolve) => embeddingServer.close(resolve));
@@ -251,6 +265,40 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(third.includes(U3), "turn 3 retains the immediately previous user turn");
     assert.ok(!third.includes(U2), "the cap keeps the window at 2 user turns");
     assert.ok(!third.includes(U1), "long-dropped pairs never resurface");
+  });
+
+  it("retains nothing between calls when autoCaptureContextTurns is 0", async () => {
+    const zeroHook = registerFresh({
+      autoCaptureContextTurns: 0,
+      dbPath: path.join(workspaceDir, "memory-db-zero"),
+    });
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+
+    await fireAgentEnd(zeroHook, turnMessages(4), ctx);
+    assert.equal(extractionPrompts.length, 1, "turn 1 should extract");
+    await fireAgentEnd(zeroHook, turnMessages(6), ctx);
+    assert.equal(extractionPrompts.length, 2, "turn 2 should extract");
+    const second = extractionPrompts[1];
+    assert.ok(second.includes(U3), "the call's own new turn is present");
+    assert.ok(
+      !second.includes(U2) && !second.includes(U1),
+      "a disabled window may not carry prior pairs into the next extraction",
+    );
+  });
+
+  it("defaults to disabled when the knob is absent (upstream behavior preserved)", async () => {
+    const defaultHook = registerFresh({
+      autoCaptureContextTurns: undefined,
+      dbPath: path.join(workspaceDir, "memory-db-default"),
+    });
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+
+    await fireAgentEnd(defaultHook, turnMessages(4), ctx);
+    await fireAgentEnd(defaultHook, turnMessages(6), ctx);
+    assert.equal(extractionPrompts.length, 2);
+    const second = extractionPrompts[1];
+    assert.ok(second.includes(U3));
+    assert.ok(!second.includes(U2) && !second.includes(U1), "absent knob means no retained context");
   });
 
   it("clears the retained window when the session renews under a stable key", async () => {

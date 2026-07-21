@@ -209,7 +209,7 @@ interface PluginConfig {
   autoRecallExcludeAgents?: string[];
   /** Agent IDs included in auto-recall injection (whitelist mode). When set, ONLY these agents receive auto-recall. Unresolved agent context falls back to 'main'. If both include and exclude are set, include wins. */
   autoRecallIncludeAgents?: string[];
-  /** true: capture assistant turns as eligible content (existing behavior). "context": include assistant turns as marked, non-extractable context without counting them toward extraction eligibility. */
+  /** true: assistant turns join the transcript as eligible sources with attribution rules; false (default): assistant turns are excluded entirely. */
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -283,6 +283,8 @@ interface PluginConfig {
     thinkLevel?: string;
   };
   extractMinMessages?: number;
+  /** Rolling extraction context window in retained user turns (0 = disabled, max 10). */
+  autoCaptureContextTurns?: number;
   /** Per-call chunk bound for every batched pipeline stage (1-50, default 10). */
   batchChunkSize?: number;
   extractMaxChars?: number;
@@ -4205,24 +4207,28 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          // Rolling PAIR window (operator spec: extractMinMessages counts
-          // user<->assistant pairs, and captureAssistant-eligible turns ride the
-          // same window). This call's new pairs -- kept user turns with the
-          // assistant replies interleaved in true order -- extend what
-          // earlier calls buffered, bounded to extractMinMessages user turns
-          // (or this call's own new-user count when larger, so unextracted
+          // Rolling PAIR window sized by autoCaptureContextTurns (0 =
+          // disabled: each extraction sees only its own call's turns, and
+          // nothing is retained between calls). When enabled, this call's
+          // new pairs -- kept user turns with the assistant replies
+          // interleaved in true order -- extend what earlier calls
+          // buffered, bounded to autoCaptureContextTurns user turns (or
+          // this call's own new-user count when larger, so unextracted
           // user turns are never trimmed out of their own transcript).
           const thisCallPairTurns = buildConversationTurnsForExtraction({
             messageLoopTurns: conversationTurns,
             eligibleTexts,
             newUserTexts: newTexts,
           });
-          const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
+          const contextTurns = config.autoCaptureContextTurns ?? 0;
+          const priorPairTurns = contextTurns > 0 ? autoCaptureRecentPairTurns.get(sessionKey) || [] : [];
           const pairWindowTurns = trimTurnsToUserCap(
             dedupePairWindow([...priorPairTurns, ...thisCallPairTurns]),
-            Math.max(minMessages, thisCallPairTurns.filter((turn) => turn.role === "user").length),
+            Math.max(contextTurns, thisCallPairTurns.filter((turn) => turn.role === "user").length),
           );
-          if (thisCallPairTurns.length > 0) {
+          if (contextTurns === 0) {
+            autoCaptureRecentPairTurns.delete(sessionKey);
+          } else if (thisCallPairTurns.length > 0) {
             autoCaptureRecentPairTurns.set(sessionKey, pairWindowTurns);
             pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
@@ -6507,6 +6513,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       })()
       : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+    autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
     batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize),
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,

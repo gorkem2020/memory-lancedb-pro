@@ -191,6 +191,7 @@ describe("bounded injection when the watermark is unknown and history is large",
         autoRecall: false,
         smartExtraction: true,
         extractMinMessages: 2,
+        autoCaptureContextTurns: 2,
         extractMaxChars: 8000,
         extractionThrottle: { skipLowValue: false, maxExtractionsPerHour: 200 },
         sessionCompression: { enabled: false },
@@ -238,7 +239,8 @@ describe("bounded injection when the watermark is unknown and history is large",
     // carry the immediately previous extracted turn back in as context
     // (trimmed to the 2-user-turn cap), which is the retention feature
     // working -- only the forfeited prefix and beyond-cap turns must stay
-    // out.
+    // out. (Retention is opted into via autoCaptureContextTurns: 2 above;
+    // with the knob at its 0 default nothing would be retained.)
     await fireAgentEnd(hook, userMessages(...history, "synthetic turn 41 content here"), ctx);
     assert.equal(extractionPrompts.length, 2, "the next turn's single new message must fire a normal delta extraction");
     const secondPrompt = extractionPrompts[1];

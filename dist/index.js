@@ -3215,21 +3215,26 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
-                        // Rolling PAIR window (operator spec: extractMinMessages counts
-                        // user<->assistant pairs, and captureAssistant-eligible turns ride the
-                        // same window). This call's new pairs -- kept user turns with the
-                        // assistant replies interleaved in true order -- extend what
-                        // earlier calls buffered, bounded to extractMinMessages user turns
-                        // (or this call's own new-user count when larger, so unextracted
+                        // Rolling PAIR window sized by autoCaptureContextTurns (0 =
+                        // disabled: each extraction sees only its own call's turns, and
+                        // nothing is retained between calls). When enabled, this call's
+                        // new pairs -- kept user turns with the assistant replies
+                        // interleaved in true order -- extend what earlier calls
+                        // buffered, bounded to autoCaptureContextTurns user turns (or
+                        // this call's own new-user count when larger, so unextracted
                         // user turns are never trimmed out of their own transcript).
                         const thisCallPairTurns = buildConversationTurnsForExtraction({
                             messageLoopTurns: conversationTurns,
                             eligibleTexts,
                             newUserTexts: newTexts,
                         });
-                        const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
-                        const pairWindowTurns = trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...thisCallPairTurns]), Math.max(minMessages, thisCallPairTurns.filter((turn) => turn.role === "user").length));
-                        if (thisCallPairTurns.length > 0) {
+                        const contextTurns = config.autoCaptureContextTurns ?? 0;
+                        const priorPairTurns = contextTurns > 0 ? autoCaptureRecentPairTurns.get(sessionKey) || [] : [];
+                        const pairWindowTurns = trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...thisCallPairTurns]), Math.max(contextTurns, thisCallPairTurns.filter((turn) => turn.role === "user").length));
+                        if (contextTurns === 0) {
+                            autoCaptureRecentPairTurns.delete(sessionKey);
+                        }
+                        else if (thisCallPairTurns.length > 0) {
                             autoCaptureRecentPairTurns.set(sessionKey, pairWindowTurns);
                             pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
@@ -5179,6 +5184,7 @@ export function parsePluginConfig(value) {
             })()
             : undefined,
         extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+        autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
         batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize),
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,
