@@ -143,6 +143,29 @@ describe("buildConversationTurnsForExtraction (pair-shaped window)", () => {
     ]);
   });
 
+  it("skips the already-seen prefix by index under mixed-role eligibility (captureAssistant=true)", () => {
+    // The dave regression shape (2026-07-21): 5 eligible texts of mixed role
+    // aligned 1:1 with the loop turns, previousSeen=3. The old user-turn
+    // walk skipped 3 USER turns for 3 mixed already-seen texts and emptied
+    // the window; the index skip keeps exactly the new delta.
+    const messageLoopTurns = [
+      { role: "user", text: "u1" },
+      { role: "assistant", text: "a1" },
+      { role: "user", text: "u2" },
+      { role: "assistant", text: "a2" },
+      { role: "user", text: "u3" },
+    ];
+    const result = buildConversationTurnsForExtraction({
+      messageLoopTurns,
+      eligibleTexts: ["u1", "a1", "u2", "a2", "u3"],
+      newUserTexts: ["a2", "u3"],
+    });
+    assert.deepEqual(result, [
+      { role: "assistant", text: "a2" },
+      { role: "user", text: "u3" },
+    ]);
+  });
+
   it("falls back to flat user turns when newUserTexts did not come from a tail-slice of eligibleTexts (pending-ingress replay)", () => {
     const messageLoopTurns = [{ role: "user", text: "unrelated-this-call-text" }];
     const result = buildConversationTurnsForExtraction({
@@ -190,6 +213,16 @@ describe("trimTurnsToUserCap (extractMinMessages as a window of pairs)", () => {
     assert.deepEqual(trimTurnsToUserCap(turns, 1), [
       { role: "user", text: "u3" },
       { role: "assistant", text: "a3" },
+    ]);
+  });
+
+  it("keeps the newest turns instead of dropping everything when the window has no user anchor", () => {
+    const assistantOnly = [
+      { role: "assistant", text: "a1" },
+      { role: "assistant", text: "a2" },
+    ];
+    assert.deepEqual(trimTurnsToUserCap(assistantOnly, 1), [
+      { role: "assistant", text: "a2" },
     ]);
   });
 });

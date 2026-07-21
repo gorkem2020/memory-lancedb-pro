@@ -233,6 +233,17 @@ export function buildConversationTurnsForExtraction(params: {
     return newUserTexts.map((text) => ({ role: "user", text }));
   }
 
+  // Since the captureAssistant boolean revert, the eligibility loop pushes
+  // exactly one turn per eligible text, so messageLoopTurns aligns 1:1 with
+  // eligibleTexts and the already-extracted prefix is a plain index skip.
+  // Role-agnostic on purpose: under captureAssistant=true eligible texts are
+  // mixed-role, and the older user-turn-counting walk below over-skipped
+  // there (it consumed one USER turn per already-seen text of ANY role,
+  // emptying the window — the 2026-07-21 empty-transcript regression).
+  if (messageLoopTurns.length === eligibleTexts.length) {
+    return messageLoopTurns.slice(eligibleTexts.length - newUserTexts.length);
+  }
+
   const skipUserCount = eligibleTexts.length - newUserTexts.length;
   const thisCallTurns: ConversationTurn[] = [];
   let userSeen = 0;
@@ -272,6 +283,12 @@ export function trimTurnsToUserCap(
       if (userCount > cap) break;
       start = i;
     }
+  }
+  if (userCount === 0) {
+    // All-assistant window (possible under captureAssistant=true when the
+    // delta carries only assistant turns): no user anchor exists, so keep
+    // the newest `cap` turns instead of silently dropping everything.
+    return turns.slice(-cap);
   }
   return turns.slice(start);
 }
