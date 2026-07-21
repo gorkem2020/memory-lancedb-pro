@@ -160,6 +160,33 @@ describe("buildExtractionPrompt speaker teaching", () => {
     assert.ok(user.includes("Extract memory candidates ONLY from <user_message> blocks."));
   });
 
+  it("teaches the assistant tag as CONTEXT-ONLY when assistantContext is set (captureAssistant=false + context window)", () => {
+    const { system, user } = buildExtractionPrompt(transcript, "User", { assistantContext: true });
+    assert.ok(
+      system.includes("wraps ONE message written by the AI assistant. Context only"),
+      "format teaching must describe assistant blocks as context",
+    );
+    assert.ok(
+      system.includes("<assistant_message> blocks: context only — NEVER extract memories from them."),
+      "the NOT-worth list must carry the context-only rule",
+    );
+    assert.ok(
+      system.includes("Memories may only be grounded here."),
+      "user-block grounding stays exclusive in context mode",
+    );
+    assert.ok(user.includes("Extract memory candidates ONLY from <user_message> blocks."));
+    assert.ok(!system.includes("also valid sources"), "no eligible-mode vocabulary may leak in");
+  });
+
+  it("lets assistantEligible win when both flags are set", () => {
+    const { system } = buildExtractionPrompt(transcript, "User", {
+      assistantEligible: true,
+      assistantContext: true,
+    });
+    assert.ok(system.includes("also valid sources"));
+    assert.ok(!system.includes("NEVER a source of memories"));
+  });
+
   it("keeps the eligible variant when assistantEligible is true, in tag vocabulary", () => {
     const { system, user } = buildExtractionPrompt(transcript, "User", { assistantEligible: true });
     assert.ok(system.includes("<assistant_message> blocks: also valid sources"));

@@ -267,6 +267,22 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(!third.includes(U1), "long-dropped pairs never resurface");
   });
 
+  it("rides assistant replies into the transcript as context under captureAssistant=false + context window", async () => {
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+
+    await fireAgentEnd(hook, turnMessages(4), ctx);
+    assert.equal(extractionPrompts.length, 1);
+    const first = extractionPrompts[0];
+    assert.ok(first.includes(`<assistant_message>\n${A1}`), "assistant replies must appear as tagged context blocks");
+    assert.ok(first.includes("Context only"), "the prompt must teach the assistant tag as context");
+    assert.ok(first.includes("NEVER extract memories from them"), "the context-only extraction rule must be present");
+
+    await fireAgentEnd(hook, turnMessages(6), ctx);
+    const second = extractionPrompts[1];
+    assert.ok(second.includes(`<assistant_message>\n${A2}`), "the retained window keeps the prior pair's assistant reply");
+    assert.ok(second.includes(`<assistant_message>\n${A3}`), "the new pair's assistant reply rides along");
+  });
+
   it("retains nothing between calls when autoCaptureContextTurns is 0", async () => {
     const zeroHook = registerFresh({
       autoCaptureContextTurns: 0,

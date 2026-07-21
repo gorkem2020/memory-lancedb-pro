@@ -1987,6 +1987,7 @@ function _initPluginState(api) {
                     user: "User",
                     batchChunkSize: config.batchChunkSize,
                     captureAssistantEligible: config.captureAssistant === true,
+                    assistantContextOnly: config.captureAssistant !== true && (config.autoCaptureContextTurns ?? 0) > 0,
                     manualEchoLedger,
                     extractMinMessages: config.extractMinMessages ?? 4,
                     extractMaxChars: config.extractMaxChars ?? 8000,
@@ -3091,6 +3092,7 @@ const memoryLanceDBProPlugin = {
                         const conversationTurns = [];
                         let skippedAutoCaptureTexts = 0;
                         const captureAssistantEligible = config.captureAssistant === true;
+                        const assistantContextOnly = !captureAssistantEligible && (config.autoCaptureContextTurns ?? 0) > 0;
                         for (const msg of event.messages) {
                             if (!msg || typeof msg !== "object") {
                                 continue;
@@ -3098,10 +3100,14 @@ const memoryLanceDBProPlugin = {
                             const msgObj = msg;
                             const role = msgObj.role;
                             const isEligibleRole = role === "user" || (captureAssistantEligible && role === "assistant");
-                            if (!isEligibleRole) {
+                            const isContextOnlyRole = assistantContextOnly && role === "assistant";
+                            if (!isEligibleRole && !isContextOnlyRole) {
                                 continue;
                             }
-                            const targetTexts = eligibleTexts;
+                            // Context-only assistant turns join the transcript window but never
+                            // the eligible set: they cannot fire the gate, move the watermark,
+                            // or ground a memory.
+                            const targetTexts = isEligibleRole ? eligibleTexts : null;
                             const content = msgObj.content;
                             if (typeof content === "string") {
                                 const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
@@ -3109,7 +3115,7 @@ const memoryLanceDBProPlugin = {
                                     skippedAutoCaptureTexts++;
                                 }
                                 else {
-                                    targetTexts.push(normalized);
+                                    targetTexts?.push(normalized);
                                     conversationTurns.push({ role: role, text: normalized });
                                 }
                                 continue;
@@ -3128,7 +3134,7 @@ const memoryLanceDBProPlugin = {
                                             skippedAutoCaptureTexts++;
                                         }
                                         else {
-                                            targetTexts.push(normalized);
+                                            targetTexts?.push(normalized);
                                             conversationTurns.push({ role: role, text: normalized });
                                         }
                                     }

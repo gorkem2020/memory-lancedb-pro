@@ -44,22 +44,34 @@ export interface SplitPrompt {
 export function buildExtractionPrompt(
   conversationText: string,
   user: string,
-  options: { assistantEligible?: boolean } = {},
+  options: { assistantEligible?: boolean; assistantContext?: boolean } = {},
 ): SplitPrompt {
-  // captureAssistant=false excludes assistant lines from the transcript
-  // entirely, so the prompt only describes <assistant_message> blocks — and
-  // their grounding rule — when they can actually appear (captureAssistant=true).
+  // Three transcript modes, driven by captureAssistant x autoCaptureContextTurns:
+  // - assistantEligible (captureAssistant=true): assistant blocks appear AND are
+  //   valid grounding sources, with attribution rules.
+  // - assistantContext (captureAssistant=false + context window on): assistant
+  //   blocks appear as CONTEXT ONLY — they disambiguate the user's messages but
+  //   are never memory sources.
+  // - neither: assistant lines are excluded from the transcript entirely, so
+  //   the prompt does not describe <assistant_message> blocks at all.
   const assistantEligible = options.assistantEligible === true;
+  const assistantContext = !assistantEligible && options.assistantContext === true;
   const assistantFormatBullet = assistantEligible
     ? `
 - <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.`
-    : "";
+    : assistantContext
+      ? `
+- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant. Context only — use it to resolve what the user meant (pronouns, follow-ups, corrections); it is NEVER a source of memories.`
+      : "";
   const userGroundingSuffix = assistantEligible ? "" : " Memories may only be grounded here.";
   const assistantBlocksRule = assistantEligible
     ? `
 - <assistant_message> blocks: also valid sources — but only for concrete facts the user did not correct. Skip the assistant's greetings, guesses, and self-description.
 - Attribute every memory to whoever actually said it. When both said it, use the <user_message> version.`
-    : "";
+    : assistantContext
+      ? `
+- <assistant_message> blocks: context only — NEVER extract memories from them. A fact that appears only in an assistant message must not be stored.`
+      : "";
   const system = `${EXTRACTION_AGENT_IDENTITY} Analyze session context and extract memories worth long-term preservation.
 
 ## Transcript format

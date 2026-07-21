@@ -783,6 +783,7 @@ export class SmartExtractor {
         const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
         const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
             assistantEligible: this.config.captureAssistantEligible === true,
+            assistantContext: this.config.assistantContextOnly === true,
         });
         const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
         if (!result) {
