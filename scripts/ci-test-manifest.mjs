@@ -6,6 +6,7 @@ export const CI_TEST_GROUPS = [
   "packaging-and-workflow",
   { group: "core-regression", runner: "node", file: "test/manual-echo-guard.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/capture-assistant-boolean.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-reflection.test.mjs", args: ["--test"] },
 ];
 
 export const CI_TEST_MANIFEST = [
