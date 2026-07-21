@@ -40,6 +40,7 @@ import {
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
+import { ManualEchoLedger } from "./src/manual-echo-guard.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
@@ -2417,6 +2418,7 @@ interface PluginSingletonState {
   scopeManager: ReturnType<typeof createScopeManager>;
   migrator: ReturnType<typeof createMigrator>;
   smartExtractor: SmartExtractor | null;
+  manualEchoLedger: ManualEchoLedger;
   admissionController: AdmissionController | null;
   admissionControllerReflectionLane: AdmissionController | null;
   reflectionLaneLlm: ReturnType<typeof createLlmClient> | undefined;
@@ -2557,6 +2559,10 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const mdMirror = createMdMirrorWriter(api, config);
 
   let smartExtractor: SmartExtractor | null = null;
+  // JR-205 echo guard: shared between the manual store/update tools (record
+  // side) and the smart extractor (drop side); lives here so the tools keep
+  // recording even when smart extraction is disabled.
+  const manualEchoLedger = new ManualEchoLedger();
   let admissionController: AdmissionController | null = null;
   let admissionControllerReflectionLane: AdmissionController | null = null;
   let reflectionLaneLlm: ReturnType<typeof createLlmClient> | undefined;
@@ -2688,6 +2694,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
           user: "User",
           batchChunkSize: config.batchChunkSize,
           captureAssistantEligible: config.captureAssistant === true,
+          manualEchoLedger,
           extractMinMessages: config.extractMinMessages ?? 4,
           extractMaxChars: config.extractMaxChars ?? 8000,
           defaultScope: config.scopes?.default ?? "global",
@@ -2757,6 +2764,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     scopeManager,
     migrator,
     smartExtractor,
+    manualEchoLedger,
     admissionController,
     admissionControllerReflectionLane,
     reflectionLaneLlm,
@@ -2922,6 +2930,7 @@ const memoryLanceDBProPlugin = {
       scopeManager,
       migrator,
       smartExtractor,
+      manualEchoLedger,
       admissionController,
       admissionControllerReflectionLane,
       reflectionLaneLlm,
@@ -3381,6 +3390,7 @@ const memoryLanceDBProPlugin = {
         workspaceBoundary: config.workspaceBoundary,
         selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
         manualStoreSupersede: config.manualStoreSupersede === true,
+        manualEchoLedger,
         // Mirrors the CLI context wiring below: keep in-process reflection caches
         // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
         onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),

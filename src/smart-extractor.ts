@@ -17,6 +17,7 @@ import {
   buildBatchMergePrompt,
 } from "./extraction-prompts.js";
 import { formatExistingMemoryEntry } from "./prompt-blocks.js";
+import type { ManualEchoLedger } from "./manual-echo-guard.js";
 import {
   type ConversationTurn,
   formatConversationTranscript,
@@ -356,6 +357,8 @@ export interface SmartExtractorConfig {
   batchChunkSize?: number;
   /** Mirrors captureAssistant === true: the extraction prompt then treats assistant lines as eligible grounding sources instead of context-only. */
   captureAssistantEligible?: boolean;
+  /** JR-205 echo guard: drops candidates near-identical to a recent manual memory_store/memory_update text, pre-judge. */
+  manualEchoLedger?: ManualEchoLedger;
   /** Maximum characters of conversation text to process. */
   extractMaxChars?: number;
   /** Default scope for new memories. */
@@ -537,7 +540,25 @@ export class SmartExtractor {
       options.conversationTurns,
       policyMode,
     );
-    const candidates = extraction.candidates;
+    let candidates = extraction.candidates;
+
+    // JR-205 echo guard: candidates near-identical to a recent manual
+    // memory_store/memory_update text are echoes of a row that already
+    // exists verbatim — drop them before any judge/dedup/merge spend.
+    const echoLedger = this.config.manualEchoLedger;
+    if (echoLedger && candidates.length > 0) {
+      const kept: CandidateMemory[] = [];
+      for (const candidate of candidates) {
+        if (echoLedger.match(agentId, candidate.content)) {
+          this.log(
+            `memory-pro: smart-extractor: manual-echo guard dropped candidate (near-identical to a recent manual store) category=${candidate.category} abstract=${JSON.stringify(candidate.abstract.slice(0, 120))}`,
+          );
+        } else {
+          kept.push(candidate);
+        }
+      }
+      candidates = kept;
+    }
 
     if (candidates.length === 0) {
       this.log("memory-pro: smart-extractor: no memories extracted");

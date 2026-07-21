@@ -26,6 +26,7 @@ import { createRetriever, normalizeRetrievalConfig, } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
+import { ManualEchoLedger } from "./src/manual-echo-guard.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { parseClawteamScopes, applyClawteamScopes } from "./src/clawteam-scope.js";
@@ -1867,6 +1868,10 @@ function _initPluginState(api) {
     // callback below closes over it.
     const mdMirror = createMdMirrorWriter(api, config);
     let smartExtractor = null;
+    // JR-205 echo guard: shared between the manual store/update tools (record
+    // side) and the smart extractor (drop side); lives here so the tools keep
+    // recording even when smart extraction is disabled.
+    const manualEchoLedger = new ManualEchoLedger();
     let admissionController = null;
     let admissionControllerReflectionLane = null;
     let reflectionLaneLlm;
@@ -1977,6 +1982,7 @@ function _initPluginState(api) {
                     user: "User",
                     batchChunkSize: config.batchChunkSize,
                     captureAssistantEligible: config.captureAssistant === true,
+                    manualEchoLedger,
                     extractMinMessages: config.extractMinMessages ?? 4,
                     extractMaxChars: config.extractMaxChars ?? 8000,
                     defaultScope: config.scopes?.default ?? "global",
@@ -2042,6 +2048,7 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        manualEchoLedger,
         admissionController,
         admissionControllerReflectionLane,
         reflectionLaneLlm,
@@ -2172,7 +2179,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, admissionController, admissionControllerReflectionLane, reflectionLaneLlm, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentPairTurns, autoCapturePayloadShapeLoggedSessions, autoCaptureSessionIds, autoCaptureLastEligibleLength, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, admissionController, admissionControllerReflectionLane, reflectionLaneLlm, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentPairTurns, autoCapturePayloadShapeLoggedSessions, autoCaptureSessionIds, autoCaptureLastEligibleLength, } = singleton;
         // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
         // must also go through here so the on-disk watermark never drifts from the
         // in-memory Map -- a process restart rehydrates from exactly what was last
@@ -2523,6 +2530,7 @@ const memoryLanceDBProPlugin = {
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
             manualStoreSupersede: config.manualStoreSupersede === true,
+            manualEchoLedger,
             // Mirrors the CLI context wiring below: keep in-process reflection caches
             // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
             onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),

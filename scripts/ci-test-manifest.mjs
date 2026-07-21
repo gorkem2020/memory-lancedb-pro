@@ -4,6 +4,7 @@ export const CI_TEST_GROUPS = [
   "storage-and-schema",
   "llm-clients-and-auth",
   "packaging-and-workflow",
+  { group: "core-regression", runner: "node", file: "test/manual-echo-guard.test.mjs", args: ["--test"] },
 ];
 
 export const CI_TEST_MANIFEST = [
