@@ -52,17 +52,18 @@ export function buildExtractionPrompt(
   const assistantEligible = options.assistantEligible === true;
   const assistantFormatBullet = assistantEligible
     ? `
-- <assistant_message>...</assistant_message> wraps ONE reply written by the AI assistant. Every line inside it — every paragraph, list, and heading up to the closing tag — is assistant-authored, never the user's words.`
+- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.`
     : "";
   const userGroundingSuffix = assistantEligible ? "" : " Memories may only be grounded here.";
   const assistantBlocksRule = assistantEligible
     ? `
-- <assistant_message> blocks: eligible sources in this configuration. A candidate may be grounded in an <assistant_message> block when it states a concrete durable fact about the user, their entities, or their work that went uncorrected — but never the assistant's own greetings, suggestions, speculation, or self-description. When the same fact has both a <user_message> and an <assistant_message> source, ground it in the <user_message>, and always attribute assistant-authored statements to the assistant, never to the user.`
+- <assistant_message> blocks: also valid sources — but only for concrete facts the user did not correct. Skip the assistant's greetings, guesses, and self-description.
+- Attribute every memory to whoever actually said it. When both said it, use the <user_message> version.`
     : "";
   const system = `${EXTRACTION_AGENT_IDENTITY} Analyze session context and extract memories worth long-term preservation.
 
 ## Transcript format
-The conversation in the user message is a sequence of tagged blocks in chronological order:
+The conversation is a sequence of tagged blocks in chronological order:
 - <user_message>...</user_message> wraps ONE message written by the human user.${userGroundingSuffix}${assistantFormatBullet}
 
 # Memory Extraction Criteria
@@ -264,16 +265,18 @@ Notes:
 - Preferences should be aggregated by topic
 - Always set the top-level "conversation_register" field, and tag every memory's "grounding" field, per the Conversational Grounding rules above`;
 
-  const userMessage = `User: ${user}
+  // "User: User" with the default generic identity confused live agents;
+  // the name line only appears when a real name is configured.
+  const userNameLine = user && user !== "User" ? `User: ${user}\n\n` : "";
+  const userMessage = `${userNameLine}Target Output Language: auto (detect from recent messages)
 
-Target Output Language: auto (detect from recent messages)
-
-## Recent Conversation
 ${
     assistantEligible
-      ? "Extract memory candidates from <user_message> blocks, and from <assistant_message> blocks per the assistant-message rule — always attributed to their true speaker, never to the user."
+      ? "Extract memory candidates from <user_message> and <assistant_message> blocks, attributed to their true speaker."
       : "Extract memory candidates ONLY from <user_message> blocks."
   }
+
+## Recent Conversation
 ${conversationText}`;
 
   return { system, user: userMessage };

@@ -526,7 +526,7 @@ describe("extraction transcript block and assistant-line policy", () => {
     const { user } = buildExtractionPrompt(transcript, "User");
     assert.match(
       user,
-      /## Recent Conversation\nExtract memory candidates ONLY from <user_message> blocks\.\n<user_message>\nhi\n<\/user_message>/,
+      /Extract memory candidates ONLY from <user_message> blocks\.\n\n## Recent Conversation\n<user_message>\nhi\n<\/user_message>/,
     );
     assert.doesNotMatch(user, /```/, "speaker tags replaced the code fence as the transcript delimiter");
   });
@@ -544,9 +544,9 @@ describe("extraction transcript block and assistant-line policy", () => {
     assert.doesNotMatch(system, /eligible sources in this configuration/);
   });
 
-  it("adds the assistant-block format and eligible rule when assistant turns are capture-eligible", () => {
+  it("adds the assistant-block format and source rule when assistant turns are capture-eligible", () => {
     const { system } = buildExtractionPrompt("t", "User", { assistantEligible: true });
-    assert.match(system, /eligible sources in this configuration/);
-    assert.match(system, /wraps ONE reply written by the AI assistant/);
+    assert.match(system, /also valid sources/);
+    assert.match(system, /wraps ONE message written by the AI assistant/);
   });
 });

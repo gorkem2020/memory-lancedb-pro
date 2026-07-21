@@ -70,21 +70,51 @@ describe("prompt under captureAssistant=true", () => {
     { assistantEligible: true },
   );
 
-  it("documents assistant blocks in the transcript format", () => {
-    assert.ok(system.includes("wraps ONE reply written by the AI assistant"));
+  it("documents assistant blocks in the transcript format, without the authorship over-explanation", () => {
+    assert.ok(system.includes("wraps ONE message written by the AI assistant"));
+    assert.ok(!system.includes("Every line inside it"));
   });
 
-  it("carries the attribution-aware eligible rule", () => {
-    assert.ok(system.includes("eligible sources in this configuration"));
-    assert.ok(system.includes("always attribute assistant-authored statements to the assistant, never to the user"));
+  it("carries the simplified source and attribution rules", () => {
+    assert.ok(system.includes("also valid sources — but only for concrete facts the user did not correct"));
+    assert.ok(system.includes("Attribute every memory to whoever actually said it"));
+    assert.ok(system.includes("use the <user_message> version"));
   });
 
   it("switches the user-slot instruction too (the contradiction fix)", () => {
-    assert.ok(user.includes("per the assistant-message rule"));
+    assert.ok(user.includes("attributed to their true speaker"));
     assert.ok(!user.includes("Extract memory candidates ONLY from <user_message> blocks."));
   });
 
   it("drops the user-only grounding suffix", () => {
     assert.ok(!system.includes("Memories may only be grounded here."));
+  });
+});
+
+describe("user-half layout (both modes)", () => {
+  it("places the extraction instruction ABOVE the Recent Conversation header, not under it", () => {
+    for (const opts of [{}, { assistantEligible: true }]) {
+      const { user } = buildExtractionPrompt("<user_message>\nhi\n</user_message>", "User", opts);
+      const instruction = user.indexOf("Extract memory candidates");
+      const header = user.indexOf("## Recent Conversation");
+      assert.ok(instruction >= 0 && header >= 0 && instruction < header,
+        "instruction must precede the header so it cannot read as conversation content");
+    }
+  });
+
+  it("never emits the generic 'User: User' line", () => {
+    const { user } = buildExtractionPrompt("t", "User");
+    assert.ok(!user.includes("User: User"));
+  });
+
+  it("emits a name line only when a real name is configured", () => {
+    const { user } = buildExtractionPrompt("t", "Alex");
+    assert.ok(user.startsWith("User: Alex"));
+  });
+
+  it("avoids the overloaded 'conversation in the user message' phrasing", () => {
+    const { system } = buildExtractionPrompt("t", "User");
+    assert.ok(!system.includes("conversation in the user message"));
+    assert.ok(system.includes("The conversation is a sequence of tagged blocks"));
   });
 });

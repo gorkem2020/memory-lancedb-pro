@@ -141,11 +141,11 @@ describe("buildExtractionPrompt speaker teaching", () => {
 
   it("keeps the eligible variant when assistantEligible is true, in tag vocabulary", () => {
     const { system, user } = buildExtractionPrompt(transcript, "User", { assistantEligible: true });
-    assert.ok(system.includes("<assistant_message> blocks: eligible sources in this configuration"));
-    assert.ok(system.includes("ground it in the <user_message>"));
-    assert.ok(system.includes("wraps ONE reply written by the AI assistant"));
+    assert.ok(system.includes("<assistant_message> blocks: also valid sources"));
+    assert.ok(system.includes("use the <user_message> version"));
+    assert.ok(system.includes("wraps ONE message written by the AI assistant"));
     assert.ok(!system.includes("Memories may only be grounded here."));
-    assert.ok(user.includes("per the assistant-message rule"));
+    assert.ok(user.includes("attributed to their true speaker"));
     assert.ok(!user.includes("Extract memory candidates ONLY from <user_message> blocks."));
   });
 });
