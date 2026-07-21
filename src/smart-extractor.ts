@@ -357,8 +357,8 @@ export interface SmartExtractorConfig {
   batchChunkSize?: number;
   /** Mirrors captureAssistant === true: the extraction prompt then treats assistant lines as eligible grounding sources instead of context-only. */
   captureAssistantEligible?: boolean;
-  /** captureAssistant=false + autoCaptureContextTurns>0: assistant turns ride the transcript as context-only blocks and the prompt teaches the context-only rule. */
-  assistantContextOnly?: boolean;
+  /** autoCaptureContextTurns > 0: already-processed turns render as context_* tags and the prompt teaches them; with captureAssistant=false every assistant turn is context-only. */
+  contextWindowEnabled?: boolean;
   /** Echo guard: drops candidates near-identical to a recent manual memory_store/memory_update text, pre-judge. */
   manualEchoLedger?: ManualEchoLedger;
   /** Maximum characters of conversation text to process. */
@@ -1180,12 +1180,14 @@ export class SmartExtractor {
           ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant" as const, text })),
         ];
 
-    const rawTranscript = formatConversationTranscript(turns, user);
+    const rawTranscript = formatConversationTranscript(turns, user, {
+      assistantContextOnly: this.config.contextWindowEnabled === true && this.config.captureAssistantEligible !== true,
+    });
     const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
 
     const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
       assistantEligible: this.config.captureAssistantEligible === true,
-      assistantContext: this.config.assistantContextOnly === true,
+      contextWindow: this.config.contextWindowEnabled === true,
     });
 
     const result = await this.llm.completeJson<{

@@ -2710,8 +2710,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
           user: "User",
           batchChunkSize: config.batchChunkSize,
           captureAssistantEligible: config.captureAssistant === true,
-          assistantContextOnly:
-            config.captureAssistant !== true && (config.autoCaptureContextTurns ?? 0) > 0,
+          contextWindowEnabled: (config.autoCaptureContextTurns ?? 0) > 0,
           manualEchoLedger,
           extractMinMessages: config.extractMinMessages ?? 4,
           extractMaxChars: config.extractMaxChars ?? 8000,
@@ -4229,7 +4228,10 @@ const memoryLanceDBProPlugin = {
             newUserTexts: newTexts,
           });
           const contextTurns = config.autoCaptureContextTurns ?? 0;
-          const priorPairTurns = contextTurns > 0 ? autoCaptureRecentPairTurns.get(sessionKey) || [] : [];
+          const priorPairTurns =
+            contextTurns > 0
+              ? (autoCaptureRecentPairTurns.get(sessionKey) || []).map((turn) => ({ ...turn, context: true }))
+              : [];
           const pairWindowTurns = trimTurnsToUserCap(
             dedupePairWindow([...priorPairTurns, ...thisCallPairTurns]),
             Math.max(contextTurns, thisCallPairTurns.filter((turn) => turn.role === "user").length),

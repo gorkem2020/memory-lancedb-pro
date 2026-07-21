@@ -125,7 +125,7 @@ export function normalizeAutoCaptureText(role, text, shouldSkipMessage) {
  * can no longer be confused with transcript structure.
  */
 export function neutralizeSpeakerTagSpoof(text) {
-    return text.replace(/<(\/?)((?:user|assistant)_message)>/g, "‹$1$2›");
+    return text.replace(/<(\/?)((?:context_)?(?:user|assistant)_message)>/g, "‹$1$2›");
 }
 /**
  * Renders turns oldest-first with each message wholly enclosed in
@@ -136,11 +136,18 @@ export function neutralizeSpeakerTagSpoof(text) {
  * `_userLabel` parameter is kept for call-site compatibility -- the user's
  * display name now travels in the prompt header, not per turn.
  */
-export function formatConversationTranscript(turns, _userLabel = "User") {
+export function formatConversationTranscript(turns, _userLabel = "User", options = {}) {
     return turns
-        .map((turn) => turn.role === "user"
-        ? `<user_message>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</user_message>`
-        : `<assistant_message>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</assistant_message>`)
+        .map((turn) => {
+        const tag = turn.role === "user"
+            ? turn.context
+                ? "context_user_message"
+                : "user_message"
+            : turn.context || options.assistantContextOnly === true
+                ? "context_assistant_message"
+                : "assistant_message";
+        return `<${tag}>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</${tag}>`;
+    })
         .join("\n");
 }
 /**
@@ -153,7 +160,7 @@ export function trimTranscriptToTagBoundary(transcript, maxChars) {
         return transcript;
     }
     const sliced = transcript.slice(-maxChars);
-    const tagStarts = ["<user_message>", "<assistant_message>"]
+    const tagStarts = ["<user_message>", "<assistant_message>", "<context_user_message>", "<context_assistant_message>"]
         .map((tag) => sliced.indexOf(tag))
         .filter((index) => index >= 0);
     if (tagStarts.length === 0) {

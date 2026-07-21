@@ -779,11 +779,13 @@ export class SmartExtractor {
                     : []),
                 ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant", text })),
             ];
-        const rawTranscript = formatConversationTranscript(turns, user);
+        const rawTranscript = formatConversationTranscript(turns, user, {
+            assistantContextOnly: this.config.contextWindowEnabled === true && this.config.captureAssistantEligible !== true,
+        });
         const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
         const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
             assistantEligible: this.config.captureAssistantEligible === true,
-            assistantContext: this.config.assistantContextOnly === true,
+            contextWindow: this.config.contextWindowEnabled === true,
         });
         const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
         if (!result) {

@@ -160,16 +160,21 @@ describe("buildExtractionPrompt speaker teaching", () => {
     assert.ok(user.includes("Extract memory candidates ONLY from <user_message> blocks."));
   });
 
-  it("teaches the assistant tag as CONTEXT-ONLY when assistantContext is set (captureAssistant=false + context window)", () => {
-    const { system, user } = buildExtractionPrompt(transcript, "User", { assistantContext: true });
+  it("teaches the symmetric context tags when the context window is on (captureAssistant=false)", () => {
+    const { system, user } = buildExtractionPrompt(transcript, "User", { contextWindow: true });
     assert.ok(
-      system.includes("wraps ONE message written by the AI assistant. Context only"),
-      "format teaching must describe assistant blocks as context",
+      system.includes("<context_assistant_message>...</context_assistant_message> wraps ONE message written by the AI assistant. Context only"),
+      "format teaching must describe self replies as context_assistant_message",
     );
     assert.ok(
-      system.includes("<assistant_message> blocks: context only — NEVER extract memories from them."),
+      system.includes("<context_user_message>...</context_user_message> wraps a user message that was ALREADY processed by a previous extraction run."),
+      "format teaching must describe processed user turns",
+    );
+    assert.ok(
+      system.includes("<context_user_message> and <context_assistant_message> blocks: context only — NEVER extract memories from them."),
       "the NOT-worth list must carry the context-only rule",
     );
+    assert.ok(system.includes("wraps ONE NEW message written by the human user."), "user_message is taught as the NEW delta");
     assert.ok(
       system.includes("Memories may only be grounded here."),
       "user-block grounding stays exclusive in context mode",
@@ -178,13 +183,14 @@ describe("buildExtractionPrompt speaker teaching", () => {
     assert.ok(!system.includes("also valid sources"), "no eligible-mode vocabulary may leak in");
   });
 
-  it("lets assistantEligible win when both flags are set", () => {
+  it("teaches processed-context tags alongside eligible tags under captureAssistant=true + window", () => {
     const { system } = buildExtractionPrompt(transcript, "User", {
       assistantEligible: true,
-      assistantContext: true,
+      contextWindow: true,
     });
-    assert.ok(system.includes("also valid sources"));
-    assert.ok(!system.includes("NEVER a source of memories"));
+    assert.ok(system.includes("also valid sources"), "eligible attribution rules stay");
+    assert.ok(system.includes("already processed in previous runs — NEVER extract memories from them again"));
+    assert.ok(!system.includes("NEVER a source of memories"), "the false-mode self-context wording must not leak into eligible mode");
   });
 
   it("keeps the eligible variant when assistantEligible is true, in tag vocabulary", () => {
