@@ -96,19 +96,10 @@ assert.ok(
   Object.prototype.hasOwnProperty.call(manifest.configSchema.properties.llm.properties, "oauthProvider"),
   "configSchema should declare llm.oauthProvider",
 );
-assert.ok(
-  Array.isArray(manifest.configSchema.properties.captureAssistant?.oneOf),
-  "configSchema.properties.captureAssistant should be a oneOf, not a plain boolean, so the 'context' mode is representable",
-);
-assert.ok(
-  manifest.configSchema.properties.captureAssistant.oneOf.some((entry) => entry.type === "boolean"),
-  "captureAssistant oneOf should still allow a plain boolean for backward compatibility",
-);
-assert.ok(
-  manifest.configSchema.properties.captureAssistant.oneOf.some(
-    (entry) => entry.type === "string" && Array.isArray(entry.enum) && entry.enum.includes("context"),
-  ),
-  "captureAssistant oneOf should allow the string literal \"context\"",
+assert.equal(
+  manifest.configSchema.properties.captureAssistant?.type,
+  "boolean",
+  "configSchema.properties.captureAssistant is a plain boolean again (the 'context' enum value was retired; legacy 'context' configs coerce to false at parse)",
 );
 
 assert.ok(

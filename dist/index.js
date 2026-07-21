@@ -3083,12 +3083,9 @@ const memoryLanceDBProPlugin = {
                         api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${JSON.stringify(config.captureAssistant)}, ${summarizeAgentEndMessages(event.messages)})`);
                         // Extract text content from messages
                         const eligibleTexts = [];
-                        const assistantContextTexts = [];
                         const conversationTurns = [];
                         let skippedAutoCaptureTexts = 0;
-                        const captureAssistantValue = config.captureAssistant;
-                        const captureAssistantEligible = captureAssistantValue === true;
-                        const captureAssistantAsContext = captureAssistantValue === "context";
+                        const captureAssistantEligible = config.captureAssistant === true;
                         for (const msg of event.messages) {
                             if (!msg || typeof msg !== "object") {
                                 continue;
@@ -3096,11 +3093,10 @@ const memoryLanceDBProPlugin = {
                             const msgObj = msg;
                             const role = msgObj.role;
                             const isEligibleRole = role === "user" || (captureAssistantEligible && role === "assistant");
-                            const isContextOnlyRole = captureAssistantAsContext && role === "assistant";
-                            if (!isEligibleRole && !isContextOnlyRole) {
+                            if (!isEligibleRole) {
                                 continue;
                             }
-                            const targetTexts = isEligibleRole ? eligibleTexts : assistantContextTexts;
+                            const targetTexts = eligibleTexts;
                             const content = msgObj.content;
                             if (typeof content === "string") {
                                 const normalized = normalizeAutoCaptureText(role, content, shouldSkipReflectionMessage);
@@ -3215,7 +3211,7 @@ const memoryLanceDBProPlugin = {
                             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
                         // Rolling PAIR window (operator spec: extractMinMessages counts
-                        // user<->assistant pairs, and captureAssistant context rides the
+                        // user<->assistant pairs, and captureAssistant-eligible turns ride the
                         // same window). This call's new pairs -- kept user turns with the
                         // assistant replies interleaved in true order -- extend what
                         // earlier calls buffered, bounded to extractMinMessages user turns
@@ -5137,7 +5133,7 @@ export function parsePluginConfig(value) {
             }
             return s;
         })(),
-        captureAssistant: cfg.captureAssistant === "context" ? "context" : cfg.captureAssistant === true,
+        captureAssistant: cfg.captureAssistant === true,
         retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null
             ? (() => {
                 const retrieval = { ...cfg.retrieval };

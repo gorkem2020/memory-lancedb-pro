@@ -208,7 +208,7 @@ interface PluginConfig {
   /** Agent IDs included in auto-recall injection (whitelist mode). When set, ONLY these agents receive auto-recall. Unresolved agent context falls back to 'main'. If both include and exclude are set, include wins. */
   autoRecallIncludeAgents?: string[];
   /** true: capture assistant turns as eligible content (existing behavior). "context": include assistant turns as marked, non-extractable context without counting them toward extraction eligibility. */
-  captureAssistant?: boolean | "context";
+  captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
     vectorWeight?: number;
@@ -4048,12 +4048,9 @@ const memoryLanceDBProPlugin = {
 
           // Extract text content from messages
           const eligibleTexts: string[] = [];
-          const assistantContextTexts: string[] = [];
           const conversationTurns: ConversationTurn[] = [];
           let skippedAutoCaptureTexts = 0;
-          const captureAssistantValue = config.captureAssistant;
-          const captureAssistantEligible = captureAssistantValue === true;
-          const captureAssistantAsContext = captureAssistantValue === "context";
+          const captureAssistantEligible = config.captureAssistant === true;
           for (const msg of event.messages) {
             if (!msg || typeof msg !== "object") {
               continue;
@@ -4063,11 +4060,10 @@ const memoryLanceDBProPlugin = {
             const role = msgObj.role;
             const isEligibleRole =
               role === "user" || (captureAssistantEligible && role === "assistant");
-            const isContextOnlyRole = captureAssistantAsContext && role === "assistant";
-            if (!isEligibleRole && !isContextOnlyRole) {
+            if (!isEligibleRole) {
               continue;
             }
-            const targetTexts = isEligibleRole ? eligibleTexts : assistantContextTexts;
+            const targetTexts = eligibleTexts;
 
             const content = msgObj.content;
 
@@ -4196,7 +4192,7 @@ const memoryLanceDBProPlugin = {
           }
 
           // Rolling PAIR window (operator spec: extractMinMessages counts
-          // user<->assistant pairs, and captureAssistant context rides the
+          // user<->assistant pairs, and captureAssistant-eligible turns ride the
           // same window). This call's new pairs -- kept user turns with the
           // assistant replies interleaved in true order -- extend what
           // earlier calls buffered, bounded to extractMinMessages user turns
@@ -6455,7 +6451,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       }
       return s;
     })(),
-    captureAssistant: cfg.captureAssistant === "context" ? "context" : cfg.captureAssistant === true,
+    captureAssistant: cfg.captureAssistant === true,
     retrieval:
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
         ? (() => {

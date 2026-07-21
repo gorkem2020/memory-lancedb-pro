@@ -122,7 +122,8 @@ describe("buildExtractionPrompt speaker teaching", () => {
   it("teaches the tag format in the system half and embeds the tagged transcript under the conversation header", () => {
     const { system, user: userPrompt } = buildExtractionPrompt(transcript, "User");
     assert.ok(system.includes("## Transcript format"), "system must teach the transcript format");
-    assert.ok(system.includes("<user_message>...</user_message>") && system.includes("<assistant_message>...</assistant_message>"));
+    assert.ok(system.includes("<user_message>...</user_message>"));
+    assert.ok(!system.includes("<assistant_message>...</assistant_message>"), "default mode carries no assistant-tag teaching (assistant lines are excluded from the transcript)");
     const conversation = userPrompt.indexOf("## Recent Conversation");
     assert.ok(conversation >= 0, "user half must carry the conversation header");
     assert.ok(userPrompt.indexOf(transcript) > conversation, "tagged transcript embeds under the conversation header");
@@ -130,18 +131,21 @@ describe("buildExtractionPrompt speaker teaching", () => {
     assert.ok(!(system + userPrompt).includes('"Assistant:" lines'), "legacy prefix vocabulary must be gone");
   });
 
-  it("pins assistant blocks to disambiguation-only context in the default mode", () => {
-    const { system } = buildExtractionPrompt(transcript, "User");
-    assert.ok(system.includes("context ONLY, never a source"));
-    assert.ok(system.includes("ONLY to resolve what an ambiguous or obscure <user_message> refers to"));
-    assert.ok(system.includes("never attribute them to the user"));
+  it("omits assistant-block language entirely in the default mode (captureAssistant=false excludes assistant lines from the transcript)", () => {
+    const { system, user } = buildExtractionPrompt(transcript, "User");
+    assert.ok(!system.includes("<assistant_message>"));
+    assert.ok(system.includes("Memories may only be grounded here."));
     assert.ok(!system.includes("eligible sources in this configuration"));
+    assert.ok(user.includes("Extract memory candidates ONLY from <user_message> blocks."));
   });
 
   it("keeps the eligible variant when assistantEligible is true, in tag vocabulary", () => {
-    const { system } = buildExtractionPrompt(transcript, "User", { assistantEligible: true });
+    const { system, user } = buildExtractionPrompt(transcript, "User", { assistantEligible: true });
     assert.ok(system.includes("<assistant_message> blocks: eligible sources in this configuration"));
     assert.ok(system.includes("ground it in the <user_message>"));
-    assert.ok(!system.includes("context ONLY, never a source"));
+    assert.ok(system.includes("wraps ONE reply written by the AI assistant"));
+    assert.ok(!system.includes("Memories may only be grounded here."));
+    assert.ok(user.includes("per the assistant-message rule"));
+    assert.ok(!user.includes("Extract memory candidates ONLY from <user_message> blocks."));
   });
 });

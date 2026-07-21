@@ -23,15 +23,24 @@
  */
 import { CATEGORY_TAXONOMY, CONSOLIDATE_DECIDER_IDENTITY, CONSOLIDATE_MERGE_WRITER_IDENTITY, DEDUP_JUDGE_IDENTITY, EXTRACTION_AGENT_IDENTITY, MERGE_WRITER_IDENTITY, formatCandidateBlock, formatExistingMemoriesSection, formatMemoryFieldLines, jsonShape, } from "./prompt-blocks.js";
 export function buildExtractionPrompt(conversationText, user, options = {}) {
-    const assistantBlocksRule = options.assistantEligible
-        ? `- <assistant_message> blocks: eligible sources in this configuration. A candidate may be grounded in an <assistant_message> block when it states a concrete durable fact about the user, their entities, or their work that went uncorrected — but never the assistant's own greetings, suggestions, speculation, or self-description. When the same fact has both a <user_message> and an <assistant_message> source, ground it in the <user_message>, and always attribute assistant-authored statements to the assistant, never to the user.`
-        : `- <assistant_message> blocks: context ONLY, never a source. Use them ONLY to resolve what an ambiguous or obscure <user_message> refers to (e.g. "yes exactly, that one"). Do NOT create a candidate whose support comes from an <assistant_message> block — every candidate must be grounded in <user_message> content. Plans, summaries, preferences, realizations, or mental models that appear only inside an <assistant_message> belong to the assistant; never attribute them to the user, no matter how long or detailed the assistant text is. The assistant greeting or addressing the user by a name is NOT the user introducing themselves; the assistant proposing, summarizing, or confirming something is NOT the user asserting it. If the user never stated or explicitly confirmed the fact in a <user_message>, do not extract it.`;
+    // captureAssistant=false excludes assistant lines from the transcript
+    // entirely, so the prompt only describes <assistant_message> blocks — and
+    // their grounding rule — when they can actually appear (captureAssistant=true).
+    const assistantEligible = options.assistantEligible === true;
+    const assistantFormatBullet = assistantEligible
+        ? `
+- <assistant_message>...</assistant_message> wraps ONE reply written by the AI assistant. Every line inside it — every paragraph, list, and heading up to the closing tag — is assistant-authored, never the user's words.`
+        : "";
+    const userGroundingSuffix = assistantEligible ? "" : " Memories may only be grounded here.";
+    const assistantBlocksRule = assistantEligible
+        ? `
+- <assistant_message> blocks: eligible sources in this configuration. A candidate may be grounded in an <assistant_message> block when it states a concrete durable fact about the user, their entities, or their work that went uncorrected — but never the assistant's own greetings, suggestions, speculation, or self-description. When the same fact has both a <user_message> and an <assistant_message> source, ground it in the <user_message>, and always attribute assistant-authored statements to the assistant, never to the user.`
+        : "";
     const system = `${EXTRACTION_AGENT_IDENTITY} Analyze session context and extract memories worth long-term preservation.
 
 ## Transcript format
 The conversation in the user message is a sequence of tagged blocks in chronological order:
-- <user_message>...</user_message> wraps ONE message written by the human user. Memories may only be grounded here.
-- <assistant_message>...</assistant_message> wraps ONE reply written by the AI assistant. Every line inside it — every paragraph, list, and heading up to the closing tag — is assistant-authored, never the user's words.
+- <user_message>...</user_message> wraps ONE message written by the human user.${userGroundingSuffix}${assistantFormatBullet}
 
 # Memory Extraction Criteria
 
@@ -51,8 +60,7 @@ The conversation in the user message is a sequence of tagged blocks in chronolog
 - Degraded or incomplete references: If the user mentions something vaguely ("that thing I said"), do NOT invent details or create a hollow memory
 - Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete profile detail, preference, entity state, event, case, or pattern from them or skip.
 - System/runtime artifacts: content containing "System:", compaction notices, model-switch/session-reset traces, tool-call transcripts, raw JSON blobs, or similar internal execution traces must be rejected unless a clean user fact can be extracted.
-- Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.
-${assistantBlocksRule}
+- Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.${assistantBlocksRule}
 - Atomic memory shape: each stored memory must read like one durable fact, preference, decision, entity state, event, case, or reusable pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement or skip it.
 - Length/distillation gate: if a candidate is longer than about 200 characters and reads like raw conversation instead of a distilled insight, rewrite it as a single factual statement before storing; if that is not possible, skip it.
 
@@ -237,7 +245,9 @@ Notes:
 Target Output Language: auto (detect from recent messages)
 
 ## Recent Conversation
-Extract memory candidates ONLY from <user_message> blocks. <assistant_message> blocks are context for resolving references; never treat assistant statements as the user's facts, preferences, or decisions.
+${assistantEligible
+        ? "Extract memory candidates from <user_message> blocks, and from <assistant_message> blocks per the assistant-message rule — always attributed to their true speaker, never to the user."
+        : "Extract memory candidates ONLY from <user_message> blocks."}
 ${conversationText}`;
     return { system, user: userMessage };
 }

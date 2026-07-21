@@ -1519,7 +1519,7 @@ async function runAssistantContextModeScenario() {
       `http://127.0.0.1:${embeddingPort}/v1`,
       `http://127.0.0.1:${llmPort}`,
       logs,
-      { extractMinMessages: 2, smartExtraction: true, captureAssistant: "context" },
+      { extractMinMessages: 2, smartExtraction: true, captureAssistant: false },
     );
     registerFreshPlugin(api);
 
@@ -1596,12 +1596,12 @@ assert.ok(
   "extraction prompt should include the single conversation-turns transcript header",
 );
 assert.ok(
-  assistantContextResult.capturedPrompts.some((p) => /<assistant_message>\n/.test(p)),
-  "extraction prompt should include a tag-wrapped assistant turn in the transcript",
+  !assistantContextResult.capturedPrompts.some((p) => /<assistant_message>\n/.test(p)),
+  "captureAssistant=false excludes assistant turns from the transcript entirely (boolean revert 2026-07-21)",
 );
 assert.ok(
-  assistantContextResult.capturedPrompts.some((p) => p.includes("游泳是很好的运动")),
-  "extraction prompt should include the actual assistant context text for disambiguation",
+  !assistantContextResult.capturedPrompts.some((p) => p.includes("游泳是很好的运动")),
+  "assistant text must not appear anywhere in the extraction prompt under captureAssistant=false",
 );
 
 // ===============================================================

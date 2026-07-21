@@ -526,7 +526,7 @@ describe("extraction transcript block and assistant-line policy", () => {
     const { user } = buildExtractionPrompt(transcript, "User");
     assert.match(
       user,
-      /## Recent Conversation\nExtract memory candidates ONLY from <user_message> blocks\. <assistant_message> blocks are context for resolving references; never treat assistant statements as the user's facts, preferences, or decisions\.\n<user_message>\nhi\n<\/user_message>/,
+      /## Recent Conversation\nExtract memory candidates ONLY from <user_message> blocks\.\n<user_message>\nhi\n<\/user_message>/,
     );
     assert.doesNotMatch(user, /```/, "speaker tags replaced the code fence as the transcript delimiter");
   });
@@ -538,15 +538,15 @@ describe("extraction transcript block and assistant-line policy", () => {
     assert.match(distiller, /Do not wrap the output in a code fence\./);
   });
 
-  it("defaults assistant blocks to context-only grounding", () => {
+  it("omits assistant-block language by default (captureAssistant=false has no assistant lines)", () => {
     const { system } = buildExtractionPrompt("t", "User");
-    assert.match(system, /context ONLY, never a source/);
+    assert.doesNotMatch(system, /<assistant_message>/);
     assert.doesNotMatch(system, /eligible sources in this configuration/);
   });
 
-  it("flips the assistant-block rule when assistant turns are capture-eligible", () => {
+  it("adds the assistant-block format and eligible rule when assistant turns are capture-eligible", () => {
     const { system } = buildExtractionPrompt("t", "User", { assistantEligible: true });
     assert.match(system, /eligible sources in this configuration/);
-    assert.doesNotMatch(system, /context ONLY, never a source/);
+    assert.match(system, /wraps ONE reply written by the AI assistant/);
   });
 });

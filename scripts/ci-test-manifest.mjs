@@ -5,6 +5,7 @@ export const CI_TEST_GROUPS = [
   "llm-clients-and-auth",
   "packaging-and-workflow",
   { group: "core-regression", runner: "node", file: "test/manual-echo-guard.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/capture-assistant-boolean.test.mjs", args: ["--test"] },
 ];
 
 export const CI_TEST_MANIFEST = [
@@ -38,10 +39,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/retriever-neighbor-enrichment.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-memory-lifecycle.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-branches.mjs" },
-  { group: "core-regression", runner: "node", file: "test/assistant-context-capture.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/extraction-transcript-speaker-tags.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/auto-capture-cleanup.test.mjs", args: ["--test"] },
-  { group: "core-regression", runner: "node", file: "test/assistant-context-capture-counting-symmetry.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-embed.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-noise-gating.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/extraction-grounding-register.test.mjs", args: ["--test"] },
