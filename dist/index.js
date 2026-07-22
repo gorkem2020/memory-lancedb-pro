@@ -43,7 +43,7 @@ import { gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.j
 import { createMemoryCLI } from "./cli.js";
 import { clampBatchChunkSize } from "./src/memory-categories.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, trimTurnsToUserCap, dedupePairWindow, formatConversationTranscript, trimTranscriptToTagBoundary, MESSAGE_TOOL_DELIVERY_BANNER_PREFIX, } from "./src/auto-capture-cleanup.js";
+import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, trimTurnsToUserCap, dedupePairWindow, formatConversationTranscript, trimTranscriptToTagBoundary, MESSAGE_TOOL_DELIVERY_BANNER_PREFIX, isDirectConversationSessionKey, } from "./src/auto-capture-cleanup.js";
 import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
@@ -3092,7 +3092,12 @@ const memoryLanceDBProPlugin = {
                         const conversationTurns = [];
                         let skippedAutoCaptureTexts = 0;
                         const captureAssistantEligible = config.captureAssistant === true;
-                        const assistantContextOnly = !captureAssistantEligible && (config.autoCaptureContextTurns ?? 0) > 0;
+                        // Group chats fall back to contextTurns=0 (original
+                        // captureAssistant-gated behavior): full channel support will be
+                        // implemented with speaker awareness. Direct keys are allowlisted;
+                        // unknown key shapes count as group, fail-closed.
+                        const contextWindowActive = isDirectConversationSessionKey(sessionKey) && (config.autoCaptureContextTurns ?? 0) > 0;
+                        const assistantContextOnly = !captureAssistantEligible && contextWindowActive;
                         // Message-tool runs (Slack groups etc.) never auto-deliver the final
                         // assistant text — the real reply left via the message tool, so
                         // assistant texts in this payload are internal monologue, not
@@ -3255,7 +3260,7 @@ const memoryLanceDBProPlugin = {
                             eligibleTexts,
                             newUserTexts: newTexts,
                         });
-                        const contextTurns = config.autoCaptureContextTurns ?? 0;
+                        const contextTurns = contextWindowActive ? config.autoCaptureContextTurns ?? 0 : 0;
                         const priorPairTurns = contextTurns > 0
                             ? (autoCaptureRecentPairTurns.get(sessionKey) || []).map((turn) => ({ ...turn, context: true }))
                             : [];
@@ -3332,7 +3337,7 @@ const memoryLanceDBProPlugin = {
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantWindowTexts, conversationTurns: finalConversationTurns });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantWindowTexts, conversationTurns: finalConversationTurns, contextWindowActive });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);

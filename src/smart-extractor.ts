@@ -414,6 +414,13 @@ export interface ExtractPersistOptions {
    */
   assistantContextTexts?: string[];
   /**
+   * Per-call context-window state: false forces the plain (no context tags)
+   * transcript and prompt for this extraction regardless of the static
+   * contextWindowEnabled config. Set by the capture pipeline for group-chat
+   * session keys, where the window is disabled until speaker awareness.
+   */
+  contextWindowActive?: boolean;
+  /**
    * Ordered conversation turns for the extraction prompt's transcript block,
    * oldest-first, true chronological interleaving of user and assistant
    * turns. Preferred over `conversationText` + `assistantContextTexts` when
@@ -541,6 +548,7 @@ export class SmartExtractor {
       options.assistantContextTexts,
       options.conversationTurns,
       policyMode,
+      options.contextWindowActive,
     );
     let candidates = extraction.candidates;
 
@@ -1164,6 +1172,7 @@ export class SmartExtractor {
     assistantContextTexts?: string[],
     conversationTurns?: ConversationTurn[],
     policyMode: ExtractionPolicyMode = "full",
+    contextWindowActive?: boolean,
   ): Promise<ExtractCandidatesResult> {
     const maxChars = this.config.extractMaxChars ?? 8000;
     const user = this.config.user ?? "User";
@@ -1180,14 +1189,15 @@ export class SmartExtractor {
           ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant" as const, text })),
         ];
 
+    const windowActive = contextWindowActive ?? this.config.contextWindowEnabled === true;
     const rawTranscript = formatConversationTranscript(turns, user, {
-      assistantContextOnly: this.config.contextWindowEnabled === true && this.config.captureAssistantEligible !== true,
+      assistantContextOnly: windowActive && this.config.captureAssistantEligible !== true,
     });
     const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
 
     const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
       assistantEligible: this.config.captureAssistantEligible === true,
-      contextWindow: this.config.contextWindowEnabled === true,
+      contextWindow: windowActive,
     });
 
     const result = await this.llm.completeJson<{

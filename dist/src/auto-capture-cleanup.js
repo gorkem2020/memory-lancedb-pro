@@ -157,6 +157,27 @@ export function normalizeAutoCaptureText(role, text, shouldSkipMessage) {
     return normalized;
 }
 /**
+ * Direct (1:1) conversations by session-key grammar, allowlisted from the
+ * host's key builder: the dmScope-collapsed main key, dashboard/webchat
+ * sessions, and the explicit `:direct:` peer forms. Everything else —
+ * channels, groups, threads, topics, and any key shape we have never seen —
+ * is treated as a group chat, fail-closed. The context window falls back to
+ * contextTurns=0 there (original captureAssistant-gated behavior); full
+ * group-channel support arrives with per-sender speaker awareness.
+ */
+export function isDirectConversationSessionKey(sessionKey) {
+    if (typeof sessionKey !== "string" || sessionKey.length === 0)
+        return false;
+    const key = sessionKey.toLowerCase();
+    if (/^agent:[^:]+:main$/.test(key))
+        return true;
+    if (/^agent:[^:]+:dashboard(?::|$)/.test(key))
+        return true;
+    if (key.includes(":direct:"))
+        return true;
+    return false;
+}
+/**
  * A literal speaker tag typed INSIDE a message could fake a block boundary
  * (or defeat tag-boundary trimming, which trusts that literal tags only occur
  * as real boundaries). Rewritten with guillemets the text stays readable but

@@ -320,6 +320,37 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(!prompt.includes("No response needed."), "control-token finals are excluded with the monologue");
   });
 
+  it("forces contextTurns=0 on group-chat session keys: no context tags, no retention (fail-closed)", async () => {
+    const groupCtx = { sessionKey: "agent:test-agent:slack:channel:C0EXAMPLE01", agentId: "test-agent" };
+
+    await fireAgentEnd(hook, turnMessages(4), groupCtx);
+    assert.equal(extractionPrompts.length, 1);
+    const first = extractionPrompts[0];
+    assert.ok(!first.includes("<context_user_message>") && !first.includes("<context_assistant_message>"), "group transcripts carry no context tags");
+    assert.ok(!first.includes("ALREADY processed by a previous extraction run"), "group prompts do not teach the context tags");
+    assert.ok(!first.includes("wraps ONE NEW message"), "group prompts keep the plain user-message teaching");
+
+    await fireAgentEnd(hook, turnMessages(6), groupCtx);
+    const second = extractionPrompts[1];
+    assert.ok(second.includes(U3), "the new delta is present");
+    assert.ok(!second.includes(U1) && !second.includes(U2), "nothing is retained across group-chat extractions");
+  });
+
+  it("classifies direct vs group session keys with unknown shapes failing closed", () => {
+    const { isDirectConversationSessionKey } = jiti("../src/auto-capture-cleanup.ts");
+    assert.equal(isDirectConversationSessionKey("agent:agent-two:main"), true);
+    assert.equal(isDirectConversationSessionKey("agent:agent-two:dashboard:00000000-0000-0000"), true);
+    assert.equal(isDirectConversationSessionKey("agent:agent-two:telegram:direct:10000001"), true);
+    assert.equal(isDirectConversationSessionKey("agent:agent-two:direct:10000001"), true);
+    assert.equal(isDirectConversationSessionKey("agent:agent-two:slack:acct1:direct:u0example01"), true);
+    assert.equal(isDirectConversationSessionKey("agent:agent-two:slack:channel:c0example01"), false);
+    assert.equal(isDirectConversationSessionKey("agent:agent-two:slack:channel:c0example01:thread:1782.001"), false);
+    assert.equal(isDirectConversationSessionKey("agent:main:telegram:group:-100123:topic:42"), false);
+    assert.equal(isDirectConversationSessionKey("agent:agent-two:newchannel:room:xyz"), false);
+    assert.equal(isDirectConversationSessionKey(""), false);
+    assert.equal(isDirectConversationSessionKey(undefined), false);
+  });
+
   it("retains nothing between calls when autoCaptureContextTurns is 0", async () => {
     const zeroHook = registerFresh({
       autoCaptureContextTurns: 0,

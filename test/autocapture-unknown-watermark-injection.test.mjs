@@ -211,7 +211,7 @@ describe("bounded injection when the watermark is unknown and history is large",
     });
     memoryLanceDBProPlugin.register(harness.api);
     const hook = getAutoCaptureHook(harness.eventHandlers);
-    const ctx = { sessionKey: "agent:terry:webchat", agentId: "terry" };
+    const ctx = { sessionKey: "agent:agent-one:main", agentId: "agent-one" };
 
     // A 40-message history arrives in a single agent_end call on a session
     // whose watermark has never been established (fresh Map, nothing
@@ -287,7 +287,7 @@ describe("bounded injection when the watermark is unknown and history is large",
     });
     memoryLanceDBProPlugin.register(harness.api);
     const hook = getAutoCaptureHook(harness.eventHandlers);
-    const ctx = { sessionKey: "agent:dave:main", agentId: "dave" };
+    const ctx = { sessionKey: "agent:agent-two:main", agentId: "dave" };
 
     // Only 3 texts total, at or under minMessages(4) -- a totally normal
     // fresh session, not the "large unknown history" scenario. Must not be
