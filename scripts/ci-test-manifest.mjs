@@ -153,6 +153,8 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/invalidated-rows-visibility.test.mjs", args: ["--test"] },
   // Valid-empty extraction must reset the auto-capture watermark the same way a successful extraction does
   { group: "core-regression", runner: "node", file: "test/autocapture-reset-on-valid-empty-extraction.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/reflection-embed-transient-retry.test.mjs", args: ["--test"] },
   { group: "storage-and-schema", runner: "node", file: "test/smart-metadata-source-classification.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/auto-capture-watermark-store.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-watermark-restart-survival.test.mjs", args: ["--test"] },
