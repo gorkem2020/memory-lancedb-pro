@@ -246,7 +246,7 @@ export class SmartExtractor {
             : [targetScope];
         const agentId = options.agentId;
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText, options.conversationTurns);
+        const extraction = await this.extractCandidates(conversationText, options.conversationTurns, options.contextWindowActive, options.captureAssistantActive);
         const candidates = extraction.candidates;
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
@@ -516,7 +516,7 @@ export class SmartExtractor {
     /**
      * Call LLM to extract candidate memories from conversation text.
      */
-    async extractCandidates(conversationText, conversationTurns) {
+    async extractCandidates(conversationText, conversationTurns, contextWindowActive, captureAssistantActive) {
         const maxChars = this.config.extractMaxChars ?? 8000;
         const user = this.config.user ?? "User";
         // Strip platform envelope metadata injected by OpenClaw channels
@@ -527,13 +527,15 @@ export class SmartExtractor {
         const turns = conversationTurns?.length
             ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
             : [{ role: "user", text: stripEnvelopeMetadata(conversationText) }];
+        const windowActive = contextWindowActive ?? this.config.contextWindowEnabled === true;
+        const assistantEligibleActive = captureAssistantActive ?? this.config.captureAssistantEligible === true;
         const rawTranscript = formatConversationTranscript(turns, user, {
-            assistantContextOnly: this.config.contextWindowEnabled === true && this.config.captureAssistantEligible !== true,
+            assistantContextOnly: windowActive && !assistantEligibleActive,
         });
         const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
         const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
-            assistantEligible: this.config.captureAssistantEligible === true,
-            contextWindow: this.config.contextWindowEnabled === true,
+            assistantEligible: assistantEligibleActive,
+            contextWindow: windowActive,
         });
         const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
         if (!result) {

@@ -323,6 +323,19 @@ export interface ExtractPersistOptions {
    * joined text, so every line has an unambiguous speaker.
    */
   conversationTurns?: ConversationTurn[];
+  /**
+   * Per-call context-window state: false forces the plain (no context tags)
+   * transcript and prompt for this extraction regardless of the static
+   * contextWindowEnabled config. Set by the capture pipeline for group-chat
+   * session keys, where the window is disabled until speaker awareness.
+   */
+  contextWindowActive?: boolean;
+  /**
+   * Per-call assistant-eligibility state: false forces user-only grounding
+   * for this extraction regardless of the static captureAssistantEligible
+   * config. Set by the capture pipeline for group-chat session keys.
+   */
+  captureAssistantActive?: boolean;
 }
 
 export class SmartExtractor {
@@ -418,7 +431,12 @@ export class SmartExtractor {
     const agentId = options.agentId;
 
     // Step 1: LLM extraction
-    const extraction = await this.extractCandidates(conversationText, options.conversationTurns);
+    const extraction = await this.extractCandidates(
+      conversationText,
+      options.conversationTurns,
+      options.contextWindowActive,
+      options.captureAssistantActive,
+    );
     const candidates = extraction.candidates;
 
     if (candidates.length === 0) {
@@ -772,6 +790,8 @@ export class SmartExtractor {
   private async extractCandidates(
     conversationText: string,
     conversationTurns?: ConversationTurn[],
+    contextWindowActive?: boolean,
+    captureAssistantActive?: boolean,
   ): Promise<ExtractCandidatesResult> {
     const maxChars = this.config.extractMaxChars ?? 8000;
     const user = this.config.user ?? "User";
@@ -785,14 +805,16 @@ export class SmartExtractor {
       ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
       : [{ role: "user", text: stripEnvelopeMetadata(conversationText) }];
 
+    const windowActive = contextWindowActive ?? this.config.contextWindowEnabled === true;
+    const assistantEligibleActive = captureAssistantActive ?? this.config.captureAssistantEligible === true;
     const rawTranscript = formatConversationTranscript(turns, user, {
-      assistantContextOnly: this.config.contextWindowEnabled === true && this.config.captureAssistantEligible !== true,
+      assistantContextOnly: windowActive && !assistantEligibleActive,
     });
     const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
 
     const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
-      assistantEligible: this.config.captureAssistantEligible === true,
-      contextWindow: this.config.contextWindowEnabled === true,
+      assistantEligible: assistantEligibleActive,
+      contextWindow: windowActive,
     });
 
     const result = await this.llm.completeJson<{

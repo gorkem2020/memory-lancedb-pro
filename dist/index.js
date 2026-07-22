@@ -40,7 +40,7 @@ import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { MESSAGE_TOOL_DELIVERY_BANNER_PREFIX, anchorTextToRawIngress, buildConversationTurnsForExtraction, dedupePairWindow, formatConversationTranscript, normalizeAutoCaptureText, trimTranscriptToTagBoundary, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
+import { MESSAGE_TOOL_DELIVERY_BANNER_PREFIX, anchorTextToRawIngress, isDirectConversationSessionKey, buildConversationTurnsForExtraction, dedupePairWindow, formatConversationTranscript, normalizeAutoCaptureText, trimTranscriptToTagBoundary, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
 const RAW_INGRESS_GLOBAL_KEY = ":global:";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
@@ -2931,8 +2931,24 @@ const memoryLanceDBProPlugin = {
                         const eligibleTexts = [];
                         const messageLoopTurns = [];
                         let skippedAutoCaptureTexts = 0;
-                        const captureAssistantEligible = config.captureAssistant === true;
-                        const assistantContextOnly = !captureAssistantEligible && (config.autoCaptureContextTurns ?? 0) > 0;
+                        const isDirectSession = isDirectConversationSessionKey(sessionKey);
+                        // Opt-out knob: unset follows autoCapture (groups keep capturing,
+                        // no surprises on install); explicit false skips group-chat capture
+                        // entirely until per-sender speaker awareness lands.
+                        if (!isDirectSession && config.autoCaptureGroupChats === false) {
+                            api.logger.debug(`memory-lancedb-pro: auto-capture skipped for group-chat session ${sessionKey} (autoCaptureGroupChats=false)`);
+                            return;
+                        }
+                        // Group chats force captureAssistant=false and contextTurns=0
+                        // (plain user-only capture) regardless of config: with every
+                        // non-self participant arriving role=user, assistant-sourced
+                        // extraction in a multi-party room misattributes at will. Full
+                        // channel support will be implemented with speaker awareness.
+                        // Direct keys are allowlisted; unknown key shapes count as group,
+                        // fail-closed.
+                        const captureAssistantEligible = config.captureAssistant === true && isDirectSession;
+                        const contextWindowActive = isDirectSession && (config.autoCaptureContextTurns ?? 0) > 0;
+                        const assistantContextOnly = !captureAssistantEligible && contextWindowActive;
                         const rawAnchorConversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
                         const rawAnchorPool = [
                             ...(rawAnchorConversationKey
@@ -3059,7 +3075,7 @@ const memoryLanceDBProPlugin = {
                             eligibleTexts,
                             newUserTexts: newTexts,
                         });
-                        const contextTurns = config.autoCaptureContextTurns ?? 0;
+                        const contextTurns = contextWindowActive ? config.autoCaptureContextTurns ?? 0 : 0;
                         const priorPairTurns = contextTurns > 0
                             ? (autoCaptureRecentPairTurns.get(sessionKey) || []).map((turn) => ({ ...turn, context: true }))
                             : [];
@@ -3134,7 +3150,7 @@ const memoryLanceDBProPlugin = {
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, conversationTurns: finalConversationTurns });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, conversationTurns: finalConversationTurns, contextWindowActive, captureAssistantActive: captureAssistantEligible });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
@@ -4881,6 +4897,7 @@ export function parsePluginConfig(value) {
             : undefined,
         extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
         autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
+        autoCaptureGroupChats: typeof cfg.autoCaptureGroupChats === "boolean" ? cfg.autoCaptureGroupChats : undefined,
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,
         enableManagementTools: cfg.enableManagementTools === true,
