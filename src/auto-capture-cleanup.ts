@@ -152,7 +152,10 @@ export function stripAutoCaptureInjectedPrefix(role: string, text: string): stri
  */
 export const MESSAGE_TOOL_DELIVERY_BANNER_PREFIX =
   "Delivery: Final assistant text is not automatically delivered in this run.";
-const CHAT_HISTORY_QUOTE_HEADER = "Chat history since last reply (untrusted, for context):";
+const CHAT_HISTORY_QUOTE_HEADERS = [
+  "Chat history since last reply (untrusted, for context):",
+  "Conversation context (untrusted, chronological, selected for current message):",
+];
 const QUOTED_HISTORY_LINE = /^#\d+(?:\.\d+)? \S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ [^:]+: /;
 
 export function stripGroupChannelScaffold(text: string): string {
@@ -165,7 +168,7 @@ export function stripGroupChannelScaffold(text: string): string {
       index++;
       continue;
     }
-    if (line.trim() === CHAT_HISTORY_QUOTE_HEADER) {
+    if (CHAT_HISTORY_QUOTE_HEADERS.includes(line.trim())) {
       index++;
       while (index < lines.length && (QUOTED_HISTORY_LINE.test(lines[index]) || lines[index].trim() === "")) {
         index++;

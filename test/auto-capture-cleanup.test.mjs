@@ -86,6 +86,17 @@ describe("stripGroupChannelScaffold (message-tool channel payloads)", () => {
     assert.equal(stripGroupChannelScaffold(input), "agent-two is here and ready to help");
   });
 
+  it("strips the Telegram conversation-context variant with the same quoted-line grammar", () => {
+    const input = [
+      "Conversation context (untrusted, chronological, selected for current message):",
+      "#108 Wed 2026-07-22 12:07:40 GMT+3 sam.rivera: hey there! hows it going?",
+      "#110 Wed 2026-07-22 12:08:01 GMT+3 agent-one (you): doing good, what's up?",
+      "",
+      "the actual new inbound message tail",
+    ].join("\n");
+    assert.equal(stripGroupChannelScaffold(input), "the actual new inbound message tail");
+  });
+
   it("fail-closed: only the header is stripped when following lines do not match the quoted grammar", () => {
     const input = [
       "Chat history since last reply (untrusted, for context):",
