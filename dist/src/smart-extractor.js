@@ -527,10 +527,13 @@ export class SmartExtractor {
         const turns = conversationTurns?.length
             ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
             : [{ role: "user", text: stripEnvelopeMetadata(conversationText) }];
-        const rawTranscript = formatConversationTranscript(turns, user);
+        const rawTranscript = formatConversationTranscript(turns, user, {
+            assistantContextOnly: this.config.contextWindowEnabled === true && this.config.captureAssistantEligible !== true,
+        });
         const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
         const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
             assistantEligible: this.config.captureAssistantEligible === true,
+            contextWindow: this.config.contextWindowEnabled === true,
         });
         const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
         if (!result) {

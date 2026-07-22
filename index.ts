@@ -2537,6 +2537,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
       smartExtractor = new SmartExtractor(store, embedder, llmClient, {
         user: "User",
         captureAssistantEligible: config.captureAssistant === true,
+        contextWindowEnabled: (config.autoCaptureContextTurns ?? 0) > 0,
         extractMinMessages: config.extractMinMessages ?? 4,
         extractMaxChars: config.extractMaxChars ?? 8000,
         defaultScope: config.scopes?.default ?? "global",
@@ -3840,6 +3841,9 @@ const memoryLanceDBProPlugin = {
           const eligibleTexts: string[] = [];
           const messageLoopTurns: ConversationTurn[] = [];
           let skippedAutoCaptureTexts = 0;
+          const captureAssistantEligible = config.captureAssistant === true;
+          const assistantContextOnly =
+            !captureAssistantEligible && (config.autoCaptureContextTurns ?? 0) > 0;
           for (const msg of event.messages) {
             if (!msg || typeof msg !== "object") {
               continue;
@@ -3847,13 +3851,16 @@ const memoryLanceDBProPlugin = {
             const msgObj = msg as Record<string, unknown>;
 
             const role = msgObj.role;
-            const captureAssistant = config.captureAssistant === true;
-            if (
-              role !== "user" &&
-              !(captureAssistant && role === "assistant")
-            ) {
+            const isEligibleRole =
+              role === "user" || (captureAssistantEligible && role === "assistant");
+            const isContextOnlyRole = assistantContextOnly && role === "assistant";
+            if (!isEligibleRole && !isContextOnlyRole) {
               continue;
             }
+            // Context-only assistant turns join the transcript window but never
+            // the eligible set: they cannot fire the gate, move the watermark,
+            // or ground a memory.
+            const targetTexts = isEligibleRole ? eligibleTexts : null;
 
             const content = msgObj.content;
 
@@ -3862,7 +3869,7 @@ const memoryLanceDBProPlugin = {
               if (!normalized) {
                 skippedAutoCaptureTexts++;
               } else {
-                eligibleTexts.push(normalized);
+                targetTexts?.push(normalized);
                 messageLoopTurns.push({ role: role as "user" | "assistant", text: normalized });
               }
               continue;
@@ -3883,7 +3890,7 @@ const memoryLanceDBProPlugin = {
                   if (!normalized) {
                     skippedAutoCaptureTexts++;
                   } else {
-                    eligibleTexts.push(normalized);
+                    targetTexts?.push(normalized);
                     messageLoopTurns.push({ role: role as "user" | "assistant", text: normalized });
                   }
                 }
@@ -3940,7 +3947,10 @@ const memoryLanceDBProPlugin = {
             newUserTexts: newTexts,
           });
           const contextTurns = config.autoCaptureContextTurns ?? 0;
-          const priorPairTurns = contextTurns > 0 ? autoCaptureRecentPairTurns.get(sessionKey) || [] : [];
+          const priorPairTurns =
+            contextTurns > 0
+              ? (autoCaptureRecentPairTurns.get(sessionKey) || []).map((turn) => ({ ...turn, context: true }))
+              : [];
           const pairWindowTurns = trimTurnsToUserCap(
             dedupePairWindow([...priorPairTurns, ...thisCallTurns]),
             Math.max(contextTurns, thisCallTurns.filter((turn) => turn.role === "user").length),

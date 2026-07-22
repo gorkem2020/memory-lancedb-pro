@@ -299,6 +299,8 @@ export interface SmartExtractorConfig {
   onPersisted?: (entry: PersistedMemoryEntry, meta: PersistedMemoryMeta) => Promise<void> | void;
   /** Assistant turns are capture-eligible sources (captureAssistant=true): flips the prompt's assistant-block rule. */
   captureAssistantEligible?: boolean;
+  /** autoCaptureContextTurns > 0: already-processed turns render as context_* tags and the prompt teaches them; with captureAssistant=false every assistant turn is context-only. */
+  contextWindowEnabled?: boolean;
 }
 
 export interface ExtractPersistOptions {
@@ -783,11 +785,14 @@ export class SmartExtractor {
       ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
       : [{ role: "user", text: stripEnvelopeMetadata(conversationText) }];
 
-    const rawTranscript = formatConversationTranscript(turns, user);
+    const rawTranscript = formatConversationTranscript(turns, user, {
+      assistantContextOnly: this.config.contextWindowEnabled === true && this.config.captureAssistantEligible !== true,
+    });
     const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
 
     const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
       assistantEligible: this.config.captureAssistantEligible === true,
+      contextWindow: this.config.contextWindowEnabled === true,
     });
 
     const result = await this.llm.completeJson<{

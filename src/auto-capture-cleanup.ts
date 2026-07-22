@@ -156,6 +156,8 @@ export function normalizeAutoCaptureText(
 export interface ConversationTurn {
   role: "user" | "assistant";
   text: string;
+  /** Already processed by a previous extraction (retained window turn): renders as a context_* tag, never an extraction source. */
+  context?: boolean;
 }
 
 /**
@@ -165,7 +167,7 @@ export interface ConversationTurn {
  * can no longer be confused with transcript structure.
  */
 export function neutralizeSpeakerTagSpoof(text: string): string {
-  return text.replace(/<(\/?)((?:user|assistant)_message)>/g, "‹$1$2›");
+  return text.replace(/<(\/?)((?:context_)?(?:user|assistant)_message)>/g, "‹$1$2›");
 }
 
 /**
@@ -180,10 +182,18 @@ export function neutralizeSpeakerTagSpoof(text: string): string {
 export function formatConversationTranscript(
   turns: ConversationTurn[],
   _userLabel: string = "User",
+  options: { assistantContextOnly?: boolean } = {},
 ): string {
   return turns
     .map((turn) => {
-      const tag = turn.role === "user" ? "user_message" : "assistant_message";
+      const tag =
+        turn.role === "user"
+          ? turn.context
+            ? "context_user_message"
+            : "user_message"
+          : turn.context || options.assistantContextOnly === true
+            ? "context_assistant_message"
+            : "assistant_message";
       return `<${tag}>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</${tag}>`;
     })
     .join("\n");
@@ -199,7 +209,7 @@ export function trimTranscriptToTagBoundary(transcript: string, maxChars: number
     return transcript;
   }
   const sliced = transcript.slice(-maxChars);
-  const tagStarts = ["<user_message>", "<assistant_message>"]
+  const tagStarts = ["<user_message>", "<assistant_message>", "<context_user_message>", "<context_assistant_message>"]
     .map((tag) => sliced.indexOf(tag))
     .filter((index) => index >= 0);
   if (tagStarts.length === 0) {
