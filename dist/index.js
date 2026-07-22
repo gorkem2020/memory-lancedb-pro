@@ -40,7 +40,8 @@ import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.
 import { gateMappedReflectionEntries } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { buildConversationTurnsForExtraction, dedupePairWindow, formatConversationTranscript, normalizeAutoCaptureText, trimTranscriptToTagBoundary, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
+import { MESSAGE_TOOL_DELIVERY_BANNER_PREFIX, anchorTextToRawIngress, buildConversationTurnsForExtraction, dedupePairWindow, formatConversationTranscript, normalizeAutoCaptureText, trimTranscriptToTagBoundary, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
+const RAW_INGRESS_GLOBAL_KEY = ":global:";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -1893,6 +1894,11 @@ function _initPluginState(api) {
     const turnCounter = new Map();
     const autoCaptureSeenTextCount = new Map();
     const autoCapturePendingIngressTexts = new Map();
+    // Raw inbound texts as the channel delivered them, pre-composition: the
+    // anchor pool for channel-agnostic injection slicing. Never consumed;
+    // small per-conversation rings plus a global ring under a reserved key
+    // (main-collapsed DM sessions cannot reconstruct the ingress key).
+    const autoCaptureRecentRawIngress = new Map();
     const autoCaptureRecentTexts = new Map();
     const autoCaptureRecentPairTurns = new Map();
     return {
@@ -1921,6 +1927,7 @@ function _initPluginState(api) {
         turnCounter,
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
+        autoCaptureRecentRawIngress,
         autoCaptureRecentTexts,
         autoCaptureRecentPairTurns,
     };
@@ -2031,7 +2038,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentPairTurns, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentRawIngress, autoCaptureRecentTexts, autoCaptureRecentPairTurns, } = singleton;
         warnForDisabledChannelPlugin(api.config, api.logger);
         async function sleep(ms, signal) {
             if (signal?.aborted) {
@@ -2339,6 +2346,13 @@ const memoryLanceDBProPlugin = {
                         queue.push(normalized);
                         autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
                         pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        const rawRing = autoCaptureRecentRawIngress.get(conversationKey) || [];
+                        rawRing.push(normalized);
+                        autoCaptureRecentRawIngress.set(conversationKey, rawRing.slice(-8));
+                        const globalRing = autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || [];
+                        globalRing.push(normalized);
+                        autoCaptureRecentRawIngress.set(RAW_INGRESS_GLOBAL_KEY, globalRing.slice(-24));
+                        pruneMapIfOver(autoCaptureRecentRawIngress, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                     }
                 }
             }
@@ -2919,6 +2933,30 @@ const memoryLanceDBProPlugin = {
                         let skippedAutoCaptureTexts = 0;
                         const captureAssistantEligible = config.captureAssistant === true;
                         const assistantContextOnly = !captureAssistantEligible && (config.autoCaptureContextTurns ?? 0) > 0;
+                        const rawAnchorConversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
+                        const rawAnchorPool = [
+                            ...(rawAnchorConversationKey
+                                ? autoCaptureRecentRawIngress.get(rawAnchorConversationKey) || []
+                                : []),
+                            ...(autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || []),
+                        ];
+                        // Message-tool runs (Slack groups etc.) never auto-deliver the final
+                        // assistant text — the real reply left via the message tool, so
+                        // assistant texts in this payload are internal monologue, not
+                        // conversation. Detected via the host's Delivery banner.
+                        const messageToolRun = event.messages.some((msg) => {
+                            if (!msg || typeof msg !== "object")
+                                return false;
+                            const content = msg.content;
+                            if (typeof content === "string")
+                                return content.includes(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX);
+                            if (Array.isArray(content)) {
+                                return content.some((block) => block && typeof block === "object" &&
+                                    typeof block.text === "string" &&
+                                    block.text.includes(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX));
+                            }
+                            return false;
+                        });
                         for (const msg of event.messages) {
                             if (!msg || typeof msg !== "object") {
                                 continue;
@@ -2928,6 +2966,10 @@ const memoryLanceDBProPlugin = {
                             const isEligibleRole = role === "user" || (captureAssistantEligible && role === "assistant");
                             const isContextOnlyRole = assistantContextOnly && role === "assistant";
                             if (!isEligibleRole && !isContextOnlyRole) {
+                                continue;
+                            }
+                            if (role === "assistant" && messageToolRun) {
+                                skippedAutoCaptureTexts++;
                                 continue;
                             }
                             // Context-only assistant turns join the transcript window but never
@@ -2941,8 +2983,11 @@ const memoryLanceDBProPlugin = {
                                     skippedAutoCaptureTexts++;
                                 }
                                 else {
-                                    targetTexts?.push(normalized);
-                                    messageLoopTurns.push({ role: role, text: normalized });
+                                    const anchored = role === "user" && rawAnchorPool.length > 0
+                                        ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                                        : normalized;
+                                    targetTexts?.push(anchored);
+                                    messageLoopTurns.push({ role: role, text: anchored });
                                 }
                                 continue;
                             }
@@ -2960,8 +3005,11 @@ const memoryLanceDBProPlugin = {
                                             skippedAutoCaptureTexts++;
                                         }
                                         else {
-                                            targetTexts?.push(normalized);
-                                            messageLoopTurns.push({ role: role, text: normalized });
+                                            const anchored = role === "user" && rawAnchorPool.length > 0
+                                                ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                                                : normalized;
+                                            targetTexts?.push(anchored);
+                                            messageLoopTurns.push({ role: role, text: anchored });
                                         }
                                     }
                                 }

@@ -180,6 +180,7 @@ describe("pair-window retention across successful extractions", () => {
   let extractionPrompts;
   let hook;
   let basePluginConfig;
+  let harnessEventHandlers;
 
   beforeEach(async () => {
     resetRegistration();
@@ -215,6 +216,7 @@ describe("pair-window retention across successful extractions", () => {
     const harness = createPluginApiHarness({ pluginConfig: basePluginConfig, resolveRoot: workspaceDir });
     memoryLanceDBProPlugin.register(harness.api);
     hook = getAutoCaptureHook(harness.eventHandlers);
+    harnessEventHandlers = harness.eventHandlers;
   });
 
   function registerFresh(overrides) {
@@ -224,6 +226,7 @@ describe("pair-window retention across successful extractions", () => {
       resolveRoot: workspaceDir,
     });
     memoryLanceDBProPlugin.register(harness.api);
+    harnessEventHandlers = harness.eventHandlers;
     return getAutoCaptureHook(harness.eventHandlers);
   }
 
@@ -296,6 +299,56 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(second.includes(`<user_message>\n${U3}`), "the new user turn keeps the extractable user_message tag");
     assert.ok(!second.includes(`<user_message>\n${U2}`), "a processed user turn must not wear the extractable tag");
     assert.ok(second.includes("ALREADY processed by a previous extraction run"), "the prompt must teach the processed-context tag");
+  });
+
+  it("drops message-tool scaffolding: banner stripped from user text, assistant monologue excluded", async () => {
+    const ctx = { sessionKey: "agent:test-agent:slack:channel:C0EXAMPLE01", agentId: "test-agent" };
+    const banner =
+      "Delivery: Final assistant text is not automatically delivered in this run. Use the `message` tool to send user-visible output.";
+
+    await fireAgentEnd(
+      hook,
+      [
+        { role: "user", content: `${banner}\nsynthetic group fact about the copper kettle` },
+        { role: "assistant", content: "Response sent to the channel. Waiting for the next request." },
+        { role: "user", content: `${banner}\nsynthetic group fact about the walnut tray` },
+        { role: "assistant", content: "No response needed." },
+      ],
+      ctx,
+    );
+    assert.equal(extractionPrompts.length, 1, "the two clean user texts open the gate");
+    const prompt = extractionPrompts[0];
+    assert.ok(prompt.includes("synthetic group fact about the copper kettle"), "real content survives the banner strip");
+    assert.ok(!prompt.includes("Final assistant text is not automatically delivered"), "the banner never reaches the transcript");
+    assert.ok(!prompt.includes("Response sent to the channel"), "assistant monologue on message-tool runs is excluded");
+    assert.ok(!prompt.includes("No response needed."), "control-token finals are excluded with the monologue");
+  });
+
+  it("anchors composed user texts to the raw ingress message across unknown injection shapes", async () => {
+    const alienHook = registerFresh({
+      extractMinMessages: 1,
+      dbPath: path.join(workspaceDir, "memory-db-alien"),
+    });
+    const handlers = harnessEventHandlers.get("message_received") || [];
+    assert.ok(handlers.length >= 1, "the ingress hook must be registered");
+    const raw = "synthetic anchor fact about the pewter lantern on the shelf";
+    for (const h of handlers) {
+      h.handler({ content: raw, from: "sam.rivera" }, { channelId: "alienchat", conversationId: "room9" });
+    }
+
+    const composed = [
+      "Totally Unknown Injection Header (from a channel we never modeled):",
+      "~~ structured noise line one ~~",
+      "~~ structured noise line two ~~",
+      raw,
+    ].join("\n");
+    const ctx = { sessionKey: "agent:agent-one:alienchat:direct:peer9", agentId: "agent-one" };
+    await fireAgentEnd(alienHook, [{ role: "user", content: composed }, { role: "assistant", content: "noted, lantern logged" }], ctx);
+    assert.ok(extractionPrompts.length >= 1, "the single message must fire at minMessages=1");
+    const last = extractionPrompts[extractionPrompts.length - 1];
+    assert.ok(last.includes(raw), "the raw message must be extractable");
+    assert.ok(!last.includes("Totally Unknown Injection Header"), "the unknown injection must be sliced away");
+    assert.ok(!last.includes("structured noise line"), "no injected noise may reach the transcript");
   });
 
   it("retains nothing between calls when autoCaptureContextTurns is 0", async () => {
