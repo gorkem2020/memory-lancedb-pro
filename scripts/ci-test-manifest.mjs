@@ -112,6 +112,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/delete-invalidate-reflection-caches.test.mjs", args: ["--test"] },
   { group: "llm-clients-and-auth", runner: "node", file: "test/extraction-category-rubric.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/admission-control-batch-utility.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/llm-thinklevel.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-batch-admission.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/admission-control-prompt-shape.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/smart-extractor-merge-accounting.test.mjs", args: ["--test"] },

@@ -218,6 +218,9 @@ function createApiKeyClient(config, log, warnLog) {
                     ...(shouldDisableReasoningForJson(config.model)
                         ? { chat_template_kwargs: { enable_thinking: false } }
                         : {}),
+                    ...(config.thinkLevel?.trim()
+                        ? { reasoning: { effort: config.thinkLevel.trim() } }
+                        : {}),
                 };
                 // Transmit the internal call label as a request header so gateway-side
                 // observability (tracing UIs, proxy logs) can distinguish call sites
@@ -427,7 +430,16 @@ function createOauthClient(config, log, warnLog) {
         },
     };
 }
+/**
+ * Resolves the canonical llm.thinkLevel value. Blank/whitespace-only values
+ * count as unset, so an accidentally-materialized empty string can never
+ * masquerade as "the user actually set it".
+ */
+export function resolveThinkLevel(config) {
+    return config.thinkLevel?.trim() || undefined;
+}
 export function createLlmClient(config) {
+    config = { ...config, thinkLevel: resolveThinkLevel(config) };
     const log = config.log ?? (() => { });
     const warnLog = config.warnLog;
     if (config.auth === "oauth") {

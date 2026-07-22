@@ -1598,6 +1598,10 @@
             "type": "integer",
             "minimum": 500,
             "default": 30000
+          },
+          "thinkLevel": {
+            "type": "string",
+            "description": "Reasoning effort requested from the model, e.g. low, medium, high. Sent only when explicitly configured (as the OpenRouter-compatible reasoning effort field); when unset, no reasoning parameter is sent and the provider's own default applies. Deliberately no JSON-schema default: a schema default gets materialized into the plugin config upstream on at least one OpenClaw host config-loading path, indistinguishably from a genuine user value."
           }
         }
       },

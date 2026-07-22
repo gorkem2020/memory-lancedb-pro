@@ -1847,6 +1847,7 @@ function _initPluginState(api) {
                 oauthProvider: llmOauthProvider,
                 oauthPath: llmOauthPath,
                 timeoutMs: llmTimeoutMs,
+                thinkLevel: config.llm?.thinkLevel,
                 log: (msg) => api.logger.debug(msg),
                 warnLog: (msg) => api.logger.warn(msg),
             });
@@ -1866,9 +1867,10 @@ function _initPluginState(api) {
                 globalModel: llmModel,
                 reflectionModel: reflectionModelForAdmission,
             });
-            const buildAdmissionLlmClient = (model) => {
+            const globalThinkLevel = config.llm?.thinkLevel;
+            const buildAdmissionLlmClient = (model, thinkLevel = globalThinkLevel) => {
                 const directModel = normalizeDirectModelRef(model);
-                return directModel === llmModel
+                return directModel === llmModel && thinkLevel === globalThinkLevel
                     ? llmClient
                     : createLlmClient({
                         auth: llmAuth,
@@ -1878,6 +1880,7 @@ function _initPluginState(api) {
                         oauthProvider: llmOauthProvider,
                         oauthPath: llmOauthPath,
                         timeoutMs: llmTimeoutMs,
+                        thinkLevel,
                         log: (msg) => api.logger.debug(msg),
                         warnLog: (msg) => api.logger.warn(msg),
                     });
@@ -1887,15 +1890,19 @@ function _initPluginState(api) {
             // regex fallback) even when smart extraction itself is disabled.
             admissionController = createAdmissionController(store, buildAdmissionLlmClient(admissionModelExtraction), config.admissionControl, (msg) => api.logger.debug(msg));
             // modelAffinity "lane": the whole reflection pipeline (judge, dedup
-            // decider, merge writer) rides the reflection lane's model; "global"
-            // keeps every stage on the plugin llm, judge included.
+            // decider, merge writer) rides the reflection lane's model AND
+            // thinkLevel; "global" keeps every stage on the plugin llm + its
+            // thinkLevel, judge included.
             const laneAffinity = config.admissionControl?.modelAffinity === "lane";
+            const reflectionThinkLevel = laneAffinity
+                ? (asNonEmptyString(config.memoryReflection?.thinkLevel) ?? globalThinkLevel)
+                : globalThinkLevel;
             admissionControllerReflectionLane =
-                admissionModelReflection === admissionModelExtraction
+                admissionModelReflection === admissionModelExtraction && reflectionThinkLevel === globalThinkLevel
                     ? admissionController
-                    : createAdmissionController(store, buildAdmissionLlmClient(admissionModelReflection), config.admissionControl, (msg) => api.logger.debug(msg));
+                    : createAdmissionController(store, buildAdmissionLlmClient(admissionModelReflection, reflectionThinkLevel), config.admissionControl, (msg) => api.logger.debug(msg));
             reflectionLaneLlm = laneAffinity
-                ? buildAdmissionLlmClient(asNonEmptyString(config.memoryReflection?.model) ?? llmModel)
+                ? buildAdmissionLlmClient(asNonEmptyString(config.memoryReflection?.model) ?? llmModel, reflectionThinkLevel)
                 : undefined;
             if (config.smartExtraction !== false) {
                 const noiseBank = new NoisePrototypeBank((msg) => api.logger.debug(msg));

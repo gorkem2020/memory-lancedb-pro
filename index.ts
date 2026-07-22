@@ -265,6 +265,8 @@ interface PluginConfig {
     oauthProvider?: string;
     oauthPath?: string;
     timeoutMs?: number;
+    /** Reasoning effort for memory LLM calls (e.g. low | medium | high). Sent only when set; unset leaves the provider default. */
+    thinkLevel?: string;
   };
   extractMinMessages?: number;
   extractMaxChars?: number;
@@ -2514,6 +2516,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         oauthProvider: llmOauthProvider,
         oauthPath: llmOauthPath,
         timeoutMs: llmTimeoutMs,
+        thinkLevel: config.llm?.thinkLevel,
         log: (msg: string) => api.logger.debug(msg),
         warnLog: (msg: string) => api.logger.warn(msg),
       });
@@ -2534,9 +2537,10 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         globalModel: llmModel,
         reflectionModel: reflectionModelForAdmission,
       });
-      const buildAdmissionLlmClient = (model: string) => {
+      const globalThinkLevel = config.llm?.thinkLevel;
+      const buildAdmissionLlmClient = (model: string, thinkLevel: string | undefined = globalThinkLevel) => {
         const directModel = normalizeDirectModelRef(model);
-        return directModel === llmModel
+        return directModel === llmModel && thinkLevel === globalThinkLevel
           ? llmClient
           : createLlmClient({
               auth: llmAuth,
@@ -2546,6 +2550,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
               oauthProvider: llmOauthProvider,
               oauthPath: llmOauthPath,
               timeoutMs: llmTimeoutMs,
+              thinkLevel,
               log: (msg: string) => api.logger.debug(msg),
               warnLog: (msg: string) => api.logger.warn(msg),
             });
@@ -2561,20 +2566,24 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         (msg: string) => api.logger.debug(msg),
       );
       // modelAffinity "lane": the whole reflection pipeline (judge, dedup
-      // decider, merge writer) rides the reflection lane's model; "global"
-      // keeps every stage on the plugin llm, judge included.
+      // decider, merge writer) rides the reflection lane's model AND
+      // thinkLevel; "global" keeps every stage on the plugin llm + its
+      // thinkLevel, judge included.
       const laneAffinity = config.admissionControl?.modelAffinity === "lane";
+      const reflectionThinkLevel = laneAffinity
+        ? (asNonEmptyString(config.memoryReflection?.thinkLevel) ?? globalThinkLevel)
+        : globalThinkLevel;
       admissionControllerReflectionLane =
-        admissionModelReflection === admissionModelExtraction
+        admissionModelReflection === admissionModelExtraction && reflectionThinkLevel === globalThinkLevel
           ? admissionController
           : createAdmissionController(
               store,
-              buildAdmissionLlmClient(admissionModelReflection),
+              buildAdmissionLlmClient(admissionModelReflection, reflectionThinkLevel),
               config.admissionControl,
               (msg: string) => api.logger.debug(msg),
             );
       reflectionLaneLlm = laneAffinity
-        ? buildAdmissionLlmClient(asNonEmptyString(config.memoryReflection?.model) ?? llmModel)
+        ? buildAdmissionLlmClient(asNonEmptyString(config.memoryReflection?.model) ?? llmModel, reflectionThinkLevel)
         : undefined;
 
       if (config.smartExtraction !== false) {
