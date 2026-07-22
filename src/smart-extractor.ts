@@ -421,6 +421,12 @@ export interface ExtractPersistOptions {
    */
   contextWindowActive?: boolean;
   /**
+   * Per-call assistant-eligibility state: false forces user-only grounding
+   * for this extraction regardless of the static captureAssistantEligible
+   * config. Set by the capture pipeline for group-chat session keys.
+   */
+  captureAssistantActive?: boolean;
+  /**
    * Ordered conversation turns for the extraction prompt's transcript block,
    * oldest-first, true chronological interleaving of user and assistant
    * turns. Preferred over `conversationText` + `assistantContextTexts` when
@@ -549,6 +555,7 @@ export class SmartExtractor {
       options.conversationTurns,
       policyMode,
       options.contextWindowActive,
+      options.captureAssistantActive,
     );
     let candidates = extraction.candidates;
 
@@ -1173,6 +1180,7 @@ export class SmartExtractor {
     conversationTurns?: ConversationTurn[],
     policyMode: ExtractionPolicyMode = "full",
     contextWindowActive?: boolean,
+    captureAssistantActive?: boolean,
   ): Promise<ExtractCandidatesResult> {
     const maxChars = this.config.extractMaxChars ?? 8000;
     const user = this.config.user ?? "User";
@@ -1190,13 +1198,14 @@ export class SmartExtractor {
         ];
 
     const windowActive = contextWindowActive ?? this.config.contextWindowEnabled === true;
+    const assistantEligibleActive = captureAssistantActive ?? this.config.captureAssistantEligible === true;
     const rawTranscript = formatConversationTranscript(turns, user, {
-      assistantContextOnly: windowActive && this.config.captureAssistantEligible !== true,
+      assistantContextOnly: windowActive && !assistantEligibleActive,
     });
     const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
 
     const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
-      assistantEligible: this.config.captureAssistantEligible === true,
+      assistantEligible: assistantEligibleActive,
       contextWindow: windowActive,
     });
 

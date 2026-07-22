@@ -350,6 +350,51 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(!last.includes("structured noise line"), "no injected noise may reach the transcript");
   });
 
+  it("forces captureAssistant=false on group-chat session keys even when configured true", async () => {
+    const groupHook = registerFresh({
+      captureAssistant: true,
+      extractMinMessages: 1,
+      dbPath: path.join(workspaceDir, "memory-db-group-true"),
+    });
+    const ctx = { sessionKey: "agent:agent-one:slack:channel:C0EXAMPLE02", agentId: "agent-one" };
+
+    await fireAgentEnd(
+      groupHook,
+      [
+        { role: "user", content: "synthetic group note about the ceramic planter" },
+        { role: "assistant", content: "synthetic assistant reply that must never become a source in a group" },
+      ],
+      ctx,
+    );
+    assert.ok(extractionPrompts.length >= 1);
+    const prompt = extractionPrompts[extractionPrompts.length - 1];
+    assert.ok(prompt.includes("ceramic planter"), "the user text stays extractable");
+    assert.ok(!prompt.includes("must never become a source"), "assistant text is excluded on groups despite captureAssistant=true");
+    assert.ok(!prompt.includes("also valid sources"), "the eligible-mode prompt teaching must not appear on groups");
+    assert.ok(prompt.includes("Memories may only be grounded here."), "groups fall back to user-only grounding teaching");
+  });
+
+  it("keeps captureAssistant=true fully live on direct session keys (both eligible tags on the new delta)", async () => {
+    const directHook = registerFresh({
+      captureAssistant: true,
+      extractMinMessages: 1,
+      dbPath: path.join(workspaceDir, "memory-db-direct-true"),
+    });
+    const ctx = { sessionKey: "agent:agent-one:main", agentId: "agent-one" };
+
+    await fireAgentEnd(
+      directHook,
+      [
+        { role: "user", content: "synthetic direct note about the willow basket" },
+        { role: "assistant", content: "synthetic direct reply that is a valid source here" },
+      ],
+      ctx,
+    );
+    const prompt = extractionPrompts[extractionPrompts.length - 1];
+    assert.ok(prompt.includes("<assistant_message>\nsynthetic direct reply"), "the new reply wears the eligible assistant tag on direct keys");
+    assert.ok(prompt.includes("also valid sources"), "eligible teaching stays on direct keys");
+  });
+
   it("forces contextTurns=0 on group-chat session keys: no context tags, no retention (fail-closed)", async () => {
     const groupCtx = { sessionKey: "agent:test-agent:slack:channel:C0EXAMPLE01", agentId: "test-agent" };
 

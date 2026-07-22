@@ -4088,13 +4088,17 @@ const memoryLanceDBProPlugin = {
           const eligibleTexts: string[] = [];
           const conversationTurns: ConversationTurn[] = [];
           let skippedAutoCaptureTexts = 0;
-          const captureAssistantEligible = config.captureAssistant === true;
-          // Group chats fall back to contextTurns=0 (original
-          // captureAssistant-gated behavior): full channel support will be
-          // implemented with speaker awareness. Direct keys are allowlisted;
-          // unknown key shapes count as group, fail-closed.
+          const isDirectSession = isDirectConversationSessionKey(sessionKey);
+          // Group chats force captureAssistant=false and contextTurns=0
+          // (plain user-only capture) regardless of config: with every
+          // non-self participant arriving role=user, assistant-sourced
+          // extraction in a multi-party room misattributes at will. Full
+          // channel support will be implemented with speaker awareness.
+          // Direct keys are allowlisted; unknown key shapes count as group,
+          // fail-closed.
+          const captureAssistantEligible = config.captureAssistant === true && isDirectSession;
           const contextWindowActive =
-            isDirectConversationSessionKey(sessionKey) && (config.autoCaptureContextTurns ?? 0) > 0;
+            isDirectSession && (config.autoCaptureContextTurns ?? 0) > 0;
           const assistantContextOnly = !captureAssistantEligible && contextWindowActive;
           // Message-tool runs (Slack groups etc.) never auto-deliver the final
           // assistant text — the real reply left via the message tool, so
@@ -4398,7 +4402,7 @@ const memoryLanceDBProPlugin = {
               try {
                 stats = await smartExtractor.extractAndPersist(
                   conversationText, sessionKey,
-                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantWindowTexts, conversationTurns: finalConversationTurns, contextWindowActive },
+                  { scope: defaultScope, scopeFilter: accessibleScopes, agentId, assistantContextTexts: assistantWindowTexts, conversationTurns: finalConversationTurns, contextWindowActive, captureAssistantActive: captureAssistantEligible },
                 );
               } catch (err) {
                 api.logger.error(
