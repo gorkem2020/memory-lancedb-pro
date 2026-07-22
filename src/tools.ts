@@ -298,6 +298,39 @@ function serializeFactEntry(entry: MemoryEntry, atMs: number) {
 
 const FACT_QUERY_PAGE_SIZE = 500;
 
+/**
+ * Complete, scope-aware lookup of ACTIVE rows holding a fact key. The vector
+ * top-K is the wrong tool for key collisions: a same-key row ranked behind
+ * closer unrelated neighbors, or below the similarity floor, is exactly the
+ * stale value a manual update must supersede. Paginates the full scope the
+ * same way the temporal-fact query path does.
+ */
+async function findActiveFactKeyEntries(
+  store: MemoryStore,
+  scopeFilter: string[],
+  factKey: string,
+): Promise<MemoryEntry[]> {
+  const matches: MemoryEntry[] = [];
+  const seenIds = new Set<string>();
+  const now = Date.now();
+  for (let offset = 0; ; offset += FACT_QUERY_PAGE_SIZE) {
+    const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset);
+    if (page.length === 0) break;
+    let newRows = 0;
+    for (const entry of page) {
+      if (seenIds.has(entry.id)) continue;
+      seenIds.add(entry.id);
+      newRows += 1;
+      const meta = parseSmartMetadata(entry.metadata, entry);
+      if (!isMemoryActiveAt(meta, now) || isMemoryExpired(meta, now)) continue;
+      const entryKey = meta.fact_key ?? deriveFactKey(meta.memory_category, entry.text);
+      if (entryKey === factKey) matches.push(entry);
+    }
+    if (page.length < FACT_QUERY_PAGE_SIZE || newRows === 0) break;
+  }
+  return matches;
+}
+
 type FactQueryCandidate = {
   entry: MemoryEntry;
   meta: ReturnType<typeof parseSmartMetadata>;
@@ -1370,33 +1403,57 @@ export function registerMemoryStoreTool(
           // below, and past that stores alongside: a wrong supersede destroys
           // a real fact, while a duplicate is fixable noise.
           const newFactKey = deriveFactKey(memoryCategory, stripped);
-          const factKeyCandidate =
-            manualSupersede && !force && newFactKey
-              ? existing.find((r) => {
-                  const meta = parseSmartMetadata(r.entry.metadata, r.entry);
-                  const neighborKey =
-                    meta.fact_key ?? deriveFactKey(meta.memory_category, r.entry.text);
-                  return neighborKey === newFactKey;
-                })
-              : undefined;
-          const manualPriorityTarget =
-            manualSupersede && !force ? duplicateCandidate ?? factKeyCandidate : undefined;
+          // Key collisions resolve through a COMPLETE scope lookup, never the
+          // vector top-K: a same-key row ranked behind closer unrelated
+          // neighbors, or below the similarity floor, is exactly the stale
+          // value this path exists to supersede. Fail-open like the duplicate
+          // pre-check: a lookup error stores alongside instead of blocking.
+          let activeFactKeyEntries: MemoryEntry[] = [];
+          if (manualSupersede && !force && newFactKey) {
+            try {
+              activeFactKeyEntries = await findActiveFactKeyEntries(
+                runtimeContext.store,
+                [targetScope],
+                newFactKey,
+              );
+            } catch (err) {
+              console.warn(
+                `memory-lancedb-pro: fact-key lookup failed, continue store: ${String(err)}`,
+              );
+            }
+          }
+          const manualPriorityTargets: Array<{ entry: MemoryEntry; score?: number }> = [];
+          if (manualSupersede && !force) {
+            if (duplicateCandidate) {
+              manualPriorityTargets.push(duplicateCandidate);
+            }
+            for (const entry of activeFactKeyEntries) {
+              if (!manualPriorityTargets.some((target) => target.entry.id === entry.id)) {
+                manualPriorityTargets.push({ entry });
+              }
+            }
+          }
+          const manualPriority = manualPriorityTargets.length > 0;
 
           // Auto-supersede: if a similar memory exists (0.95-0.98 similarity),
           // same storage-layer category, and category is eligible, mark the old
           // one as superseded and store the new one with a supersedes link.
-          const supersedeCandidate =
-            manualPriorityTarget ??
-            existing.find(
-              (r) =>
-                r.score > 0.95 &&
-                r.score <= 0.98 &&
-                TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
-                matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata),
-            );
+          const bandCandidate = existing.find(
+            (r) =>
+              r.score > 0.95 &&
+              r.score <= 0.98 &&
+              TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
+              matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata),
+          );
+          const supersedeTargets = manualPriority
+            ? manualPriorityTargets
+            : bandCandidate
+              ? [bandCandidate]
+              : [];
 
-          if (supersedeCandidate) {
-            const oldEntry = supersedeCandidate.entry;
+          if (supersedeTargets.length > 0) {
+            const primaryTarget = supersedeTargets[0];
+            const oldEntry = primaryTarget.entry;
             const oldMeta = parseSmartMetadata(oldEntry.metadata, oldEntry);
             const now = Date.now();
             const factKey =
@@ -1411,7 +1468,7 @@ export function registerMemoryStoreTool(
                 // A manual-priority supersede replaces the fact's VALUE, so the
                 // old row's overview is stale by definition; the band case
                 // keeps the richer inherited overview as before.
-                l1_overview: manualPriorityTarget ? `- ${text}` : oldMeta.l1_overview || `- ${text}`,
+                l1_overview: manualPriority ? `- ${text}` : oldMeta.l1_overview || `- ${text}`,
                 l2_content: text,
                 memory_category: oldMeta.memory_category,
                 tier: oldMeta.tier,
@@ -1424,10 +1481,14 @@ export function registerMemoryStoreTool(
                 valid_from: now,
                 fact_key: factKey,
                 supersedes: oldEntry.id,
-                relations: appendRelation([], {
-                  type: "supersedes",
-                  targetId: oldEntry.id,
-                }),
+                relations: supersedeTargets.reduce(
+                  (relations, target) =>
+                    appendRelation(relations, {
+                      type: "supersedes",
+                      targetId: target.entry.id,
+                    }),
+                  [] as ReturnType<typeof appendRelation>,
+                ),
               },
             );
 
@@ -1440,26 +1501,34 @@ export function registerMemoryStoreTool(
               metadata: stringifySmartMetadata(newMeta),
             });
 
-            // Invalidate old record
-            try {
-              await runtimeContext.store.patchMetadata(
-                oldEntry.id,
-                {
-                  fact_key: factKey,
-                  invalidated_at: now,
-                  superseded_by: newEntry.id,
-                  relations: appendRelation(oldMeta.relations, {
-                    type: "superseded_by",
-                    targetId: newEntry.id,
-                  }),
-                },
-                [targetScope],
-              );
-            } catch (patchErr) {
-              // New record is already the source of truth; log but don't fail
-              console.warn(
-                `memory-pro: failed to patch superseded record ${oldEntry.id.slice(0, 8)}: ${patchErr}`,
-              );
+            // Invalidate EVERY superseded record: a fact key can have
+            // accumulated several active rows (the contradiction this path
+            // removes), and reconciling only one would leave the rest standing.
+            for (const target of supersedeTargets) {
+              const targetMeta =
+                target.entry.id === oldEntry.id
+                  ? oldMeta
+                  : parseSmartMetadata(target.entry.metadata, target.entry);
+              try {
+                await runtimeContext.store.patchMetadata(
+                  target.entry.id,
+                  {
+                    fact_key: targetMeta.fact_key ?? factKey,
+                    invalidated_at: now,
+                    superseded_by: newEntry.id,
+                    relations: appendRelation(targetMeta.relations, {
+                      type: "superseded_by",
+                      targetId: newEntry.id,
+                    }),
+                  },
+                  [targetScope],
+                );
+              } catch (patchErr) {
+                // New record is already the source of truth; log but don't fail
+                console.warn(
+                  `memory-pro: failed to patch superseded record ${target.entry.id.slice(0, 8)}: ${patchErr}`,
+                );
+              }
             }
 
             context.manualEchoLedger?.record(agentId, text);
@@ -1476,18 +1545,19 @@ export function registerMemoryStoreTool(
               content: [
                 {
                   type: "text",
-                  text: `Superseded memory ${oldEntry.id.slice(0, 8)}... → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+                  text: `Superseded ${supersedeTargets.length > 1 ? `${supersedeTargets.length} memories (${supersedeTargets.map((target) => target.entry.id.slice(0, 8)).join(", ")})` : `memory ${oldEntry.id.slice(0, 8)}...`} → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
                 },
               ],
               details: {
                 action: "superseded",
                 id: newEntry.id,
                 supersededId: oldEntry.id,
+                supersededIds: supersedeTargets.map((target) => target.entry.id),
                 scope: newEntry.scope,
                 category: memoryCategory,
                 rawCategory: newEntry.category,
                 importance: newEntry.importance,
-                similarity: supersedeCandidate.score,
+                similarity: primaryTarget.score,
               },
             };
           }

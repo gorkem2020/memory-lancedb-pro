@@ -69,9 +69,13 @@ function neighborRow({ id = "old-1", text, category = "preference", score, factK
   };
 }
 
-function makeContext({ neighbors = [], manualStoreSupersede } = {}) {
+function makeContext({ neighbors = [], rows, manualStoreSupersede } = {}) {
   const storedEntries = [];
   const patchCalls = [];
+  // Production-shaped store double: vectorSearch honors the caller's limit and
+  // minScore exactly like the real store, and list() pages over ALL rows the
+  // store holds (`rows` defaults to the vector neighbors' entries).
+  const allRows = rows ?? neighbors.map((neighbor) => neighbor.entry);
   const context = {
     agentId: "main",
     workspaceDir: "/tmp",
@@ -89,8 +93,14 @@ function makeContext({ neighbors = [], manualStoreSupersede } = {}) {
       },
     },
     store: {
-      async vectorSearch() {
-        return neighbors;
+      async vectorSearch(vector, limit = 5, minScore = 0.3) {
+        return neighbors
+          .filter((neighbor) => neighbor.score >= minScore)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit);
+      },
+      async list(scopeFilter, category, limit = 100, offset = 0) {
+        return allRows.slice(offset, offset + limit);
       },
       async store(entry) {
         const stored = { ...entry, id: `new-${storedEntries.length + 1}`, timestamp: Date.now() };
@@ -194,6 +204,83 @@ describe("manual memory_store always-store supersede semantics", () => {
     assert.equal(res.details.action, "duplicate", "knob off must preserve the upstream duplicate check exactly");
     assert.equal(storedEntries.length, 0);
     assert.equal(patchCalls.length, 0);
+  });
+
+  it("supersedes a same-key row the vector top-K cannot see (ranked behind three closer unrelated neighbors)", async () => {
+    const staleKeyRow = neighborRow({ id: "old-key", text: "favorite drink: Coca-Cola", score: 0.5, factKey: "preferences:favorite drink" });
+    const { context, storedEntries, patchCalls } = makeContext({
+      manualStoreSupersede: true,
+      neighbors: [
+        neighborRow({ id: "near-1", text: "favorite snack: simit", score: 0.92, factKey: "preferences:favorite snack" }),
+        neighborRow({ id: "near-2", text: "favorite dessert: baklava", score: 0.91, factKey: "preferences:favorite dessert" }),
+        neighborRow({ id: "near-3", text: "favorite fruit: fig", score: 0.9, factKey: "preferences:favorite fruit" }),
+        staleKeyRow,
+      ],
+    });
+    const tools = createToolSet(context);
+    const store = tools.get("memory_store");
+
+    const res = await store.execute(null, { text: "favorite drink: tea", category: "preference" });
+
+    assert.equal(res.details.action, "superseded", "the stale same-key row must be found even when it ranks fourth");
+    assert.equal(patchCalls.length, 1, "only the same-key row may be invalidated");
+    assert.equal(patchCalls[0].id, "old-key");
+    assert.equal(storedEntries.length, 1);
+  });
+
+  it("supersedes a same-key row that falls below the vector similarity floor", async () => {
+    const { context, storedEntries, patchCalls } = makeContext({
+      manualStoreSupersede: true,
+      neighbors: [neighborRow({ id: "old-faint", text: "favorite drink: Coca-Cola", score: 0.05, factKey: "preferences:favorite drink" })],
+    });
+    const tools = createToolSet(context);
+    const store = tools.get("memory_store");
+
+    const res = await store.execute(null, { text: "favorite drink: tea", category: "preference" });
+
+    assert.equal(res.details.action, "superseded", "the similarity floor must not hide a same-key collision");
+    assert.equal(patchCalls.length, 1);
+    assert.equal(patchCalls[0].id, "old-faint");
+    assert.equal(storedEntries.length, 1);
+  });
+
+  it("supersedes EVERY active same-key row, not just the first match", async () => {
+    const { context, storedEntries, patchCalls } = makeContext({
+      manualStoreSupersede: true,
+      neighbors: [
+        neighborRow({ id: "old-a", text: "favorite drink: Coca-Cola", score: 0.6, factKey: "preferences:favorite drink" }),
+        neighborRow({ id: "old-b", text: "favorite drink: ayran", score: 0.55, factKey: "preferences:favorite drink" }),
+      ],
+    });
+    const tools = createToolSet(context);
+    const store = tools.get("memory_store");
+
+    const res = await store.execute(null, { text: "favorite drink: tea", category: "preference" });
+
+    assert.equal(res.details.action, "superseded");
+    assert.deepEqual([...res.details.supersededIds].sort(), ["old-a", "old-b"], "every active same-key row must be reconciled");
+    assert.equal(patchCalls.length, 2, "both stale rows must be invalidated");
+    assert.deepEqual(patchCalls.map((call) => call.id).sort(), ["old-a", "old-b"]);
+    assert.equal(storedEntries.length, 1, "exactly one new row carries the manual value");
+  });
+
+  it("ignores already-invalidated same-key rows (history must not be re-superseded)", async () => {
+    const invalidated = neighborRow({ id: "old-history", text: "favorite drink: salep", score: 0.6, factKey: "preferences:favorite drink" });
+    const meta = JSON.parse(invalidated.entry.metadata);
+    meta.invalidated_at = Date.now() - 1_000;
+    invalidated.entry.metadata = JSON.stringify(meta);
+    const { context, storedEntries, patchCalls } = makeContext({
+      manualStoreSupersede: true,
+      neighbors: [invalidated],
+    });
+    const tools = createToolSet(context);
+    const store = tools.get("memory_store");
+
+    const res = await store.execute(null, { text: "favorite drink: tea", category: "preference" });
+
+    assert.equal(res.details.action, "created", "a historical superseded row is not an active collision");
+    assert.equal(patchCalls.length, 0);
+    assert.equal(storedEntries.length, 1);
   });
 
   it("keeps the existing 0.95-0.98 same-category band superseding with the knob on (no regression)", async () => {
