@@ -350,6 +350,43 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(!last.includes("structured noise line"), "no injected noise may reach the transcript");
   });
 
+  it("skips group-chat capture entirely when autoCaptureGroupChats is explicitly false", async () => {
+    const gatedHook = registerFresh({
+      autoCaptureGroupChats: false,
+      extractMinMessages: 1,
+      dbPath: path.join(workspaceDir, "memory-db-group-gated"),
+    });
+    const before = extractionPrompts.length;
+
+    await fireAgentEnd(
+      gatedHook,
+      [{ role: "user", content: "synthetic group note about the birch coat rack" }],
+      { sessionKey: "agent:agent-one:slack:channel:C0EXAMPLE03", agentId: "agent-one" },
+    );
+    assert.equal(extractionPrompts.length, before, "no extraction may run on a gated group session");
+
+    await fireAgentEnd(
+      gatedHook,
+      [{ role: "user", content: "synthetic direct note about the birch coat rack" }],
+      { sessionKey: "agent:agent-one:main", agentId: "agent-one" },
+    );
+    assert.equal(extractionPrompts.length, before + 1, "direct sessions are unaffected by the group opt-out");
+  });
+
+  it("keeps group-chat capture running when the knob is unset (follows autoCapture, no surprises)", async () => {
+    const defaultHook = registerFresh({
+      extractMinMessages: 1,
+      dbPath: path.join(workspaceDir, "memory-db-group-default"),
+    });
+    const before = extractionPrompts.length;
+    await fireAgentEnd(
+      defaultHook,
+      [{ role: "user", content: "synthetic group note about the maple key bowl" }],
+      { sessionKey: "agent:agent-one:slack:channel:C0EXAMPLE04", agentId: "agent-one" },
+    );
+    assert.equal(extractionPrompts.length, before + 1, "unset knob preserves existing group capture behavior");
+  });
+
   it("forces captureAssistant=false on group-chat session keys even when configured true", async () => {
     const groupHook = registerFresh({
       captureAssistant: true,

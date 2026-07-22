@@ -290,6 +290,8 @@ interface PluginConfig {
   extractMinMessages?: number;
   /** Rolling extraction context window in retained user turns (0 = disabled, max 10). */
   autoCaptureContextTurns?: number;
+  /** Group-chat auto-capture: unset follows autoCapture (no behavior change); explicit false skips capture on group-chat session keys until speaker awareness lands. */
+  autoCaptureGroupChats?: boolean;
   /** Per-call chunk bound for every batched pipeline stage (1-50, default 10). */
   batchChunkSize?: number;
   extractMaxChars?: number;
@@ -4089,6 +4091,15 @@ const memoryLanceDBProPlugin = {
           const conversationTurns: ConversationTurn[] = [];
           let skippedAutoCaptureTexts = 0;
           const isDirectSession = isDirectConversationSessionKey(sessionKey);
+          // Opt-out knob: unset follows autoCapture (groups keep capturing,
+          // no surprises on install); explicit false skips group-chat capture
+          // entirely until per-sender speaker awareness lands.
+          if (!isDirectSession && config.autoCaptureGroupChats === false) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture skipped for group-chat session ${sessionKey} (autoCaptureGroupChats=false)`,
+            );
+            return;
+          }
           // Group chats force captureAssistant=false and contextTurns=0
           // (plain user-only capture) regardless of config: with every
           // non-self participant arriving role=user, assistant-sourced
@@ -6591,6 +6602,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       : undefined,
     extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
     autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
+    autoCaptureGroupChats: typeof cfg.autoCaptureGroupChats === "boolean" ? cfg.autoCaptureGroupChats : undefined,
     batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize),
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,

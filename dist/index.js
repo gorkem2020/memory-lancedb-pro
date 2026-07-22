@@ -3106,6 +3106,13 @@ const memoryLanceDBProPlugin = {
                         const conversationTurns = [];
                         let skippedAutoCaptureTexts = 0;
                         const isDirectSession = isDirectConversationSessionKey(sessionKey);
+                        // Opt-out knob: unset follows autoCapture (groups keep capturing,
+                        // no surprises on install); explicit false skips group-chat capture
+                        // entirely until per-sender speaker awareness lands.
+                        if (!isDirectSession && config.autoCaptureGroupChats === false) {
+                            api.logger.debug(`memory-lancedb-pro: auto-capture skipped for group-chat session ${sessionKey} (autoCaptureGroupChats=false)`);
+                            return;
+                        }
                         // Group chats force captureAssistant=false and contextTurns=0
                         // (plain user-only capture) regardless of config: with every
                         // non-self participant arriving role=user, assistant-sourced
@@ -5250,6 +5257,7 @@ export function parsePluginConfig(value) {
             : undefined,
         extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
         autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
+        autoCaptureGroupChats: typeof cfg.autoCaptureGroupChats === "boolean" ? cfg.autoCaptureGroupChats : undefined,
         batchChunkSize: clampBatchChunkSize(cfg.batchChunkSize),
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,
