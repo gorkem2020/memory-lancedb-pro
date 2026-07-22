@@ -73,7 +73,9 @@ import { isNoise } from "./src/noise-filter.js";
 import {
   type ConversationTurn,
   buildConversationTurnsForExtraction,
+  formatConversationTranscript,
   normalizeAutoCaptureText,
+  trimTranscriptToTagBoundary,
 } from "./src/auto-capture-cleanup.js";
 
 // Import smart extraction & lifecycle components
@@ -1388,13 +1390,20 @@ function extractTextFromToolResult(result: unknown): string {
   }
 }
 
+// "tagged" (distiller INPUT) wraps each message in speaker tags; "labeled"
+// keeps the legacy `role: text` lines for STORED artifacts (session-summary
+// rows), which must never carry literal speaker tags a later recall could
+// replay into a prompt as fake transcript structure.
+type ConversationTranscriptFormat = "tagged" | "labeled";
+
 function summarizeRecentConversationMessages(
   messages: readonly unknown[],
   messageCount: number,
+  format: ConversationTranscriptFormat = "tagged",
 ): string | null {
   if (!Array.isArray(messages) || messages.length === 0) return null;
 
-  const recent: string[] = [];
+  const recent: ConversationTurn[] = [];
   for (let index = messages.length - 1; index >= 0 && recent.length < messageCount; index--) {
     const raw = messages[index];
     if (!raw || typeof raw !== "object") continue;
@@ -1406,15 +1415,18 @@ function summarizeRecentConversationMessages(
     const text = extractTextContent(msg.content);
     if (!text || shouldSkipReflectionMessage(role, text)) continue;
 
-    recent.push(`${role}: ${redactSecrets(text)}`);
+    recent.push({ role, text: redactSecrets(text) });
   }
 
   if (recent.length === 0) return null;
   recent.reverse();
-  return recent.join("\n");
+  if (format === "labeled") {
+    return recent.map((turn) => `${turn.role}: ${turn.text}`).join("\n");
+  }
+  return formatConversationTranscript(recent);
 }
 
-async function readSessionConversationForReflection(filePath: string, messageCount: number): Promise<string | null> {
+async function readSessionConversationForReflection(filePath: string, messageCount: number, format: ConversationTranscriptFormat = "tagged"): Promise<string | null> {
   try {
     const lines = (await readFile(filePath, "utf-8")).trim().split("\n");
     const messages: unknown[] = [];
@@ -1429,14 +1441,14 @@ async function readSessionConversationForReflection(filePath: string, messageCou
       }
     }
 
-    return summarizeRecentConversationMessages(messages, messageCount);
+    return summarizeRecentConversationMessages(messages, messageCount, format);
   } catch {
     return null;
   }
 }
 
-export async function readSessionConversationWithResetFallback(sessionFilePath: string, messageCount: number): Promise<string | null> {
-  const primary = await readSessionConversationForReflection(sessionFilePath, messageCount);
+export async function readSessionConversationWithResetFallback(sessionFilePath: string, messageCount: number, format: ConversationTranscriptFormat = "tagged"): Promise<string | null> {
+  const primary = await readSessionConversationForReflection(sessionFilePath, messageCount, format);
   if (primary) return primary;
 
   try {
@@ -1449,7 +1461,7 @@ export async function readSessionConversationWithResetFallback(sessionFilePath: 
     );
     if (resetCandidates.length > 0) {
       const latestResetPath = join(dir, resetCandidates[0]);
-      return await readSessionConversationForReflection(latestResetPath, messageCount);
+      return await readSessionConversationForReflection(latestResetPath, messageCount, format);
     }
   } catch {
     // ignore
@@ -1471,7 +1483,7 @@ export function buildReflectionPrompt(
   maxInputChars: number,
   toolErrorSignals: ReflectionErrorSignal[] = []
 ): string {
-  const clipped = conversation.slice(-maxInputChars);
+  const clipped = trimTranscriptToTagBoundary(conversation, maxInputChars);
   const errorHints = toolErrorSignals.length > 0
     ? toolErrorSignals
       .map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary} (sig:${e.signatureHash.slice(0, 8)})`)
@@ -1479,6 +1491,10 @@ export function buildReflectionPrompt(
     : "- (none)";
   return [
     "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
+    "",
+    "The INPUT transcript is a sequence of tagged blocks in chronological order:",
+    "- <user_message>...</user_message> wraps ONE message written by the human user.",
+    "- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.",
     "",
     "Output Markdown only. No intro text. No outro text. No extra headings.",
     "",
@@ -1579,9 +1595,7 @@ export function buildReflectionPrompt(
     errorHints,
     "",
     "INPUT:",
-    "```",
     clipped,
-    "```",
   ].join("\n");
 }
 
@@ -5328,9 +5342,9 @@ const memoryLanceDBProPlugin = {
           guard.set(guardKey, now);
 
           const sessionContent =
-            summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount) ??
+            summarizeRecentConversationMessages(event.messages ?? [], sessionMessageCount, "labeled") ??
             (typeof event.sessionFile === "string"
-              ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount)
+              ? await readSessionConversationWithResetFallback(event.sessionFile, sessionMessageCount, "labeled")
               : null);
 
           if (!sessionContent) {
