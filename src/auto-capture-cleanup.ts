@@ -140,13 +140,53 @@ export function stripAutoCaptureInjectedPrefix(role: string, text: string): stri
   return normalized.trim();
 }
 
+/**
+ * Message-tool channels (Slack groups and other non-auto-delivery runs) hand
+ * the plugin a "user" message that concatenates runtime scaffolding around the
+ * real inbound content: a Delivery banner first, then optionally a quoted
+ * re-render of channel history the session has already seen. Both are
+ * host-emitted grammar, matched exactly and stripped fail-closed — unmatched
+ * lines always pass through. Full group-channel support (per-sender speaker
+ * awareness) is the permanent design; this keeps the transcript clean until
+ * that lands.
+ */
+export const MESSAGE_TOOL_DELIVERY_BANNER_PREFIX =
+  "Delivery: Final assistant text is not automatically delivered in this run.";
+const CHAT_HISTORY_QUOTE_HEADER = "Chat history since last reply (untrusted, for context):";
+const QUOTED_HISTORY_LINE = /^#\d+(?:\.\d+)? \S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ [^:]+: /;
+
+export function stripGroupChannelScaffold(text: string): string {
+  const lines = text.split("\n");
+  const kept: string[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (line.startsWith(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX)) {
+      index++;
+      continue;
+    }
+    if (line.trim() === CHAT_HISTORY_QUOTE_HEADER) {
+      index++;
+      while (index < lines.length && (QUOTED_HISTORY_LINE.test(lines[index]) || lines[index].trim() === "")) {
+        index++;
+      }
+      continue;
+    }
+    kept.push(line);
+    index++;
+  }
+  return kept.join("\n").trim();
+}
+
 export function normalizeAutoCaptureText(
   role: unknown,
   text: string,
   shouldSkipMessage?: (role: string, text: string) => boolean,
 ): string | null {
   if (typeof role !== "string") return null;
-  const normalized = stripAutoCaptureInjectedPrefix(role, text);
+  const descaffolded = role === "user" ? stripGroupChannelScaffold(text) : text;
+  if (!descaffolded) return null;
+  const normalized = stripAutoCaptureInjectedPrefix(role, descaffolded);
   if (!normalized) return null;
   if (shouldSkipMessage?.(role, normalized)) return null;
   return normalized;

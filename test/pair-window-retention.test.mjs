@@ -297,6 +297,29 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(second.includes("ALREADY processed by a previous extraction run"), "the prompt must teach the processed-context tag");
   });
 
+  it("drops message-tool scaffolding: banner stripped from user text, assistant monologue excluded", async () => {
+    const ctx = { sessionKey: "agent:test-agent:slack:channel:C0EXAMPLE01", agentId: "test-agent" };
+    const banner =
+      "Delivery: Final assistant text is not automatically delivered in this run. Use the `message` tool to send user-visible output.";
+
+    await fireAgentEnd(
+      hook,
+      [
+        { role: "user", content: `${banner}\nsynthetic group fact about the copper kettle` },
+        { role: "assistant", content: "Response sent to the channel. Waiting for the next request." },
+        { role: "user", content: `${banner}\nsynthetic group fact about the walnut tray` },
+        { role: "assistant", content: "No response needed." },
+      ],
+      ctx,
+    );
+    assert.equal(extractionPrompts.length, 1, "the two clean user texts open the gate");
+    const prompt = extractionPrompts[0];
+    assert.ok(prompt.includes("synthetic group fact about the copper kettle"), "real content survives the banner strip");
+    assert.ok(!prompt.includes("Final assistant text is not automatically delivered"), "the banner never reaches the transcript");
+    assert.ok(!prompt.includes("Response sent to the channel"), "assistant monologue on message-tool runs is excluded");
+    assert.ok(!prompt.includes("No response needed."), "control-token finals are excluded with the monologue");
+  });
+
   it("retains nothing between calls when autoCaptureContextTurns is 0", async () => {
     const zeroHook = registerFresh({
       autoCaptureContextTurns: 0,

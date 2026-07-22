@@ -82,6 +82,7 @@ import {
   dedupePairWindow,
   formatConversationTranscript,
   trimTranscriptToTagBoundary,
+  MESSAGE_TOOL_DELIVERY_BANNER_PREFIX,
 } from "./src/auto-capture-cleanup.js";
 import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 
@@ -4070,6 +4071,24 @@ const memoryLanceDBProPlugin = {
           const captureAssistantEligible = config.captureAssistant === true;
           const assistantContextOnly =
             !captureAssistantEligible && (config.autoCaptureContextTurns ?? 0) > 0;
+          // Message-tool runs (Slack groups etc.) never auto-deliver the final
+          // assistant text — the real reply left via the message tool, so
+          // assistant texts in this payload are internal monologue, not
+          // conversation. Detected via the host's Delivery banner.
+          const messageToolRun = event.messages.some((msg) => {
+            if (!msg || typeof msg !== "object") return false;
+            const content = (msg as Record<string, unknown>).content;
+            if (typeof content === "string") return content.includes(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX);
+            if (Array.isArray(content)) {
+              return content.some(
+                (block) =>
+                  block && typeof block === "object" &&
+                  typeof (block as Record<string, unknown>).text === "string" &&
+                  ((block as Record<string, unknown>).text as string).includes(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX),
+              );
+            }
+            return false;
+          });
           for (const msg of event.messages) {
             if (!msg || typeof msg !== "object") {
               continue;
@@ -4081,6 +4100,10 @@ const memoryLanceDBProPlugin = {
               role === "user" || (captureAssistantEligible && role === "assistant");
             const isContextOnlyRole = assistantContextOnly && role === "assistant";
             if (!isEligibleRole && !isContextOnlyRole) {
+              continue;
+            }
+            if (role === "assistant" && messageToolRun) {
+              skippedAutoCaptureTexts++;
               continue;
             }
             // Context-only assistant turns join the transcript window but never
