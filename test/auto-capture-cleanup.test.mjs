@@ -8,6 +8,7 @@ const {
   normalizeAutoCaptureText,
   stripAutoCaptureInjectedPrefix,
   stripGroupChannelScaffold,
+  anchorTextToRawIngress,
   formatConversationTranscript,
   buildConversationTurnsForExtraction,
   trimTurnsToUserCap,
@@ -56,6 +57,36 @@ describe("auto-capture cleanup", () => {
       stripAutoCaptureInjectedPrefix("user", input),
       "Actual user content starts here.",
     );
+  });
+});
+
+describe("anchorTextToRawIngress (channel-agnostic injection slicing)", () => {
+  const RAW = "the actual inbound message with enough length to anchor";
+
+  it("slices an unknown channel's injection above a newline-bounded raw match", () => {
+    const composed = `Some alien channel preamble we have never seen\nwith structured noise lines\n${RAW}`;
+    assert.equal(anchorTextToRawIngress(composed, [RAW]), RAW);
+  });
+
+  it("returns exact-match raws unchanged (webchat no-op)", () => {
+    assert.equal(anchorTextToRawIngress(RAW, [RAW]), RAW);
+  });
+
+  it("never slices on a mid-line suffix (raw must start at a line boundary)", () => {
+    const composed = `real first line of the message ${RAW}`;
+    assert.equal(anchorTextToRawIngress(composed, [RAW]), composed);
+  });
+
+  it("skips trivially short raws so multi-line real messages cannot be truncated", () => {
+    const composed = "a real two-line message\nok then";
+    assert.equal(anchorTextToRawIngress(composed, ["ok then"]), composed);
+  });
+
+  it("prefers the longest matching raw and leaves no-match texts untouched", () => {
+    const long = `extra leading detail kept\n${RAW}`;
+    const composed = `injected header line\n${long}`;
+    assert.equal(anchorTextToRawIngress(composed, [RAW, long]), long);
+    assert.equal(anchorTextToRawIngress("unrelated composed text entirely", [RAW]), "unrelated composed text entirely");
   });
 });
 

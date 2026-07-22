@@ -43,7 +43,8 @@ import { gateRegexFallbackCapture } from "./src/autocapture-fallback-admission.j
 import { createMemoryCLI } from "./cli.js";
 import { clampBatchChunkSize } from "./src/memory-categories.js";
 import { isNoise } from "./src/noise-filter.js";
-import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, trimTurnsToUserCap, dedupePairWindow, formatConversationTranscript, trimTranscriptToTagBoundary, MESSAGE_TOOL_DELIVERY_BANNER_PREFIX, isDirectConversationSessionKey, } from "./src/auto-capture-cleanup.js";
+import { normalizeAutoCaptureText, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, trimTurnsToUserCap, dedupePairWindow, formatConversationTranscript, trimTranscriptToTagBoundary, MESSAGE_TOOL_DELIVERY_BANNER_PREFIX, isDirectConversationSessionKey, anchorTextToRawIngress, } from "./src/auto-capture-cleanup.js";
+const RAW_INGRESS_GLOBAL_KEY = ":global:";
 import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter } from "./src/smart-extractor.js";
@@ -2034,6 +2035,11 @@ function _initPluginState(api) {
     const turnCounter = new Map();
     const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
     const autoCapturePendingIngressTexts = new Map();
+    // Raw inbound texts as the channel delivered them, pre-composition: the
+    // anchor pool for channel-agnostic injection slicing. Never consumed;
+    // small per-conversation rings plus a global ring under a reserved key
+    // (main-collapsed DM sessions cannot reconstruct the ingress key).
+    const autoCaptureRecentRawIngress = new Map();
     const autoCaptureRecentTexts = new Map();
     const autoCaptureRecentPairTurns = new Map();
     const autoCapturePayloadShapeLoggedSessions = new Set();
@@ -2069,6 +2075,7 @@ function _initPluginState(api) {
         turnCounter,
         autoCaptureSeenTextCount,
         autoCapturePendingIngressTexts,
+        autoCaptureRecentRawIngress,
         autoCaptureRecentTexts,
         autoCaptureRecentPairTurns,
         autoCapturePayloadShapeLoggedSessions,
@@ -2185,7 +2192,7 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, admissionController, admissionControllerReflectionLane, reflectionLaneLlm, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentTexts, autoCaptureRecentPairTurns, autoCapturePayloadShapeLoggedSessions, autoCaptureSessionIds, autoCaptureLastEligibleLength, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, admissionController, admissionControllerReflectionLane, reflectionLaneLlm, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureRecentRawIngress, autoCaptureRecentTexts, autoCaptureRecentPairTurns, autoCapturePayloadShapeLoggedSessions, autoCaptureSessionIds, autoCaptureLastEligibleLength, } = singleton;
         // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
         // must also go through here so the on-disk watermark never drifts from the
         // in-memory Map -- a process restart rehydrates from exactly what was last
@@ -2502,6 +2509,13 @@ const memoryLanceDBProPlugin = {
                         queue.push(normalized);
                         autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
                         pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        const rawRing = autoCaptureRecentRawIngress.get(conversationKey) || [];
+                        rawRing.push(normalized);
+                        autoCaptureRecentRawIngress.set(conversationKey, rawRing.slice(-8));
+                        const globalRing = autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || [];
+                        globalRing.push(normalized);
+                        autoCaptureRecentRawIngress.set(RAW_INGRESS_GLOBAL_KEY, globalRing.slice(-24));
+                        pruneMapIfOver(autoCaptureRecentRawIngress, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                     }
                 }
             }
@@ -3102,6 +3116,13 @@ const memoryLanceDBProPlugin = {
                         // assistant text — the real reply left via the message tool, so
                         // assistant texts in this payload are internal monologue, not
                         // conversation. Detected via the host's Delivery banner.
+                        const rawAnchorConversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
+                        const rawAnchorPool = [
+                            ...(rawAnchorConversationKey
+                                ? autoCaptureRecentRawIngress.get(rawAnchorConversationKey) || []
+                                : []),
+                            ...(autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || []),
+                        ];
                         const messageToolRun = event.messages.some((msg) => {
                             if (!msg || typeof msg !== "object")
                                 return false;
@@ -3141,8 +3162,11 @@ const memoryLanceDBProPlugin = {
                                     skippedAutoCaptureTexts++;
                                 }
                                 else {
-                                    targetTexts?.push(normalized);
-                                    conversationTurns.push({ role: role, text: normalized });
+                                    const anchored = role === "user" && rawAnchorPool.length > 0
+                                        ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                                        : normalized;
+                                    targetTexts?.push(anchored);
+                                    conversationTurns.push({ role: role, text: anchored });
                                 }
                                 continue;
                             }
@@ -3160,8 +3184,11 @@ const memoryLanceDBProPlugin = {
                                             skippedAutoCaptureTexts++;
                                         }
                                         else {
-                                            targetTexts?.push(normalized);
-                                            conversationTurns.push({ role: role, text: normalized });
+                                            const anchored = role === "user" && rawAnchorPool.length > 0
+                                                ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                                                : normalized;
+                                            targetTexts?.push(anchored);
+                                            conversationTurns.push({ role: role, text: anchored });
                                         }
                                     }
                                 }

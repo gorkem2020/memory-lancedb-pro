@@ -84,7 +84,10 @@ import {
   trimTranscriptToTagBoundary,
   MESSAGE_TOOL_DELIVERY_BANNER_PREFIX,
   isDirectConversationSessionKey,
+  anchorTextToRawIngress,
 } from "./src/auto-capture-cleanup.js";
+
+const RAW_INGRESS_GLOBAL_KEY = ":global:";
 import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 
 // Import smart extraction & lifecycle components
@@ -2452,6 +2455,7 @@ interface PluginSingletonState {
   turnCounter: Map<string, number>;
   autoCaptureSeenTextCount: Map<string, number>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
+  autoCaptureRecentRawIngress: Map<string, string[]>;
   autoCaptureRecentTexts: Map<string, string[]>;
   autoCaptureRecentPairTurns: Map<string, ConversationTurn[]>;
   autoCapturePayloadShapeLoggedSessions: Set<string>;
@@ -2762,6 +2766,12 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const turnCounter = new Map<string, number>();
   const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
+  // Raw inbound texts as the channel delivered them, pre-composition: the
+  // anchor pool for channel-agnostic injection slicing. Never consumed;
+  // small per-conversation rings plus a global ring under a reserved key
+  // (main-collapsed DM sessions cannot reconstruct the ingress key).
+  const autoCaptureRecentRawIngress = new Map<string, string[]>();
+
   const autoCaptureRecentTexts = new Map<string, string[]>();
   const autoCaptureRecentPairTurns = new Map<string, ConversationTurn[]>();
   const autoCapturePayloadShapeLoggedSessions = new Set<string>();
@@ -2798,6 +2808,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     turnCounter,
     autoCaptureSeenTextCount,
     autoCapturePendingIngressTexts,
+    autoCaptureRecentRawIngress,
     autoCaptureRecentTexts,
     autoCaptureRecentPairTurns,
     autoCapturePayloadShapeLoggedSessions,
@@ -2966,6 +2977,7 @@ const memoryLanceDBProPlugin = {
       turnCounter,
       autoCaptureSeenTextCount,
       autoCapturePendingIngressTexts,
+      autoCaptureRecentRawIngress,
       autoCaptureRecentTexts,
       autoCaptureRecentPairTurns,
       autoCapturePayloadShapeLoggedSessions,
@@ -3365,6 +3377,13 @@ const memoryLanceDBProPlugin = {
             queue.push(normalized);
             autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
             pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            const rawRing = autoCaptureRecentRawIngress.get(conversationKey) || [];
+            rawRing.push(normalized);
+            autoCaptureRecentRawIngress.set(conversationKey, rawRing.slice(-8));
+            const globalRing = autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || [];
+            globalRing.push(normalized);
+            autoCaptureRecentRawIngress.set(RAW_INGRESS_GLOBAL_KEY, globalRing.slice(-24));
+            pruneMapIfOver(autoCaptureRecentRawIngress, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
         }
       } catch (err) {
@@ -4081,6 +4100,13 @@ const memoryLanceDBProPlugin = {
           // assistant text — the real reply left via the message tool, so
           // assistant texts in this payload are internal monologue, not
           // conversation. Detected via the host's Delivery banner.
+          const rawAnchorConversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
+          const rawAnchorPool = [
+            ...(rawAnchorConversationKey
+              ? autoCaptureRecentRawIngress.get(rawAnchorConversationKey) || []
+              : []),
+            ...(autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || []),
+          ];
           const messageToolRun = event.messages.some((msg) => {
             if (!msg || typeof msg !== "object") return false;
             const content = (msg as Record<string, unknown>).content;
@@ -4124,8 +4150,12 @@ const memoryLanceDBProPlugin = {
               if (!normalized) {
                 skippedAutoCaptureTexts++;
               } else {
-                targetTexts?.push(normalized);
-                conversationTurns.push({ role: role as "user" | "assistant", text: normalized });
+                const anchored =
+                  role === "user" && rawAnchorPool.length > 0
+                    ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                    : normalized;
+                targetTexts?.push(anchored);
+                conversationTurns.push({ role: role as "user" | "assistant", text: anchored });
               }
               continue;
             }
@@ -4145,8 +4175,12 @@ const memoryLanceDBProPlugin = {
                   if (!normalized) {
                     skippedAutoCaptureTexts++;
                   } else {
-                    targetTexts?.push(normalized);
-                    conversationTurns.push({ role: role as "user" | "assistant", text: normalized });
+                    const anchored =
+                      role === "user" && rawAnchorPool.length > 0
+                        ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                        : normalized;
+                    targetTexts?.push(anchored);
+                    conversationTurns.push({ role: role as "user" | "assistant", text: anchored });
                   }
                 }
               }

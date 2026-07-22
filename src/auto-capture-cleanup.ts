@@ -181,6 +181,32 @@ export function stripGroupChannelScaffold(text: string): string {
   return kept.join("\n").trim();
 }
 
+/**
+ * Channel-agnostic injection slicing: the ingress hook delivers each inbound
+ * message RAW, before the host composes the prompt and layers channel
+ * injections above it, and the raw message always sits at the absolute
+ * bottom of the composed text. Anchoring on a recently seen raw text slices
+ * every injection shape — including channels whose grammar we have never
+ * seen — without parsing any of them. The newline boundary requirement stops
+ * mid-line false matches (a raw that merely ends the same as real content),
+ * the minimum length keeps trivial raws ("ok") from slicing multi-line
+ * messages, and no match leaves the text untouched (the deterministic
+ * header strips remain the fallback).
+ */
+export const RAW_INGRESS_ANCHOR_MIN_LENGTH = 12;
+
+export function anchorTextToRawIngress(text: string, recentRaws: readonly string[]): string {
+  let best: string | null = null;
+  for (const raw of recentRaws) {
+    if (!raw || raw.length < RAW_INGRESS_ANCHOR_MIN_LENGTH) continue;
+    if (text === raw) return text;
+    if (text.endsWith("\n" + raw) && (best === null || raw.length > best.length)) {
+      best = raw;
+    }
+  }
+  return best ?? text;
+}
+
 export function normalizeAutoCaptureText(
   role: unknown,
   text: string,
