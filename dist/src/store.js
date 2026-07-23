@@ -1026,6 +1026,11 @@ export class MemoryStore {
         if (!hasValidEntryScope(entry.scope)) {
             throw new Error(`upsert() requires a non-empty scope: refusing to delete row ${entry.id} for a scope-less replacement`);
         }
+        // Canonicalize scope whitespace before the destructive replace (same
+        // write-boundary contract as bulkStore): a validated-but-padded scope
+        // would delete the canonical row and persist a replacement invisible to
+        // its own scope filter.
+        const canonicalScope = entry.scope.trim();
         await this.ensureInitialized();
         const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
             const safeId = escapeSqlLiteral(entry.id);
@@ -1035,6 +1040,7 @@ export class MemoryStore {
             // is idempotent and preserves legitimate v2+ 0~1 values.
             const normalizedEntry = {
                 ...entry,
+                scope: canonicalScope,
                 metadata: entry.metadata || "{}",
                 importance: clampImportance(entry.importance),
             };
@@ -1406,7 +1412,7 @@ export class MemoryStore {
         }
         const full = {
             ...entry,
-            scope: entry.scope || "global",
+            scope: hasValidEntryScope(entry.scope) ? entry.scope.trim() : "global",
             importance: options.legacy
                 ? normalizeLegacyImportance(entry.importance)
                 : clampImportance(entry.importance),
@@ -2165,6 +2171,24 @@ export class MemoryStore {
      * every scoped reader. These two methods are the migration path: find them,
      * then reassign them to an explicit scope.
      */
+    materializeLegacyScopeRow(row) {
+        const rawVector = row.vector;
+        const vector = Array.isArray(rawVector)
+            ? rawVector
+            : rawVector && typeof rawVector.toArray === "function"
+                ? Array.from(rawVector.toArray())
+                : Array.from(rawVector ?? []);
+        return {
+            id: String(row.id),
+            text: String(row.text ?? ""),
+            vector,
+            category: String(row.category ?? "fact"),
+            scope: row.scope ?? null,
+            importance: clampImportance(Number(row.importance)),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: row.metadata || "{}",
+        };
+    }
     async findLegacyScopeRows(limit = 1000) {
         await this.ensureInitialized();
         const rows = await this.table
@@ -2172,24 +2196,7 @@ export class MemoryStore {
             .where("scope IS NULL OR scope = ''")
             .limit(limit)
             .toArray();
-        return rows.map((row) => {
-            const rawVector = row.vector;
-            const vector = Array.isArray(rawVector)
-                ? rawVector
-                : rawVector && typeof rawVector.toArray === "function"
-                    ? Array.from(rawVector.toArray())
-                    : Array.from(rawVector ?? []);
-            return {
-                id: String(row.id),
-                text: String(row.text ?? ""),
-                vector,
-                category: String(row.category ?? "fact"),
-                scope: row.scope ?? null,
-                importance: clampImportance(Number(row.importance)),
-                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-                metadata: row.metadata || "{}",
-            };
-        });
+        return rows.map((row) => this.materializeLegacyScopeRow(row));
     }
     async repairLegacyScopes(targetScope) {
         if (!hasValidEntryScope(targetScope)) {
@@ -2198,11 +2205,26 @@ export class MemoryStore {
         const legacyRows = await this.findLegacyScopeRows(100000);
         let repaired = 0;
         let failed = 0;
+        let skipped = 0;
         const unrecovered = [];
-        for (const row of legacyRows) {
+        for (const candidate of legacyRows) {
             try {
-                await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
-                    const safeId = escapeSqlLiteral(row.id);
+                const outcome = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+                    // The discovery snapshot can go stale before this row's turn under
+                    // the lock: re-read and repair only a row whose stored scope is
+                    // still legacy, from its current content. A concurrent write must
+                    // be neither overwritten with the snapshot nor reassigned to the
+                    // target scope, and a concurrently deleted row must not be
+                    // resurrected.
+                    const safeId = escapeSqlLiteral(candidate.id);
+                    const currentRows = await this.table.query().where(`id = '${safeId}'`).limit(1).toArray();
+                    if (currentRows.length === 0)
+                        return "skipped";
+                    const currentRaw = currentRows[0];
+                    const currentScope = currentRaw.scope;
+                    if (currentScope != null && currentScope !== "")
+                        return "skipped";
+                    const row = this.materializeLegacyScopeRow(currentRaw);
                     const replacement = { ...row, scope: targetScope.trim() };
                     await this.table.delete(`id = '${safeId}'`);
                     try {
@@ -2220,8 +2242,12 @@ export class MemoryStore {
                         }
                         throw addError;
                     }
+                    return "repaired";
                 }));
-                repaired += 1;
+                if (outcome === "repaired")
+                    repaired += 1;
+                else
+                    skipped += 1;
             }
             catch {
                 failed += 1;
@@ -2229,7 +2255,7 @@ export class MemoryStore {
         }
         if (repaired > 0)
             this.noteDataModification();
-        return { repaired, failed, unrecovered };
+        return { repaired, failed, skipped, unrecovered };
     }
     async bulkDelete(scopeFilter, beforeTimestamp) {
         await this.ensureInitialized();

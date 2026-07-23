@@ -2238,8 +2238,8 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           }
           return;
         }
-        const { repaired, failed, unrecovered } = await context.store.repairLegacyScopes(options.targetScope);
-        console.log(`\nRepair complete: ${repaired} reassigned to "${options.targetScope}", ${failed} failed.`);
+        const { repaired, failed, skipped, unrecovered } = await context.store.repairLegacyScopes(options.targetScope);
+        console.log(`\nRepair complete: ${repaired} reassigned to "${options.targetScope}", ${skipped} skipped (changed or removed since discovery), ${failed} failed.`);
         if (unrecovered.length > 0) {
           console.error(
             `\n${unrecovered.length} row(s) could not be restored after a failed replacement write. ` +

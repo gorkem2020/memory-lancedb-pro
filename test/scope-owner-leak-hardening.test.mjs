@@ -517,7 +517,7 @@ describe("(f) legacy NULL/blank-scope migration path", () => {
       assert.equal(globalBefore.length, 0, "legacy rows must be invisible to scoped readers before repair");
 
       const outcome = await store.repairLegacyScopes("global");
-      assert.deepEqual(outcome, { repaired: 2, failed: 0, unrecovered: [] });
+      assert.deepEqual(outcome, { repaired: 2, failed: 0, skipped: 0, unrecovered: [] });
 
       const globalAfter = await store.list(["global"], undefined, 10, 0);
       assert.equal(globalAfter.length, 2, "repaired rows must be visible under the target scope");
@@ -791,6 +791,122 @@ describe("(f) bulkStore write-boundary reporting and canonicalization", () => {
         rows.some((row) => row.text === "padded scope entry"),
         "a whitespace-padded scope must canonicalize to the trimmed scope",
       );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(g) upsert and importEntry persist the canonical trimmed scope", () => {
+  it("upsert() trims a padded scope so the replacement stays visible to the canonical filter", async () => {
+    const { store, dir } = makeStore();
+    try {
+      const stored = await store.store({ text: "canonical row", vector: [1, 0, 0], category: "fact", scope: "agent-a", importance: 0.5, metadata: "{}" });
+
+      await store.upsert({ ...stored, text: "replacement row", scope: "  agent-a  " });
+
+      const row = await store.getById(stored.id, ["agent-a"]);
+      assert.ok(row, "the replacement must remain visible under the canonical scope filter");
+      assert.equal(row.scope, "agent-a", "the persisted scope must be the trimmed canonical form");
+      assert.equal(row.text, "replacement row");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("importEntry() trims a padded scope and maps blank or whitespace-only scopes to global", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await store.importEntry({ id: "import-padded", text: "padded import", vector: [1, 0, 0], category: "fact", scope: "  agent-b ", importance: 0.5, timestamp: Date.now(), metadata: "{}" });
+      await store.importEntry({ id: "import-blank", text: "whitespace-only import", vector: [0, 1, 0], category: "fact", scope: "   ", importance: 0.5, timestamp: Date.now(), metadata: "{}" });
+
+      const padded = await store.getById("import-padded", ["agent-b"]);
+      assert.ok(padded, "a padded import scope must canonicalize to the trimmed scope");
+      assert.equal(padded.scope, "agent-b");
+
+      const blank = await store.getById("import-blank", ["global"]);
+      assert.ok(blank, "a whitespace-only import scope must fall back to global, not persist as an invisible row");
+      assert.equal(blank.scope, "global");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(h) repairLegacyScopes re-validates each row under the write lock", () => {
+  it("skips a row that gained a real scope after discovery, preserving the concurrent write", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "race-reassigned", text: "stale snapshot text", vector: [1, 0, 0], category: "fact", scope: null });
+      await seedLegacyRow(store, { id: "still-legacy", text: "still legacy row", vector: [0, 1, 0], category: "fact", scope: "" });
+
+      const realFind = store.findLegacyScopeRows.bind(store);
+      store.findLegacyScopeRows = async (limit) => {
+        const snapshot = await realFind(limit);
+        await store.table.delete("id = 'race-reassigned'");
+        await store.table.add([{ id: "race-reassigned", text: "updated by concurrent writer", vector: [1, 0, 0], category: "fact", scope: "agent-live", importance: 0.5, timestamp: Date.now(), metadata: "{}" }]);
+        return snapshot;
+      };
+
+      const outcome = await store.repairLegacyScopes("global");
+      assert.equal(outcome.repaired, 1, "only the still-legacy row may be repaired");
+      assert.equal(outcome.skipped, 1, "the concurrently reassigned row must be skipped, not overwritten");
+      assert.equal(outcome.failed, 0);
+
+      const live = await store.getById("race-reassigned", ["agent-live"]);
+      assert.ok(live, "the concurrent write must survive the repair pass");
+      assert.equal(live.text, "updated by concurrent writer");
+      assert.equal(live.scope, "agent-live");
+
+      const repairedRow = await store.getById("still-legacy", ["global"]);
+      assert.ok(repairedRow, "the genuinely legacy row must still be repaired");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs from the row's current content, not the discovery snapshot", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "race-content", text: "content at discovery time", vector: [1, 0, 0], category: "fact", scope: null });
+
+      const realFind = store.findLegacyScopeRows.bind(store);
+      store.findLegacyScopeRows = async (limit) => {
+        const snapshot = await realFind(limit);
+        await store.table.delete("id = 'race-content'");
+        await store.table.add([{ id: "race-content", text: "revised while queued", vector: [1, 0, 0], category: "fact", scope: null, importance: 0.5, timestamp: Date.now(), metadata: "{}" }]);
+        return snapshot;
+      };
+
+      const outcome = await store.repairLegacyScopes("global");
+      assert.equal(outcome.repaired, 1);
+
+      const row = await store.getById("race-content", ["global"]);
+      assert.ok(row, "the still-legacy row must be repaired");
+      assert.equal(row.text, "revised while queued", "the repair must persist the re-read content, not the stale snapshot");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips a row deleted after discovery instead of resurrecting it from the snapshot", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "race-deleted", text: "deleted before the lock", vector: [1, 0, 0], category: "fact", scope: null });
+
+      const realFind = store.findLegacyScopeRows.bind(store);
+      store.findLegacyScopeRows = async (limit) => {
+        const snapshot = await realFind(limit);
+        await store.table.delete("id = 'race-deleted'");
+        return snapshot;
+      };
+
+      const outcome = await store.repairLegacyScopes("global");
+      assert.equal(outcome.repaired, 0);
+      assert.equal(outcome.skipped, 1, "a row deleted between discovery and the lock must be skipped");
+
+      const row = await store.getById("race-deleted");
+      assert.equal(row, null, "the deleted row must not be resurrected from the snapshot");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

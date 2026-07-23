@@ -1263,6 +1263,11 @@ export class MemoryStore {
         `upsert() requires a non-empty scope: refusing to delete row ${entry.id} for a scope-less replacement`,
       );
     }
+    // Canonicalize scope whitespace before the destructive replace (same
+    // write-boundary contract as bulkStore): a validated-but-padded scope
+    // would delete the canonical row and persist a replacement invisible to
+    // its own scope filter.
+    const canonicalScope = entry.scope.trim();
     await this.ensureInitialized();
 
     const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
@@ -1273,6 +1278,7 @@ export class MemoryStore {
       // is idempotent and preserves legitimate v2+ 0~1 values.
       const normalizedEntry: MemoryEntry = {
         ...entry,
+        scope: canonicalScope,
         metadata: entry.metadata || "{}",
         importance: clampImportance(entry.importance),
       };
@@ -1680,7 +1686,7 @@ export class MemoryStore {
 
     const full: MemoryEntry = {
       ...entry,
-      scope: entry.scope || "global",
+      scope: hasValidEntryScope(entry.scope) ? entry.scope.trim() : "global",
       importance: options.legacy
         ? normalizeLegacyImportance(entry.importance)
         : clampImportance(entry.importance),
@@ -2617,6 +2623,25 @@ export class MemoryStore {
    * every scoped reader. These two methods are the migration path: find them,
    * then reassign them to an explicit scope.
    */
+  private materializeLegacyScopeRow(row: Record<string, unknown>): MemoryEntry {
+    const rawVector = row.vector as { toArray?: () => ArrayLike<number> } | ArrayLike<number> | null;
+    const vector = Array.isArray(rawVector)
+      ? rawVector
+      : rawVector && typeof (rawVector as { toArray?: unknown }).toArray === "function"
+        ? Array.from((rawVector as { toArray: () => ArrayLike<number> }).toArray())
+        : Array.from((rawVector as ArrayLike<number>) ?? []);
+    return {
+      id: String(row.id),
+      text: String(row.text ?? ""),
+      vector,
+      category: String(row.category ?? "fact"),
+      scope: (row.scope as string | null | undefined) ?? null,
+      importance: clampImportance(Number(row.importance)),
+      timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+      metadata: (row.metadata as string) || "{}",
+    } as MemoryEntry;
+  }
+
   async findLegacyScopeRows(limit = 1000): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
     const rows = await this.table!
@@ -2624,38 +2649,34 @@ export class MemoryStore {
       .where("scope IS NULL OR scope = ''")
       .limit(limit)
       .toArray();
-    return rows.map((row: Record<string, unknown>) => {
-      const rawVector = row.vector as { toArray?: () => ArrayLike<number> } | ArrayLike<number> | null;
-      const vector = Array.isArray(rawVector)
-        ? rawVector
-        : rawVector && typeof (rawVector as { toArray?: unknown }).toArray === "function"
-          ? Array.from((rawVector as { toArray: () => ArrayLike<number> }).toArray())
-          : Array.from((rawVector as ArrayLike<number>) ?? []);
-      return {
-        id: String(row.id),
-        text: String(row.text ?? ""),
-        vector,
-        category: String(row.category ?? "fact"),
-        scope: (row.scope as string | null | undefined) ?? null,
-        importance: clampImportance(Number(row.importance)),
-        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-        metadata: (row.metadata as string) || "{}",
-      } as MemoryEntry;
-    });
+    return rows.map((row: Record<string, unknown>) => this.materializeLegacyScopeRow(row));
   }
 
-  async repairLegacyScopes(targetScope: string): Promise<{ repaired: number; failed: number; unrecovered: MemoryEntry[] }> {
+  async repairLegacyScopes(targetScope: string): Promise<{ repaired: number; failed: number; skipped: number; unrecovered: MemoryEntry[] }> {
     if (!hasValidEntryScope(targetScope)) {
       throw new Error("repairLegacyScopes requires a non-empty target scope");
     }
     const legacyRows = await this.findLegacyScopeRows(100000);
     let repaired = 0;
     let failed = 0;
+    let skipped = 0;
     const unrecovered: MemoryEntry[] = [];
-    for (const row of legacyRows) {
+    for (const candidate of legacyRows) {
       try {
-        await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
-          const safeId = escapeSqlLiteral(row.id);
+        const outcome = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+          // The discovery snapshot can go stale before this row's turn under
+          // the lock: re-read and repair only a row whose stored scope is
+          // still legacy, from its current content. A concurrent write must
+          // be neither overwritten with the snapshot nor reassigned to the
+          // target scope, and a concurrently deleted row must not be
+          // resurrected.
+          const safeId = escapeSqlLiteral(candidate.id);
+          const currentRows = await this.table!.query().where(`id = '${safeId}'`).limit(1).toArray();
+          if (currentRows.length === 0) return "skipped" as const;
+          const currentRaw = currentRows[0] as Record<string, unknown>;
+          const currentScope = currentRaw.scope as string | null | undefined;
+          if (currentScope != null && currentScope !== "") return "skipped" as const;
+          const row = this.materializeLegacyScopeRow(currentRaw);
           const replacement: MemoryEntry = { ...row, scope: targetScope.trim() };
           await this.table!.delete(`id = '${safeId}'`);
           try {
@@ -2671,14 +2692,16 @@ export class MemoryStore {
             }
             throw addError;
           }
+          return "repaired" as const;
         }));
-        repaired += 1;
+        if (outcome === "repaired") repaired += 1;
+        else skipped += 1;
       } catch {
         failed += 1;
       }
     }
     if (repaired > 0) this.noteDataModification();
-    return { repaired, failed, unrecovered };
+    return { repaired, failed, skipped, unrecovered };
   }
 
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {
