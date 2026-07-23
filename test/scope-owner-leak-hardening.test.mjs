@@ -16,14 +16,22 @@ function makeStore() {
   return { store, dir };
 }
 
+/**
+ * Seed a legacy pre-scoping row below the public API: the write contract now
+ * rejects scope-less rows, so genuine legacy fixtures go straight to the table.
+ */
+async function seedLegacyRow(store, row) {
+  await store.ensureInitialized();
+  await store.table.add([{ metadata: "{}", importance: 0.5, timestamp: Date.now(), ...row }]);
+}
+
 describe("(a) MemoryStore.list() no longer passes NULL-scope rows through a scope filter", () => {
   it("excludes a NULL-scope legacy row when a real scope filter is given", async () => {
     const { store, dir } = makeStore();
     try {
-      // upsert() writes the row as-is (unlike store()/bulkStore(), it does not
-      // normalize a missing scope to "global"), so it can simulate a genuine
-      // pre-scoping legacy row with no scope at all.
-      await store.upsert({
+      // Seeded below the public API: the write contract rejects scope-less
+      // rows, so legacy pre-scoping fixtures are inserted at the table layer.
+      await seedLegacyRow(store, {
         id: "legacy-null-scope",
         timestamp: Date.now(),
         text: "legacy row with no scope",
@@ -81,7 +89,7 @@ describe("(a2) sibling read paths no longer pass NULL-scope rows through a scope
     // Same simulation technique as (a): upsert() writes the row as-is, so a
     // NULL scope genuinely reaches the table (store()/bulkStore() would
     // normalize a missing scope to "global" before it ever gets there).
-    await store.upsert({
+    await seedLegacyRow(store, {
       id: "legacy-null-scope",
       timestamp: Date.now(),
       text: "legacy row with no scope talking about rockets",
@@ -174,7 +182,7 @@ describe("(a2) sibling read paths no longer pass NULL-scope rows through a scope
 
 describe("(a3) ID-based read/write paths no longer treat a NULL scope as literally \"global\"", () => {
   async function seedNullScopeRow(store) {
-    await store.upsert({
+    await seedLegacyRow(store, {
       id: "id-path-null-scope",
       timestamp: Date.now(),
       text: "legacy row with no scope, reached by id",
@@ -263,7 +271,7 @@ describe("(a3) ID-based read/write paths no longer treat a NULL scope as literal
       // even reaching the scope check, unlike deleteExactId's exact-string match — use a
       // UUID-shaped id so the assertion below actually exercises the scope-leak path.
       const uuidId = "11111111-2222-4333-8444-555555555555";
-      await store.upsert({
+      await seedLegacyRow(store, {
         id: uuidId,
         timestamp: Date.now(),
         text: "legacy row with no scope, reached by id",
@@ -404,6 +412,118 @@ describe("(c) reflection ownership is never minted as main when the sessionKey f
         !globalScopedRead.some((r) => r.id === stored[0]?.id),
         "an unattributed reflection must not be readable via a plain global scope filter either",
       );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(e) write-path scope contract", () => {
+  it("store() rejects missing and blank scopes before writing", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await assert.rejects(
+        () => store.store({ text: "no scope", vector: [1, 0, 0], category: "fact", importance: 0.5, metadata: "{}" }),
+        /non-empty scope/,
+      );
+      await assert.rejects(
+        () => store.store({ text: "blank scope", vector: [1, 0, 0], category: "fact", scope: "   ", importance: 0.5, metadata: "{}" }),
+        /non-empty scope/,
+      );
+      const rows = await store.list(undefined, undefined, 10, 0);
+      assert.equal(rows.length, 0, "rejected writes must not persist anything");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("bulkStore() drops scope-less entries and still stores valid siblings", async () => {
+    const { store, dir } = makeStore();
+    try {
+      const stored = await store.bulkStore([
+        { text: "valid sibling", vector: [1, 0, 0], category: "fact", scope: "agent-a", importance: 0.5, metadata: "{}" },
+        { text: "scope-less entry", vector: [0, 1, 0], category: "fact", importance: 0.5, metadata: "{}" },
+        { text: "blank-scope entry", vector: [0, 0, 1], category: "fact", scope: "", importance: 0.5, metadata: "{}" },
+      ]);
+      assert.equal(stored.length, 1, "only the valid sibling may be accepted");
+      const rows = await store.list(["agent-a"], undefined, 10, 0);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].text, "valid sibling");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("upsert() rejects a scope-less replacement BEFORE deleting the existing row", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await store.upsert({
+        id: "guarded-row",
+        timestamp: Date.now(),
+        text: "original visible row",
+        vector: [1, 0, 0],
+        category: "fact",
+        scope: "agent-a",
+        importance: 0.5,
+        metadata: "{}",
+      });
+      await assert.rejects(
+        () => store.upsert({
+          id: "guarded-row",
+          timestamp: Date.now(),
+          text: "orphaned replacement",
+          vector: [0, 1, 0],
+          category: "fact",
+          scope: null,
+          importance: 0.5,
+          metadata: "{}",
+        }),
+        /non-empty scope/,
+      );
+      const rows = await store.list(["agent-a"], undefined, 10, 0);
+      assert.equal(rows.length, 1, "the existing row must survive the rejected upsert");
+      assert.equal(rows[0].text, "original visible row", "the original row must not be replaced by orphaned data");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fetchForCompaction treats an explicitly empty scope filter as deny-all", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await store.store({ text: "compactable", vector: [1, 0, 0], category: "fact", scope: "agent-a", importance: 0.5, metadata: "{}" });
+      const denied = await store.fetchForCompaction(Date.now() + 10000, []);
+      assert.equal(denied.length, 0, "an empty scope filter must return nothing");
+      const scoped = await store.fetchForCompaction(Date.now() + 10000, ["agent-a"]);
+      assert.equal(scoped.length, 1, "a real scope filter must still see its own rows");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(f) legacy NULL/blank-scope migration path", () => {
+  it("findLegacyScopeRows surfaces invisible rows and repairLegacyScopes restores visibility", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "legacy-1", text: "legacy null-scope row", vector: [1, 0, 0], category: "fact", scope: null });
+      await seedLegacyRow(store, { id: "legacy-2", text: "legacy blank-scope row", vector: [0, 1, 0], category: "fact", scope: "" });
+      await store.store({ text: "modern scoped row", vector: [0, 0, 1], category: "fact", scope: "agent-a", importance: 0.5, metadata: "{}" });
+
+      const legacy = await store.findLegacyScopeRows();
+      assert.equal(legacy.length, 2, "both legacy rows must be discoverable");
+
+      const globalBefore = await store.list(["global"], undefined, 10, 0);
+      assert.equal(globalBefore.length, 0, "legacy rows must be invisible to scoped readers before repair");
+
+      const outcome = await store.repairLegacyScopes("global");
+      assert.deepEqual(outcome, { repaired: 2, failed: 0 });
+
+      const globalAfter = await store.list(["global"], undefined, 10, 0);
+      assert.equal(globalAfter.length, 2, "repaired rows must be visible under the target scope");
+      assert.equal((await store.findLegacyScopeRows()).length, 0, "no legacy rows may remain after repair");
+
+      await assert.rejects(() => store.repairLegacyScopes("  "), /non-empty target scope/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
