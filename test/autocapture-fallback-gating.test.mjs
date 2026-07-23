@@ -834,6 +834,84 @@ describe("terminal flush of deferred captures at session_end", () => {
       releaseGate();
     }
   });
+
+  it("flushes when session_end carries only the lifecycle sessionId (real payload shape)", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: flushConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const ingressCtx = {
+      sessionKey: "agent:agent-two:synthchat:convReal",
+      sessionId: "session-id-real-1",
+      agentId: "agent-two",
+    };
+
+    await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT, SECOND_TEXT), ingressCtx);
+    assert.equal(extractionPrompts.length, 0, "two texts stay below minMessages=4");
+
+    await fireSessionEnd(harness, hook, { sessionId: "session-id-real-1", agentId: "agent-two" });
+    assert.equal(
+      extractionPrompts.length,
+      1,
+      "a session_end payload carrying only sessionId must still dispatch the terminal flush",
+    );
+    assert.ok(extractionPrompts[0].includes(PREFERENCE_TEXT));
+  });
+
+  it("flushes on a host that keys both hooks by sessionId alone", async () => {
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: flushConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const ctx = { sessionId: "session-id-only-1", agentId: "agent-two" };
+
+    await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT, SECOND_TEXT), ctx);
+    assert.equal(extractionPrompts.length, 0, "two texts stay below minMessages=4");
+
+    await fireSessionEnd(harness, hook, ctx);
+    assert.equal(
+      extractionPrompts.length,
+      1,
+      "sessionId-only ingress and session_end must resolve to the same capture bucket",
+    );
+    assert.ok(extractionPrompts[0].includes(PREFERENCE_TEXT));
+  });
+
+  it("restores deferred texts when the flush extraction fails, so a later flush can retry", async () => {
+    await new Promise((resolve) => llmServer.close(resolve));
+    llmServer = createLlmServer({
+      extractionPrompts,
+      // Call 1 returns a malformed extraction payload (memories: null), the
+      // shape a null/exhausted LLM completion produces; call 2 succeeds.
+      extractMemories: (n) => (n === 1 ? null : [{
+        category: "preferences",
+        abstract: "Synthetic retry marker",
+        overview: "## Preference\n- Retry marker",
+        content: "User stated the synthetic retry marker.",
+      }]),
+    });
+    await new Promise((resolve) => llmServer.listen(0, "127.0.0.1", resolve));
+
+    const harness = createPluginApiHarness({ resolveRoot: workspaceDir, pluginConfig: flushConfig() });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hook = getAutoCaptureHook(harness.eventHandlers);
+    const ctx = { sessionKey: "agent:agent-two:main", agentId: "agent-two" };
+
+    await fireAgentEnd(hook, userMessages(PREFERENCE_TEXT, SECOND_TEXT), ctx);
+    assert.equal(extractionPrompts.length, 0, "two texts stay below minMessages=4");
+
+    await fireSessionEnd(harness, hook, ctx);
+    assert.equal(extractionPrompts.length, 1, "the first flush must reach the extractor");
+
+    await fireSessionEnd(harness, hook, ctx);
+    assert.equal(
+      extractionPrompts.length,
+      2,
+      "a failed flush extraction must restore the deferred texts so the next flush retries them",
+    );
+    assert.ok(
+      extractionPrompts[1].includes(PREFERENCE_TEXT),
+      "the retried flush must carry the texts the failed attempt consumed",
+    );
+  });
 });
 
 describe("unique-ingress counting toward extractMinMessages", () => {
@@ -950,5 +1028,70 @@ describe("unique-ingress counting toward extractMinMessages", () => {
         `the six-entry retention cap must not evict deferred text: ${text.slice(0, 40)}`,
       );
     }
+  });
+});
+
+describe("admission gates fail closed when admission is required but unavailable", () => {
+  const { gateMappedReflectionEntries } = jiti("../src/reflection-mapped-admission.ts");
+
+  it("gateRegexFallbackCapture rejects when admission is required and no controller exists", async () => {
+    const result = await gateRegexFallbackCapture({
+      admissionController: null,
+      admissionRequired: true,
+      attachAudit: false,
+      text: "synthetic capture text",
+      storeCategory: "preference",
+      vector: [0.1, 0.2],
+      conversationText: "synthetic conversation",
+      scopeFilter: ["agent-a"],
+    });
+    assert.equal(result.admit, false, "an enabled-but-unavailable admission gate must fail closed");
+    assert.match(result.reason ?? "", /failing closed/);
+  });
+
+  it("gateRegexFallbackCapture keeps the disabled passthrough when admission is not required", async () => {
+    const result = await gateRegexFallbackCapture({
+      admissionController: null,
+      admissionRequired: false,
+      attachAudit: false,
+      text: "synthetic capture text",
+      storeCategory: "preference",
+      vector: [0.1, 0.2],
+      conversationText: "synthetic conversation",
+      scopeFilter: ["agent-a"],
+    });
+    assert.equal(result.admit, true, "admission disabled must remain a passthrough");
+  });
+
+  it("gateMappedReflectionEntries rejects the burst when admission is required and no controller exists", async () => {
+    const results = await gateMappedReflectionEntries({
+      admissionController: null,
+      admissionRequired: true,
+      attachAudit: false,
+      rows: [
+        { text: "synthetic mapped row one", category: "fact", heading: "Facts", vector: [0.1] },
+        { text: "synthetic mapped row two", category: "fact", heading: "Facts", vector: [0.2] },
+      ],
+      conversationText: "synthetic conversation",
+      scopeFilter: ["agent-a"],
+    });
+    assert.equal(results.length, 2);
+    for (const result of results) {
+      assert.equal(result.admit, false, "an enabled-but-unavailable admission gate must fail closed");
+      assert.match(result.reason ?? "", /failing closed/);
+    }
+  });
+
+  it("gateMappedReflectionEntries keeps the disabled passthrough when admission is not required", async () => {
+    const results = await gateMappedReflectionEntries({
+      admissionController: null,
+      admissionRequired: false,
+      attachAudit: false,
+      rows: [{ text: "synthetic mapped row", category: "fact", heading: "Facts", vector: [0.1] }],
+      conversationText: "synthetic conversation",
+      scopeFilter: ["agent-a"],
+    });
+    assert.equal(results.length, 1);
+    assert.equal(results[0].admit, true, "admission disabled must remain a passthrough");
   });
 });

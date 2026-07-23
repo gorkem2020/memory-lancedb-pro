@@ -2360,6 +2360,7 @@ interface PluginSingletonState {
   autoCaptureCountedPendingCount: Map<string, number>;
   autoCaptureRecentTexts: Map<string, string[]>;
   autoCaptureDeferredFlushTexts: Map<string, string[]>;
+  autoCaptureSessionIdToKey: Map<string, string>;
   autoCaptureInFlightRuns: Map<string, Set<Promise<void>>>;
   captureAdmissionController: () => AdmissionController | null;
   captureAdmissionAudit: () => boolean;
@@ -2574,8 +2575,8 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         "memory-lancedb-pro: admission control constructed for capture fallbacks (smart extraction inactive)",
       );
     } catch (err) {
-      api.logger.warn(
-        `memory-lancedb-pro: fallback admission init failed, captures stay ungated: ${String(err)}`,
+      api.logger.error(
+        `memory-lancedb-pro: fallback admission init failed; admission-gated captures FAIL CLOSED until init succeeds: ${String(err)}`,
       );
     }
   }
@@ -2605,6 +2606,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const autoCaptureCountedPendingCount = new Map<string, number>();
   const autoCaptureRecentTexts = new Map<string, string[]>();
   const autoCaptureDeferredFlushTexts = new Map<string, string[]>();
+  const autoCaptureSessionIdToKey = new Map<string, string>();
   const autoCaptureInFlightRuns = new Map<string, Set<Promise<void>>>();
 
   return {
@@ -2636,6 +2638,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     autoCaptureCountedPendingCount,
     autoCaptureRecentTexts,
     autoCaptureDeferredFlushTexts,
+    autoCaptureSessionIdToKey,
     autoCaptureInFlightRuns,
     captureAdmissionController,
     captureAdmissionAudit,
@@ -2795,6 +2798,7 @@ const memoryLanceDBProPlugin = {
       autoCaptureCountedPendingCount,
       autoCaptureRecentTexts,
       autoCaptureDeferredFlushTexts,
+    autoCaptureSessionIdToKey,
       autoCaptureInFlightRuns,
       captureAdmissionController,
       captureAdmissionAudit,
@@ -3843,7 +3847,7 @@ const memoryLanceDBProPlugin = {
         // agent_end too; capturing them would extract memory scaffolding prompts
         // as if they were conversation. Same guard convention as the sibling
         // reflection injection hooks.
-        const hookSessionKey = ctx?.sessionKey || (event as any).sessionKey;
+        const hookSessionKey = ctx?.sessionKey || (event as any).sessionKey || ctx?.sessionId || (event as any).sessionId;
         if (isInternalReflectionSessionKey(hookSessionKey) || isMemorySubsessionKey(hookSessionKey)) {
           api.logger.debug(
             `memory-lancedb-pro: auto-capture skip \u2014 internal memory session '${hookSessionKey}'`,
@@ -3878,7 +3882,14 @@ const memoryLanceDBProPlugin = {
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
             : scopeManager.getDefaultScope(agentId);
-          const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
+          const sessionKey = ctx?.sessionKey || (event as any).sessionKey || ctx?.sessionId || (event as any).sessionId || "unknown";
+          const hookSessionId = ctx?.sessionId || (event as any).sessionId;
+          if (typeof hookSessionId === "string" && hookSessionId && hookSessionId !== sessionKey) {
+            // session_end may deliver only the lifecycle sessionId; record the
+            // alias so the terminal flush resolves to the same buckets.
+            autoCaptureSessionIdToKey.set(hookSessionId, sessionKey);
+            pruneMapIfOver(autoCaptureSessionIdToKey, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
 
           api.logger.debug(
             `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
@@ -4057,6 +4068,41 @@ const memoryLanceDBProPlugin = {
             }
           }
 
+          // A failed extraction must hand back what it consumed: deferred
+          // flush texts for a terminal flush, the slice cursor for
+          // history-carrying sessions, the pending queue for ingress-fed
+          // sessions (same shapes as the below-threshold deferral path).
+          const restoreConsumedCaptureState = () => {
+            const retainedCap = autoCaptureRetainedTextCap(minMessages);
+            if (isTerminalFlush) {
+              const restored = [...new Set([...newTexts, ...(autoCaptureDeferredFlushTexts.get(sessionKey) || [])])].slice(-retainedCap);
+              if (restored.length > 0) {
+                autoCaptureDeferredFlushTexts.set(sessionKey, restored);
+                pruneMapIfOver(autoCaptureDeferredFlushTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+              }
+              return;
+            }
+            if (pendingIngressTexts.length === 0) {
+              autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+              return;
+            }
+            if (conversationKey) {
+              const merged = [
+                ...pendingIngressTexts,
+                ...(autoCapturePendingIngressTexts.get(conversationKey) || []),
+              ];
+              const requeued = merged.slice(-retainedCap);
+              const evicted = merged.length - requeued.length;
+              autoCapturePendingIngressTexts.set(conversationKey, requeued);
+              autoCaptureCountedPendingCount.set(
+                conversationKey,
+                Math.max(0, pendingIngressTexts.length - evicted),
+              );
+              pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+              pruneMapIfOver(autoCaptureCountedPendingCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            }
+          };
+
           // ----------------------------------------------------------------
           // Smart Extraction (Phase 1: LLM-powered 6-category extraction)
           // Rate limiter charged AFTER successful extraction, not before,
@@ -4087,7 +4133,15 @@ const memoryLanceDBProPlugin = {
                 api.logger.error(
                   `memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`,
                 );
+                restoreConsumedCaptureState();
                 return; // prevent hook crash — fall through to regex fallback is intentionally skipped
+              }
+              if (stats.extractionFailed) {
+                api.logger.warn(
+                  `memory-lancedb-pro: smart extraction returned no usable LLM result for agent ${agentId}; restoring consumed texts for retry`,
+                );
+                restoreConsumedCaptureState();
+                return;
               }
               // Charge rate limiter only after successful extraction
               extractionRateLimiter.recordExtraction();
@@ -4269,6 +4323,7 @@ const memoryLanceDBProPlugin = {
             // off, in which case no controller instance exists to borrow).
             const fallbackGate = await gateRegexFallbackCapture({
               admissionController: captureAdmissionController(),
+            admissionRequired: config.admissionControl?.enabled === true,
               attachAudit: captureAdmissionAudit(),
               text,
               storeCategory: category,
@@ -4430,7 +4485,15 @@ const memoryLanceDBProPlugin = {
       // (a single global slot let concurrent sessions overwrite each other, so a
       // flush could run before its own session's work recorded deferred state).
       api.on("session_end", (event: any, ctx: any) => {
-        const flushSessionKey = ctx?.sessionKey || (event as any)?.sessionKey || "";
+        // Production session_end payloads may carry only the lifecycle
+        // sessionId (no sessionKey on ctx or event); resolve through the
+        // alias the ingress hook recorded so the flush reaches the same
+        // per-session buckets, falling back to the sessionId itself for
+        // hosts that key every hook by sessionId alone.
+        const rawFlushSessionKey = ctx?.sessionKey || (event as any)?.sessionKey || "";
+        const flushSessionId = ctx?.sessionId || (event as any)?.sessionId || "";
+        const flushSessionKey = rawFlushSessionKey
+          || (flushSessionId ? autoCaptureSessionIdToKey.get(flushSessionId) || flushSessionId : "");
         if (!flushSessionKey || typeof flushSessionKey !== "string") {
           return;
         }
@@ -5279,6 +5342,7 @@ const memoryLanceDBProPlugin = {
           // control (or smart extraction) is disabled.
           const mappedGateResults = await gateMappedReflectionEntries({
             admissionController: captureAdmissionController(),
+            admissionRequired: config.admissionControl?.enabled === true,
             attachAudit: captureAdmissionAudit(),
             rows: gateEligible.map(({ mapped, vector }) => ({
               text: mapped.text,

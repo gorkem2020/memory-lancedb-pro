@@ -52,9 +52,13 @@ export function buildFallbackCandidate(
 /**
  * Gate one regex-fallback capture through admission control.
  *
- * - No controller (admission disabled, or smart extraction off so no
- *   controller instance exists to borrow): passthrough, identical to the
- *   historical behavior.
+ * - No controller with admission NOT required (admission disabled): passthrough,
+ *   identical to the historical behavior.
+ * - No controller with admission REQUIRED (enabled in config but construction
+ *   failed): fail closed. A standing init failure would otherwise silently
+ *   restore the ungated bypass this module exists to close — unlike the
+ *   transient per-candidate evaluation error below, which fails open with
+ *   durable provenance on the single affected row.
  * - Controller reject: the capture is dropped; the caller logs the reason.
  * - Controller pass: the capture proceeds; when `attachAudit` is set the
  *   audit record (tagged with provenance "auto-capture-regex-fallback") is
@@ -69,6 +73,8 @@ export function buildFallbackCandidate(
  */
 export async function gateRegexFallbackCapture(params: {
   admissionController: FallbackAdmissionGate | null;
+  /** True when admissionControl.enabled is set: a missing controller then means init failed, not "disabled". */
+  admissionRequired?: boolean;
   attachAudit: boolean;
   text: string;
   storeCategory: string;
@@ -78,6 +84,11 @@ export async function gateRegexFallbackCapture(params: {
   warnLog?: (msg: string) => void;
 }): Promise<FallbackGateResult> {
   if (!params.admissionController) {
+    if (params.admissionRequired) {
+      const reason = "admission control is enabled but no controller is available (initialization failed); failing closed";
+      params.warnLog?.(`memory-lancedb-pro: regex-fallback capture rejected: ${reason}`);
+      return { admit: false, reason };
+    }
     return { admit: true };
   }
 
