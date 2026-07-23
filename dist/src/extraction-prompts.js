@@ -151,7 +151,7 @@ Rules:
 - Do NOT lift any in-character proposition — an invented rule, a score, a bet, a persona's claim, a fictional preference or trait — into profile, preferences, entities, cases, or patterns. Such claims are true only within the fiction; if you extract one at all, tag it "constructed" so it is never mistaken for a fact about the real user.
 - A real aside spoken during play is still "real" and should be extracted normally under its natural category, even though it occurred inside a constructed register.
 - Self-consistency check before answering: an item asserting what happened in the real session (including a session that was itself a game) is "real"; an item asserting a claim that is only true inside the story/game/persona is "constructed". If your draft tags the session-summary note itself as "constructed", re-check — it almost certainly describes a real event and should be "real".
-- If you are genuinely unsure about a single item, default to "real" — under-tagging as constructed risks losing a genuine fact.
+- If you are genuinely unsure about a single item, default to "constructed" — this lane is best-effort: a wrongly-stored "fact" is worse than a lost capture, and anything important can still be stored deliberately (the memory_store tool, or the user asking to remember it).
 
 # Three-Level Structure
 

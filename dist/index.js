@@ -3585,7 +3585,9 @@ const memoryLanceDBProPlugin = {
                         // trigger the store.store() fallback (which would create duplicate rows).
                         if (capturedEntries.length > 0) {
                             try {
-                                await store.bulkStore(capturedEntries);
+                                await store.bulkStore(capturedEntries, ({ index, reason }) => {
+                                    api.logger.warn(`memory-lancedb-pro: auto-capture bulkStore dropped entry ${index}: ${reason}`);
+                                });
                                 api.logger.info(`memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} in scope ${defaultScope} (bulkStore)`);
                             }
                             catch (err) {
@@ -4083,12 +4085,20 @@ const memoryLanceDBProPlugin = {
                 const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
                 let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
                 const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
-                const sourceAgentId = parsedAgentId || "main";
+                // An unattributable sessionKey must not masquerade as "main": that fallback
+                // used to drive main-specific session recovery, reflection execution, event
+                // identity, and mdMirror writes into the main agent's workspace. No validated
+                // identity means no agent-specific work at all.
+                if (!parsedAgentId) {
+                    api.logger.info(`memory-reflection: command:${action} skipped (unattributable sessionKey=${sessionKey ?? "(none)"}); no agent identity, skipping recovery/execution/persistence/mirroring`);
+                    return;
+                }
+                const sourceAgentId = parsedAgentId;
                 // Ownership written into persisted reflection metadata must never be minted as
                 // "main" when the sessionKey fails to resolve to a real agent, that would silently
                 // misattribute the reflection to (and make it inheritable by) an unrelated agent.
                 // isOwnedByAgent() treats an empty owner as non-inheritable.
-                const ownerAgentId = parsedAgentId || "";
+                const ownerAgentId = parsedAgentId;
                 const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
                 if (isSessionBoundaryReflectionAction(action)) {
                     const now = Date.now();
@@ -4476,7 +4486,9 @@ const memoryLanceDBProPlugin = {
                         }
                     }
                     if (mappedEntries.length > 0) {
-                        const storedEntries = await store.bulkStore(mappedEntries);
+                        const storedEntries = await store.bulkStore(mappedEntries, ({ index, reason }) => {
+                            api.logger.warn(`memory-lancedb-pro: import bulkStore dropped entry ${index}: ${reason}`);
+                        });
                         if (mdMirror) {
                             for (const stored of storedEntries) {
                                 // retrieve heading from metadata JSON — critical when bulkStore filters entries
