@@ -2505,6 +2505,10 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
         console.log(`\nApplied ${pluralCount(result.applied.length, "action")}${failureNotes.length ? "; " + failureNotes.join("; ") : ""}.`);
       } catch (error) {
         console.error("consolidate failed:", error);
+        process.exit(1);
+      }
+    });
+}
 
 // ============================================================================
 // Factory Function
