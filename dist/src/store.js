@@ -72,12 +72,22 @@ const LEGACY_SECONDS_TIMESTAMP_MAX = 1_000_000_000_000;
 function isLegacyStableMemoryId(id) {
     return LEGACY_STABLE_MEMORY_ID_REGEX.test(id);
 }
+const MAX_SAFE_TIMESTAMP_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 export function normalizeMemoryTimestamp(value, fallback = Date.now()) {
     const raw = value instanceof Date
         ? value.getTime()
-        : typeof value === "number"
-            ? value
-            : Number(value);
+        : typeof value === "bigint"
+            // LanceDB returns int64 columns as BigInt. Convert inside the safe-integer
+            // bound so out-of-range values clamp deterministically instead of silently
+            // losing precision through Number()'s float rounding.
+            ? Number(value > MAX_SAFE_TIMESTAMP_BIGINT
+                ? MAX_SAFE_TIMESTAMP_BIGINT
+                : value < 0n
+                    ? 0n
+                    : value)
+            : typeof value === "number"
+                ? value
+                : Number(value);
     if (!Number.isFinite(raw) || raw <= 0) {
         return fallback;
     }
@@ -1054,7 +1064,7 @@ export class MemoryStore {
      *
      * @public
      */
-    async bulkStore(entries) {
+    async bulkStore(entries, onInvalidEntry) {
         // 【MR4 fix】阻止 destroy() 後的呼叫
         if (this.destroyed) {
             throw new Error("MemoryStore instance has been destroyed");
@@ -1063,14 +1073,23 @@ export class MemoryStore {
         // Filter out invalid entries（undefined, null, missing text/vector）
         // Scope is part of the write contract: scope-less rows are invisible to
         // the hardened scoped readers, so silently persisting them is data loss.
-        const validEntries = entries.filter((entry) => {
+        const validEntries = [];
+        entries.forEach((entry, index) => {
             const candidate = entry;
-            return (!!candidate &&
-                typeof candidate.text === "string" &&
-                candidate.text.length > 0 &&
-                Array.isArray(candidate.vector) &&
-                candidate.vector.length > 0 &&
-                hasValidEntryScope(candidate.scope));
+            const reason = !candidate
+                ? "entry is null or undefined"
+                : typeof candidate.text !== "string" || candidate.text.length === 0
+                    ? "missing or empty text"
+                    : !Array.isArray(candidate.vector) || candidate.vector.length === 0
+                        ? "missing or empty vector"
+                        : !hasValidEntryScope(candidate.scope)
+                            ? "missing or blank scope"
+                            : null;
+            if (reason != null) {
+                onInvalidEntry?.({ index, reason });
+                return;
+            }
+            validEntries.push(entry);
         });
         // Early return for empty array（skip accumulation）
         if (validEntries.length === 0) {
@@ -1090,6 +1109,9 @@ export class MemoryStore {
             id: randomUUID(),
             timestamp: Date.now(),
             metadata: entry.metadata || "{}",
+            // Canonicalize scope whitespace at the write boundary so " agent " and
+            // "agent" cannot become distinct, partially invisible scopes.
+            scope: entry.scope.trim(),
             importance: clampImportance(Number(entry.importance)),
         }));
         // 【MR2 fix】當 pendingBatch 達到上限時，等待前一個 flush 完成後再加入
@@ -1877,6 +1899,7 @@ export class MemoryStore {
                 }
                 const originals = [];
                 const updatedEntries = [];
+                const persistedUpdates = [];
                 const updatedInputIndices = [];
                 for (const candidate of chunk) {
                     const row = rowsById.get(candidate.id);
@@ -1894,6 +1917,8 @@ export class MemoryStore {
                         continue;
                     }
                     const rowScope = realScope ?? "global";
+                    // Display mask only — see update(): mutations persist the RAW scope.
+                    const persistedScope = (hasValidEntryScope(realScope) ? realScope.trim() : null);
                     const original = {
                         id: row.id,
                         text: row.text,
@@ -1916,7 +1941,8 @@ export class MemoryStore {
                         timestamp: original.timestamp,
                         metadata: candidate.updates.metadata ?? original.metadata,
                     };
-                    originals.push(original);
+                    originals.push({ ...original, scope: persistedScope });
+                    persistedUpdates.push({ ...updated, scope: persistedScope });
                     updatedEntries.push(updated);
                     updatedInputIndices.push(candidate.inputIndex);
                 }
@@ -1930,7 +1956,7 @@ export class MemoryStore {
                 try {
                     await this.table.delete(`(${deleteWhereClause})`);
                     deleted = true;
-                    await this.table.add(updatedEntries);
+                    await this.table.add(persistedUpdates);
                     this.noteDataModification();
                     for (let index = 0; index < updatedEntries.length; index++) {
                         results.set(updatedInputIndices[index], {
@@ -2050,6 +2076,11 @@ export class MemoryStore {
                 throw new Error(`Memory ${id} is outside accessible scopes`);
             }
             const rowScope = realScope ?? "global";
+            // Display mask only. Mutations must persist the RAW stored scope: writing
+            // the "global" mask back would turn an invisible legacy NULL-scope row
+            // into a globally visible one (cross-agent disclosure). Valid scopes are
+            // canonicalized by trim; legacy NULL/blank stays NULL.
+            const persistedScope = (hasValidEntryScope(realScope) ? realScope.trim() : null);
             const original = {
                 id: row.id,
                 text: row.text,
@@ -2077,11 +2108,14 @@ export class MemoryStore {
             // Serialize updates per store instance to avoid stale rollback races.
             // If the add fails after delete, attempt best-effort recovery without
             // overwriting a newer concurrent successful update.
-            const rollbackCandidate = (await this.getById(original.id).catch(() => null)) ?? original;
+            const rollbackSource = (await this.getById(original.id).catch(() => null)) ?? original;
+            // getById masks a NULL scope as "global" for display; restore the raw
+            // stored scope before any write (scope is immutable through update patches).
+            const rollbackCandidate = { ...rollbackSource, scope: persistedScope };
             const resolvedId = escapeSqlLiteral(row.id);
             await this.table.delete(`id = '${resolvedId}'`);
             try {
-                await this.table.add([updated]);
+                await this.table.add([{ ...updated, scope: persistedScope }]);
             }
             catch (addError) {
                 const current = await this.getById(original.id).catch(() => null);
@@ -2152,7 +2186,7 @@ export class MemoryStore {
                 category: String(row.category ?? "fact"),
                 scope: row.scope ?? null,
                 importance: clampImportance(Number(row.importance)),
-                timestamp: Number(row.timestamp ?? 0),
+                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
                 metadata: row.metadata || "{}",
             };
         });
@@ -2164,6 +2198,7 @@ export class MemoryStore {
         const legacyRows = await this.findLegacyScopeRows(100000);
         let repaired = 0;
         let failed = 0;
+        const unrecovered = [];
         for (const row of legacyRows) {
             try {
                 await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
@@ -2174,7 +2209,15 @@ export class MemoryStore {
                         await this.table.add([replacement]);
                     }
                     catch (addError) {
-                        await this.table.add([{ ...row }]).catch(() => undefined);
+                        try {
+                            await this.table.add([{ ...row }]);
+                        }
+                        catch {
+                            // Both the replacement and the rollback write failed after the
+                            // delete, so the row is no longer in the table. Surface its full
+                            // content to the caller instead of silently losing the data.
+                            unrecovered.push({ ...row });
+                        }
                         throw addError;
                     }
                 }));
@@ -2186,7 +2229,7 @@ export class MemoryStore {
         }
         if (repaired > 0)
             this.noteDataModification();
-        return { repaired, failed };
+        return { repaired, failed, unrecovered };
     }
     async bulkDelete(scopeFilter, beforeTimestamp) {
         await this.ensureInitialized();

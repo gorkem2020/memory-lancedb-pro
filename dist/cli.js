@@ -694,7 +694,9 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
         if (typeof ctx.store.bulkStore === "function") {
             try {
                 bulkStoreCalls++;
-                await ctx.store.bulkStore(entries);
+                await ctx.store.bulkStore(entries, ({ index, reason }) => {
+                    console.warn(`  [import-markdown] dropped invalid entry ${index}: ${reason}`);
+                });
                 console.log(`  [import] stored batch ${bulkStoreCalls} (${entries.length} entries, total: ${imported + entries.length})`);
                 return { imported: entries.length, skipped: 0 };
             }
@@ -1866,8 +1868,15 @@ export function registerMemoryCLI(program, context) {
                 }
                 return;
             }
-            const { repaired, failed } = await context.store.repairLegacyScopes(options.targetScope);
+            const { repaired, failed, unrecovered } = await context.store.repairLegacyScopes(options.targetScope);
             console.log(`\nRepair complete: ${repaired} reassigned to "${options.targetScope}", ${failed} failed.`);
+            if (unrecovered.length > 0) {
+                console.error(`\n${unrecovered.length} row(s) could not be restored after a failed replacement write. ` +
+                    "Full row content follows (JSON, one per line) so the data is not lost:");
+                for (const entry of unrecovered) {
+                    console.error(JSON.stringify(entry));
+                }
+            }
         }
         catch (error) {
             console.error("repair-scopes failed:", error);
