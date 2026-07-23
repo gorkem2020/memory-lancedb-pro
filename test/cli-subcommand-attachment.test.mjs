@@ -37,26 +37,37 @@ function summaryRow({ id, text, l0, l1, l2 }) {
   };
 }
 
-async function runRepairSummaries(rows, extraArgs = []) {
+async function runRepairSummaries(rows, extraArgs = [], storeOverrides = {}) {
   const updateCalls = [];
+  const { update: overrideUpdate, ...restOverrides } = storeOverrides;
   const program = buildRegisteredProgram({
     async list(scopeFilter, category, limit = 200, offset = 0) {
       return rows.slice(offset, offset + limit);
     },
     async update(id, patch, scopeFilter) {
       updateCalls.push({ id, patch, scopeFilter });
+      if (overrideUpdate) return overrideUpdate(id, patch, scopeFilter);
       return null;
     },
+    ...restOverrides,
   });
   const logs = [];
+  const errors = [];
   const originalLog = console.log;
+  const originalError = console.error;
+  const priorExitCode = process.exitCode;
   console.log = (...parts) => logs.push(parts.join(" "));
+  console.error = (...parts) => errors.push(parts.join(" "));
+  let exitCode;
   try {
     await program.parseAsync(["node", "cli", "memory-pro", "repair-summaries", ...extraArgs]);
   } finally {
+    exitCode = process.exitCode;
+    process.exitCode = priorExitCode;
     console.log = originalLog;
+    console.error = originalError;
   }
-  return { updateCalls, logs: logs.join("\n") };
+  return { updateCalls, logs: logs.join("\n"), errors: errors.join("\n"), exitCode };
 }
 
 describe("cli subcommand attachment", () => {
@@ -139,6 +150,86 @@ describe("repair-summaries action safety", () => {
   it("keeps --dry-run as a report-only alias even when combined with --apply", async () => {
     const { updateCalls } = await runRepairSummaries([missingRow], ["--apply", "--dry-run"]);
     assert.equal(updateCalls.length, 0, "dry-run must always win");
+  });
+
+  it("excludes current reflection rows from the scan (all three schemas and the reflection category)", async () => {
+    const reflectionRow = (id, type) => ({
+      id,
+      text: `synthetic reflection payload for ${id}`,
+      category: "fact",
+      scope: "agent:main",
+      importance: 0.7,
+      timestamp: Date.now(),
+      metadata: JSON.stringify({ type }),
+    });
+    const categoryReflectionRow = {
+      id: "reflection-category-1",
+      text: "synthetic reflection with the reflection category",
+      category: "reflection",
+      scope: "agent:main",
+      importance: 0.7,
+      timestamp: Date.now(),
+      metadata: "{}",
+    };
+
+    const { updateCalls, logs } = await runRepairSummaries([
+      reflectionRow("reflection-plain-1", "memory-reflection"),
+      reflectionRow("reflection-event-1", "memory-reflection-event"),
+      reflectionRow("reflection-item-1", "memory-reflection-item"),
+      reflectionRow("reflection-mapped-1", "memory-reflection-mapped"),
+      categoryReflectionRow,
+      missingRow,
+    ], ["--apply"], {
+      async update(id) {
+        return { id };
+      },
+    });
+    const updateIds = updateCalls.map((call) => call.id);
+
+    assert.match(logs, /Found 1 repairable entries/);
+    assert.deepEqual(updateIds, ["missing-1"], "only the non-reflection row may be repaired");
+  });
+
+  it("fills only the missing levels, preserving valid generated ones", async () => {
+    const partialRow = summaryRow({
+      id: "partial-1",
+      text: "User asked for the synthetic walnut shelf to be repainted in matte blue next month.",
+      l0: "Walnut shelf: repaint matte blue",
+      l1: "## Task\n- Repaint the walnut shelf matte blue next month",
+    });
+
+    const { updateCalls, exitCode } = await runRepairSummaries([partialRow], ["--apply"], {
+      async update(id) {
+        return { id };
+      },
+    });
+
+    assert.equal(updateCalls.length, 1);
+    const meta = JSON.parse(updateCalls[0].patch.metadata);
+    assert.equal(meta.l0_abstract, "Walnut shelf: repaint matte blue", "a valid generated L0 must survive the repair");
+    assert.equal(meta.l1_overview, "## Task\n- Repaint the walnut shelf matte blue next month", "a valid generated L1 must survive the repair");
+    assert.equal(meta.l2_content, partialRow.text, "only the missing L2 may be filled from the source text");
+    assert.notEqual(exitCode, 1, "a fully successful repair must not set a failing exit code");
+  });
+
+  it("counts a null update return as failure and exits nonzero", async () => {
+    const { logs, errors, exitCode } = await runRepairSummaries([missingRow], ["--apply"]);
+
+    assert.match(logs, /0 fixed, 1 failed/);
+    assert.match(errors, /update returned no entry/);
+    assert.equal(exitCode, 1, "a repair that persisted nothing must not exit successfully");
+  });
+
+  it("counts a thrown update error as failure and exits nonzero", async () => {
+    const { logs, errors, exitCode } = await runRepairSummaries([missingRow], ["--apply"], {
+      async update() {
+        throw new Error("synthetic update failure");
+      },
+    });
+
+    assert.match(logs, /0 fixed, 1 failed/);
+    assert.match(errors, /synthetic update failure/);
+    assert.equal(exitCode, 1, "a repair that threw must not exit successfully");
   });
 });
 
