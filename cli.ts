@@ -2216,8 +2216,10 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
     });
 
   // repair-scopes: migration path for legacy NULL/blank-scope rows that the
-  // scope hardening makes invisible to every scoped reader
-  program
+  // scope hardening makes invisible to every scoped reader. Must attach to
+  // the `memory` group: the host routes only `memory-pro <sub>`, so a command
+  // chained off the root program is unreachable in production.
+  memory
     .command("repair-scopes")
     .description("Detect legacy NULL/blank-scope rows (invisible to scoped readers) and reassign them to an explicit scope")
     .option("--target-scope <scope>", "Scope assigned to legacy rows on --apply", "global")
@@ -2248,6 +2250,9 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           for (const entry of unrecovered) {
             console.error(JSON.stringify(entry));
           }
+        }
+        if (failed > 0 || unrecovered.length > 0) {
+          process.exitCode = 1;
         }
       } catch (error) {
         console.error("repair-scopes failed:", error);

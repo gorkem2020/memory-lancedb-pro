@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import jitiFactory from "jiti";
+import { Command } from "commander";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { MemoryStore, normalizeMemoryTimestamp } = jiti("../src/store.ts");
@@ -910,5 +911,61 @@ describe("(h) repairLegacyScopes re-validates each row under the write lock", ()
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("(i) repair-scopes command wiring", () => {
+  function buildCliProgram(storeStubs) {
+    const { createMemoryCLI } = jiti("../cli.ts");
+    const program = new Command();
+    program.exitOverride();
+    createMemoryCLI({ store: storeStubs, retriever: {}, scopeManager: {}, migrator: {} })({ program });
+    return program;
+  }
+
+  async function runRepairScopes(storeStubs, extraArgs = []) {
+    const program = buildCliProgram(storeStubs);
+    const logs = [];
+    const errors = [];
+    const originalLog = console.log;
+    const originalError = console.error;
+    const priorExitCode = process.exitCode;
+    console.log = (...parts) => logs.push(parts.join(" "));
+    console.error = (...parts) => errors.push(parts.join(" "));
+    let exitCode;
+    try {
+      await program.parseAsync(["node", "cli", "memory-pro", "repair-scopes", ...extraArgs]);
+    } finally {
+      exitCode = process.exitCode;
+      process.exitCode = priorExitCode;
+      console.log = originalLog;
+      console.error = originalError;
+    }
+    return { logs: logs.join("\n"), errors: errors.join("\n"), exitCode };
+  }
+
+  it("attaches repair-scopes to the memory-pro group the host routes", () => {
+    const program = buildCliProgram({});
+    const memoryPro = program.commands.find((c) => c.name() === "memory-pro");
+    assert.ok(memoryPro, "memory-pro group must be registered");
+    const groupNames = memoryPro.commands.map((c) => c.name());
+    assert.ok(
+      groupNames.includes("repair-scopes"),
+      `expected "repair-scopes" under the memory-pro group, got: ${groupNames.join(", ")}`,
+    );
+  });
+
+  it("exits nonzero when rows failed or were unrecovered, and zero on a clean repair", async () => {
+    const failing = await runRepairScopes({
+      async findLegacyScopeRows() { return [{ id: "legacy-x", text: "legacy row" }]; },
+      async repairLegacyScopes() { return { repaired: 1, failed: 2, skipped: 0, unrecovered: [{ id: "lost-1", text: "lost row" }] }; },
+    }, ["--apply"]);
+    assert.equal(failing.exitCode, 1, "failed or unrecovered rows must fail the process for non-interactive callers");
+
+    const clean = await runRepairScopes({
+      async findLegacyScopeRows() { return [{ id: "legacy-y", text: "legacy row" }]; },
+      async repairLegacyScopes() { return { repaired: 1, failed: 0, skipped: 1, unrecovered: [] }; },
+    }, ["--apply"]);
+    assert.notEqual(clean.exitCode, 1, "a clean repair (skips included) must not fail the exit code");
   });
 });
