@@ -288,6 +288,23 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
     assert.match(prompt, /within-the-fiction/i, "the within-the-fiction definition of constructed must be present");
     assert.doesNotMatch(prompt, /at most one/i, "the per-extraction constructed cap must be fully removed from the prompt");
   });
+
+  it("the unsure tie-break defaults to constructed, never real (best-effort lane axiom)", async () => {
+    const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
+    const parts = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = `${parts.system}\n\n${parts.user}`;
+
+    assert.match(
+      prompt,
+      /genuinely unsure about a single item, default to "constructed"/,
+      "an unsure item must default to constructed: auto-capture is best-effort, and a wrongly-stored fact is worse than a lost capture",
+    );
+    assert.doesNotMatch(
+      prompt,
+      /genuinely unsure about a single item, default to "real"/,
+      "the old default-to-real tie-break must be gone",
+    );
+  });
 });
 
 // ============================================================================
