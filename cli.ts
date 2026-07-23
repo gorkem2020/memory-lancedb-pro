@@ -2212,6 +2212,37 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
         process.exit(1);
       }
     });
+
+  // repair-scopes: migration path for legacy NULL/blank-scope rows that the
+  // scope hardening makes invisible to every scoped reader
+  program
+    .command("repair-scopes")
+    .description("Detect legacy NULL/blank-scope rows (invisible to scoped readers) and reassign them to an explicit scope")
+    .option("--target-scope <scope>", "Scope assigned to legacy rows on --apply", "global")
+    .option("--apply", "Apply the reassignment (default: report only)", false)
+    .action(async (options: { targetScope: string; apply: boolean }) => {
+      try {
+        const legacy = await context.store.findLegacyScopeRows(100000);
+        console.log(`Found ${legacy.length} legacy row(s) with NULL/blank scope${legacy.length > 0 ? ":" : "."}`);
+        for (const entry of legacy.slice(0, 20)) {
+          console.log(`  ${String(entry.id).slice(0, 8)}  ${String(entry.text).slice(0, 60)}`);
+        }
+        if (legacy.length > 20) {
+          console.log(`  ... and ${legacy.length - 20} more`);
+        }
+        if (!options.apply) {
+          if (legacy.length > 0) {
+            console.log(`\nReport-only mode. Re-run with --apply to assign scope "${options.targetScope}".`);
+          }
+          return;
+        }
+        const { repaired, failed } = await context.store.repairLegacyScopes(options.targetScope);
+        console.log(`\nRepair complete: ${repaired} reassigned to "${options.targetScope}", ${failed} failed.`);
+      } catch (error) {
+        console.error("repair-scopes failed:", error);
+        process.exit(1);
+      }
+    });
 }
 
 // ============================================================================

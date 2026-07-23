@@ -336,6 +336,10 @@ function normalizeSearchText(value: string): string {
   return value.toLowerCase().trim();
 }
 
+function hasValidEntryScope(scope: unknown): scope is string {
+  return typeof scope === "string" && scope.trim().length > 0;
+}
+
 function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
   return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
@@ -1227,6 +1231,11 @@ export class MemoryStore {
     // its explicit legacy branch — this clamp is the generic v2+ boundary.
     // Number() coerces the structurally-typed entry.importance to a real
     // number so clampImportance's NaN/Infinity fallback can do its job.
+    if (!hasValidEntryScope(entry.scope)) {
+      throw new Error(
+        "store() requires a non-empty scope: scope-less rows are invisible to scoped readers",
+      );
+    }
     const clampedEntry: Omit<MemoryEntry, "id" | "timestamp"> = {
       ...entry,
       importance: clampImportance(Number(entry.importance)),
@@ -1236,6 +1245,11 @@ export class MemoryStore {
   }
 
   async upsert(entry: MemoryEntry): Promise<MemoryEntry> {
+    if (!hasValidEntryScope(entry.scope)) {
+      throw new Error(
+        `upsert() requires a non-empty scope: refusing to delete row ${entry.id} for a scope-less replacement`,
+      );
+    }
     await this.ensureInitialized();
 
     const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
@@ -1286,14 +1300,17 @@ export class MemoryStore {
     await this.ensureInitialized();
 
     // Filter out invalid entries（undefined, null, missing text/vector）
+    // Scope is part of the write contract: scope-less rows are invisible to
+    // the hardened scoped readers, so silently persisting them is data loss.
     const validEntries = entries.filter((entry) => {
-      const candidate = entry as { text?: unknown; vector?: unknown };
+      const candidate = entry as { text?: unknown; vector?: unknown; scope?: unknown };
       return (
         !!candidate &&
         typeof candidate.text === "string" &&
         candidate.text.length > 0 &&
         Array.isArray(candidate.vector) &&
-        candidate.vector.length > 0
+        candidate.vector.length > 0 &&
+        hasValidEntryScope(candidate.scope)
       );
     });
 
@@ -2559,6 +2576,67 @@ export class MemoryStore {
     );
   }
 
+  /**
+   * Legacy NULL/blank-scope rows predate scope hardening and are invisible to
+   * every scoped reader. These two methods are the migration path: find them,
+   * then reassign them to an explicit scope.
+   */
+  async findLegacyScopeRows(limit = 1000): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+    const rows = await this.table!
+      .query()
+      .where("scope IS NULL OR scope = ''")
+      .limit(limit)
+      .toArray();
+    return rows.map((row: Record<string, unknown>) => {
+      const rawVector = row.vector as { toArray?: () => ArrayLike<number> } | ArrayLike<number> | null;
+      const vector = Array.isArray(rawVector)
+        ? rawVector
+        : rawVector && typeof (rawVector as { toArray?: unknown }).toArray === "function"
+          ? Array.from((rawVector as { toArray: () => ArrayLike<number> }).toArray())
+          : Array.from((rawVector as ArrayLike<number>) ?? []);
+      return {
+        id: String(row.id),
+        text: String(row.text ?? ""),
+        vector,
+        category: String(row.category ?? "fact"),
+        scope: (row.scope as string | null | undefined) ?? null,
+        importance: clampImportance(Number(row.importance)),
+        timestamp: Number(row.timestamp ?? 0),
+        metadata: (row.metadata as string) || "{}",
+      } as MemoryEntry;
+    });
+  }
+
+  async repairLegacyScopes(targetScope: string): Promise<{ repaired: number; failed: number }> {
+    if (!hasValidEntryScope(targetScope)) {
+      throw new Error("repairLegacyScopes requires a non-empty target scope");
+    }
+    const legacyRows = await this.findLegacyScopeRows(100000);
+    let repaired = 0;
+    let failed = 0;
+    for (const row of legacyRows) {
+      try {
+        await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+          const safeId = escapeSqlLiteral(row.id);
+          const replacement: MemoryEntry = { ...row, scope: targetScope.trim() };
+          await this.table!.delete(`id = '${safeId}'`);
+          try {
+            await this.table!.add([replacement]);
+          } catch (addError) {
+            await this.table!.add([{ ...row }]).catch(() => undefined);
+            throw addError;
+          }
+        }));
+        repaired += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    if (repaired > 0) this.noteDataModification();
+    return { repaired, failed };
+  }
+
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {
     await this.ensureInitialized();
 
@@ -2676,6 +2754,10 @@ export class MemoryStore {
     limit = 200,
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
+
+    // An explicitly empty scope filter is a deny-all contract, matching the
+    // other scoped readers: compaction must never widen into every scope.
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const conditions: string[] = [timestampBeforePredicate("timestamp", maxTimestamp)];
 

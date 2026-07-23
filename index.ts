@@ -4721,12 +4721,22 @@ const memoryLanceDBProPlugin = {
         const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
         let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
         const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
-        const sourceAgentId = parsedAgentId || "main";
+        // An unattributable sessionKey must not masquerade as "main": that fallback
+        // used to drive main-specific session recovery, reflection execution, event
+        // identity, and mdMirror writes into the main agent's workspace. No validated
+        // identity means no agent-specific work at all.
+        if (!parsedAgentId) {
+          api.logger.info(
+            `memory-reflection: command:${action} skipped (unattributable sessionKey=${sessionKey ?? "(none)"}); no agent identity, skipping recovery/execution/persistence/mirroring`,
+          );
+          return;
+        }
+        const sourceAgentId = parsedAgentId;
         // Ownership written into persisted reflection metadata must never be minted as
         // "main" when the sessionKey fails to resolve to a real agent, that would silently
         // misattribute the reflection to (and make it inheritable by) an unrelated agent.
         // isOwnedByAgent() treats an empty owner as non-inheritable.
-        const ownerAgentId = parsedAgentId || "";
+        const ownerAgentId = parsedAgentId;
         const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
         if (isSessionBoundaryReflectionAction(action)) {
           const now = Date.now();
