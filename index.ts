@@ -4677,7 +4677,11 @@ const memoryLanceDBProPlugin = {
           // trigger the store.store() fallback (which would create duplicate rows).
           if (capturedEntries.length > 0) {
             try {
-              await store.bulkStore(capturedEntries);
+              await store.bulkStore(capturedEntries, ({ index, reason }) => {
+                api.logger.warn(
+                  `memory-lancedb-pro: auto-capture bulkStore dropped entry ${index}: ${reason}`,
+                );
+              });
               api.logger.info(
                 `memory-lancedb-pro: auto-captured ${capturedEntries.length} memories for agent ${agentId} in scope ${defaultScope} (bulkStore)`,
               );
@@ -5701,7 +5705,11 @@ const memoryLanceDBProPlugin = {
             }
           }
           if (mappedEntries.length > 0) {
-            const storedEntries = await store.bulkStore(mappedEntries);
+            const storedEntries = await store.bulkStore(mappedEntries, ({ index, reason }) => {
+              api.logger.warn(
+                `memory-lancedb-pro: import bulkStore dropped entry ${index}: ${reason}`,
+              );
+            });
             if (mdMirror) {
               for (const stored of storedEntries) {
                 // retrieve heading from metadata JSON — critical when bulkStore filters entries

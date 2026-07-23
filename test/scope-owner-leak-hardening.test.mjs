@@ -6,7 +6,7 @@ import { join } from "node:path";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
-const { MemoryStore } = jiti("../src/store.ts");
+const { MemoryStore, normalizeMemoryTimestamp } = jiti("../src/store.ts");
 const { isOwnedByAgent } = jiti("../src/reflection-store.ts");
 const { parseAgentIdFromSessionKey } = jiti("../src/scopes.ts");
 
@@ -517,13 +517,280 @@ describe("(f) legacy NULL/blank-scope migration path", () => {
       assert.equal(globalBefore.length, 0, "legacy rows must be invisible to scoped readers before repair");
 
       const outcome = await store.repairLegacyScopes("global");
-      assert.deepEqual(outcome, { repaired: 2, failed: 0 });
+      assert.deepEqual(outcome, { repaired: 2, failed: 0, unrecovered: [] });
 
       const globalAfter = await store.list(["global"], undefined, 10, 0);
       assert.equal(globalAfter.length, 2, "repaired rows must be visible under the target scope");
       assert.equal((await store.findLegacyScopeRows()).length, 0, "no legacy rows may remain after repair");
 
       await assert.rejects(() => store.repairLegacyScopes("  "), /non-empty target scope/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(d) unrestricted mutations preserve the raw stored scope", () => {
+  const LEGACY_ID = "11111111-1111-4111-8111-111111111111";
+
+  async function seedNullScopeRow(store, text) {
+    await seedLegacyRow(store, {
+      id: LEGACY_ID,
+      text,
+      vector: [0.1, 0.2, 0.3],
+      category: "fact",
+      scope: null,
+    });
+  }
+
+  it("update() on a NULL-scope row keeps the row invisible to scoped readers", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeRow(store, "legacy row updated without a filter");
+
+      const updated = await store.update(LEGACY_ID, { text: "legacy row text after update" });
+      assert.ok(updated, "the unrestricted update must succeed");
+      assert.equal(updated.scope, "global", "the RETURNED entry keeps the display mask");
+
+      const throughGlobal = await store.getById(LEGACY_ID, ["global"]);
+      assert.equal(
+        throughGlobal,
+        null,
+        'the updated row must stay invisible through a "global"-inclusive filter',
+      );
+
+      const legacy = await store.findLegacyScopeRows();
+      assert.ok(
+        legacy.some((row) => row.id === LEGACY_ID && row.text === "legacy row text after update"),
+        "the updated row must still be a NULL-scope legacy row carrying the new text",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("bulkUpdateExact() on a NULL-scope row keeps the row invisible to scoped readers", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeRow(store, "legacy row bulk-updated without a filter");
+
+      const results = await store.bulkUpdateExact([
+        { id: LEGACY_ID, updates: { text: "legacy row text after bulk update" } },
+      ]);
+      assert.equal(results.length, 1);
+      assert.ok(results[0].entry, "the unrestricted bulk update must succeed");
+      assert.equal(results[0].entry.scope, "global", "the RETURNED entry keeps the display mask");
+
+      const throughGlobal = await store.getById(LEGACY_ID, ["global"]);
+      assert.equal(
+        throughGlobal,
+        null,
+        'the bulk-updated row must stay invisible through a "global"-inclusive filter',
+      );
+
+      const legacy = await store.findLegacyScopeRows();
+      assert.ok(
+        legacy.some((row) => row.id === LEGACY_ID && row.text === "legacy row text after bulk update"),
+        "the bulk-updated row must still be a NULL-scope legacy row carrying the new text",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("update() rollback restores the raw NULL scope when the replacement write fails", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedNullScopeRow(store, "legacy row that survives a failed update");
+
+      const originalAdd = store.table.add.bind(store.table);
+      let failNext = true;
+      store.table.add = async (rows) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("synthetic add failure");
+        }
+        return originalAdd(rows);
+      };
+
+      await assert.rejects(store.update(LEGACY_ID, { text: "never persisted" }));
+
+      const legacy = await store.findLegacyScopeRows();
+      assert.ok(
+        legacy.some((row) => row.id === LEGACY_ID),
+        "rollback must restore the row with its raw NULL scope",
+      );
+      const throughGlobal = await store.getById(LEGACY_ID, ["global"]);
+      assert.equal(throughGlobal, null, "the restored row must remain invisible to scoped readers");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("update() canonicalizes whitespace-padded valid scopes instead of masking them", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, {
+        id: "33333333-3333-4333-8333-333333333333",
+        text: "padded scope row",
+        vector: [0.1, 0.2, 0.3],
+        category: "fact",
+        scope: "  agent-a  ",
+      });
+
+      await store.update("33333333-3333-4333-8333-333333333333", { text: "padded scope row updated" });
+
+      const throughScope = await store.getById("33333333-3333-4333-8333-333333333333", ["agent-a"]);
+      assert.ok(throughScope, "the updated row must be reachable through its trimmed scope");
+      assert.equal(throughScope.text, "padded scope row updated");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(e) legacy-scope repair is BigInt-safe and recoverable", () => {
+  it("normalizeMemoryTimestamp bounds BigInt values instead of losing precision", () => {
+    assert.equal(normalizeMemoryTimestamp(9223372036854775807n, 0), Number.MAX_SAFE_INTEGER);
+    assert.equal(normalizeMemoryTimestamp(1784801288000n, 0), 1784801288000);
+    assert.equal(normalizeMemoryTimestamp(1700000000n, 0), 1700000000000);
+    assert.equal(normalizeMemoryTimestamp(-5n, 123), 123);
+  });
+
+  it("findLegacyScopeRows maps an above-safe-range BigInt timestamp to the bounded value", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await store.ensureInitialized();
+      const realTable = store.table;
+      store.table = {
+        query: () => ({
+          where: () => ({
+            limit: () => ({
+              toArray: async () => [{
+                id: "legacy-bigint",
+                text: "legacy row with an int64 timestamp",
+                vector: [0.1, 0.2, 0.3],
+                category: "fact",
+                scope: null,
+                importance: 0.5,
+                timestamp: 9223372036854775807n,
+                metadata: "{}",
+              }],
+            }),
+          }),
+        }),
+      };
+      try {
+        const rows = await store.findLegacyScopeRows();
+        assert.equal(rows.length, 1);
+        assert.equal(
+          rows[0].timestamp,
+          Number.MAX_SAFE_INTEGER,
+          "the mapped timestamp must be bounded, not float-rounded",
+        );
+      } finally {
+        store.table = realTable;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairLegacyScopes reports rows lost to a double write failure instead of dropping them", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, {
+        id: "22222222-2222-4222-8222-222222222222",
+        text: "legacy row that must not vanish silently",
+        vector: [0.1, 0.2, 0.3],
+        category: "fact",
+        scope: null,
+      });
+
+      store.table.add = async () => {
+        throw new Error("synthetic persistent add failure");
+      };
+
+      const result = await store.repairLegacyScopes("global");
+      assert.equal(result.repaired, 0);
+      assert.equal(result.failed, 1);
+      assert.equal(result.unrecovered.length, 1, "the lost row must be surfaced to the caller");
+      assert.equal(result.unrecovered[0].id, "22222222-2222-4222-8222-222222222222");
+      assert.equal(result.unrecovered[0].text, "legacy row that must not vanish silently");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairLegacyScopes rolls back cleanly on a single write failure (nothing unrecovered)", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, {
+        id: "44444444-4444-4444-8444-444444444444",
+        text: "legacy row restored by rollback",
+        vector: [0.1, 0.2, 0.3],
+        category: "fact",
+        scope: null,
+      });
+
+      const originalAdd = store.table.add.bind(store.table);
+      let failNext = true;
+      store.table.add = async (rows) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("synthetic add failure");
+        }
+        return originalAdd(rows);
+      };
+
+      const result = await store.repairLegacyScopes("global");
+      assert.equal(result.repaired, 0);
+      assert.equal(result.failed, 1);
+      assert.equal(result.unrecovered.length, 0, "a successful rollback leaves nothing unrecovered");
+
+      const legacy = await store.findLegacyScopeRows();
+      assert.ok(
+        legacy.some((row) => row.id === "44444444-4444-4444-8444-444444444444"),
+        "the rolled-back row must still exist as a legacy NULL-scope row",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(f) bulkStore write-boundary reporting and canonicalization", () => {
+  it("reports each invalid entry with its index and reason instead of silently dropping", async () => {
+    const { store, dir } = makeStore();
+    try {
+      const reports = [];
+      const stored = await store.bulkStore([
+        { text: "valid entry", vector: [0.1, 0.2, 0.3], category: "fact", scope: "agent-a", importance: 0.5, metadata: "{}" },
+        { text: "scope-less entry", vector: [0.1, 0.2, 0.3], category: "fact", scope: "   ", importance: 0.5, metadata: "{}" },
+        { text: "", vector: [0.1, 0.2, 0.3], category: "fact", scope: "agent-a", importance: 0.5, metadata: "{}" },
+      ], (report) => reports.push(report));
+
+      assert.equal(stored.length, 1, "only the valid entry may be stored");
+      assert.deepEqual(reports.map((r) => r.index), [1, 2]);
+      assert.match(reports[0].reason, /scope/);
+      assert.match(reports[1].reason, /text/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("trims scope whitespace at the write boundary", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await store.bulkStore([
+        { text: "padded scope entry", vector: [0.1, 0.2, 0.3], category: "fact", scope: "  agent-a  ", importance: 0.5, metadata: "{}" },
+      ]);
+
+      const rows = await store.list(["agent-a"], undefined, 20, 0);
+      assert.ok(
+        rows.some((row) => row.text === "padded scope entry"),
+        "a whitespace-padded scope must canonicalize to the trimmed scope",
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
