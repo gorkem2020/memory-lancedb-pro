@@ -1449,7 +1449,6 @@ export function registerMemoryStoreTool(
           };
 
           const discovery = await runSupersedeDiscovery();
-          const existing = discovery.neighbors;
           const duplicateCandidate = discovery.duplicateCandidate;
           if (duplicateCandidate && !force && !manualSupersede) {
             return {
