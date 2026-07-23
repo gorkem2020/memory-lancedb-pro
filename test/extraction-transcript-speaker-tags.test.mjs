@@ -132,6 +132,17 @@ describe("trimTranscriptToTagBoundary", () => {
     const untagged = "z".repeat(5000);
     assert.equal(trimTranscriptToTagBoundary(untagged, 1000), "z".repeat(1000));
   });
+
+  it("re-heads a single over-limit turn so the fragment keeps its speaker tag", () => {
+    const turns = [{ role: "user", text: "a".repeat(5000) }];
+    const transcript = formatConversationTranscript(turns, "User");
+    const trimmed = trimTranscriptToTagBoundary(transcript, 1200);
+    assert.ok(
+      trimmed.startsWith("<user_message>"),
+      `a truncated single turn must keep an opening speaker tag, got: ${trimmed.slice(0, 30)}`,
+    );
+    assert.ok(trimmed.includes("</user_message>"), "the closing tag must survive");
+  });
 });
 
 describe("buildConversationTurnsForExtraction", () => {

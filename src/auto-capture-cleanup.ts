@@ -203,7 +203,18 @@ export function trimTranscriptToTagBoundary(transcript: string, maxChars: number
     .map((tag) => sliced.indexOf(tag))
     .filter((index) => index >= 0);
   if (tagStarts.length === 0) {
-    return sliced;
+    // A single turn longer than the budget: the slice is a headless fragment
+    // whose speaker tag was cut away. Re-head it with the opener matching its
+    // closing tag so the attribution invariant survives truncation.
+    const closers = ["</user_message>", "</assistant_message>"]
+      .map((tag) => ({ tag, index: sliced.indexOf(tag) }))
+      .filter((entry) => entry.index >= 0)
+      .sort((a, b) => a.index - b.index);
+    if (closers.length === 0) {
+      return sliced;
+    }
+    const opener = closers[0].tag.replace("</", "<");
+    return `${opener}${sliced}`;
   }
   return sliced.slice(Math.min(...tagStarts));
 }

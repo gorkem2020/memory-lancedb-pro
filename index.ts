@@ -3891,12 +3891,14 @@ const memoryLanceDBProPlugin = {
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
+          let rememberPrependedText: string | null = null;
           if (
             texts.length === 1 &&
             isExplicitRememberCommand(texts[0]) &&
             priorRecentTexts.length > 0
           ) {
             texts = [...priorRecentTexts.slice(-1), ...texts];
+            rememberPrependedText = texts[0];
           }
           if (newTexts.length > 0) {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
@@ -3904,11 +3906,19 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          const thisCallTurns = buildConversationTurnsForExtraction({
+          let thisCallTurns = buildConversationTurnsForExtraction({
             messageLoopTurns,
             eligibleTexts,
             newUserTexts: newTexts,
           });
+          // The remember-this flow prepends the referenced prior message to the
+          // FLAT text sequence above; the tagged transcript must carry the same
+          // final sequence, so reconstruct the prepended prior turn explicitly
+          // (it comes from a previous call's history and is not part of this
+          // call's message-loop turns).
+          if (rememberPrependedText != null) {
+            thisCallTurns = [{ role: "user", text: rememberPrependedText }, ...thisCallTurns];
+          }
 
           const minMessages = config.extractMinMessages ?? 4;
           if (skippedAutoCaptureTexts > 0) {
@@ -3989,12 +3999,14 @@ const memoryLanceDBProPlugin = {
                 `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (cumulative=${cumulativeCount} >= minMessages=${minMessages}, cleanTexts=${cleanTexts.length})`,
               );
               const conversationText = cleanTexts.join("\n");
-              // The tagged transcript is built from this call's turns; user
-              // turns the noise filter dropped stay out of it so they cannot
-              // become sources.
-              const noiseDroppedTexts = new Set(texts.filter((text) => !cleanTexts.includes(text)));
+              // The tagged transcript must mirror the FINAL extraction input:
+              // a user turn appears in it only if its text survived every
+              // upstream selector (session compression and the embedding noise
+              // filter alike) -- otherwise the tagged prompt smuggles texts the
+              // selectors dropped back into extraction.
+              const keptUserTexts = new Set(cleanTexts);
               const finalConversationTurns = thisCallTurns.filter(
-                (turn) => !(turn.role === "user" && noiseDroppedTexts.has(turn.text)),
+                (turn) => turn.role !== "user" || keptUserTexts.has(turn.text),
               );
               // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
               let stats: Awaited<ReturnType<typeof smartExtractor.extractAndPersist>> | null = null;
