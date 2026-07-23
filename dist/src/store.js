@@ -2099,6 +2099,20 @@ export class MemoryStore {
         return this.update(id, { metadata: stringifySmartMetadata(metadata) }, scopeFilter);
     }
     /**
+     * Force the open table handle onto the latest committed version. A nonzero
+     * readConsistencyInterval lets reads serve a snapshot up to that many
+     * seconds stale; a locked read-modify-write section must observe every
+     * commit that preceded its lock acquisition, so it re-syncs first. A sync
+     * failure propagates: proceeding on a possibly-stale snapshot would
+     * silently reintroduce the staleness this guard exists to close.
+     */
+    async syncTableToLatest() {
+        const table = this.table;
+        if (table && typeof table.checkoutLatest === "function") {
+            await table.checkoutLatest();
+        }
+    }
+    /**
      * Atomic supersede-and-store: re-discovers the target rows, inserts the new
      * row, and invalidates every confirmed target inside ONE write-lock +
      * serialized-update section. The caller's advisory discovery only decides
@@ -2115,6 +2129,11 @@ export class MemoryStore {
     async storeSuperseding(options) {
         await this.ensureInitialized();
         const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+            // The cross-process lock serializes writers but does not refresh this
+            // handle's read snapshot: with a second store instance and a nonzero
+            // readConsistencyInterval, the locked re-discovery could miss the
+            // preceding writer's commit and leave both replacements active.
+            await this.syncTableToLatest();
             const targets = await options.discoverTargets();
             const fullEntry = {
                 ...options.entry,

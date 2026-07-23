@@ -514,4 +514,86 @@ describe("manual supersede commits atomically at the store layer (real store)", 
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("a second store instance with a stale read snapshot still supersedes the first instance's replacement (nonzero readConsistencyInterval)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "supersede-xinst-"));
+    const makeInstance = () => {
+      const store = new MemoryStore({ dbPath: dir, vectorDim: 3, readConsistencyInterval: 30 });
+      const context = {
+        agentId: "main",
+        workspaceDir: "/tmp",
+        mdMirror: null,
+        manualStoreSupersede: true,
+        scopeManager: {
+          getAccessibleScopes: (agentId) => ["global", `agent:${agentId}`],
+          getScopeFilter: (agentId) => ["global", `agent:${agentId}`],
+          isAccessible: (scope, agentId) => ["global", `agent:${agentId}`].includes(scope),
+          getDefaultScope: (agentId) => `agent:${agentId}`,
+        },
+        retriever: {
+          getConfig() {
+            return { mode: "hybrid" };
+          },
+        },
+        store,
+        embedder: {
+          async embedPassage() {
+            return [1, 0, 0];
+          },
+        },
+      };
+      return { context, store };
+    };
+    const first = makeInstance();
+    const second = makeInstance();
+    try {
+      const factKey = deriveFactKey("preferences", "favorite drink: cola");
+      await first.store.store({
+        text: "favorite drink: cola",
+        vector: [1, 0, 0],
+        category: "preference",
+        scope: "agent:main",
+        importance: 0.7,
+        metadata: JSON.stringify({
+          memory_category: "preferences",
+          fact_key: factKey,
+          source: "manual",
+          state: "confirmed",
+          l0_abstract: "favorite drink: cola",
+        }),
+      });
+
+      // Arm the second instance's table snapshot BEFORE the first writer's
+      // supersede commits: with a 30s consistency interval this handle keeps
+      // serving that snapshot, so its locked recheck reads stale unless the
+      // store re-syncs the handle under the lock.
+      await second.store.list(undefined, undefined, 10, 0);
+
+      const toolA = createToolSet(first.context).get("memory_store");
+      const toolB = createToolSet(second.context).get("memory_store");
+
+      const resA = await toolA.execute(null, { text: "favorite drink: tea", category: "preference" });
+      assert.equal(resA.details.action, "superseded");
+
+      const resB = await toolB.execute(null, { text: "favorite drink: coffee", category: "preference" });
+      assert.equal(resB.details.action, "superseded");
+
+      const verifyStore = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+      const rows = await verifyStore.list(undefined, undefined, 100, 0);
+      const now = Date.now();
+      const activeSameKey = rows.filter((row) => {
+        const meta = parseSmartMetadata(row.metadata, row);
+        const key = meta.fact_key ?? deriveFactKey(meta.memory_category, row.text);
+        return key === factKey && isMemoryActiveAt(meta, now);
+      });
+      assert.equal(
+        activeSameKey.length,
+        1,
+        `the serialized writers must converge on one active row even across stale instance snapshots (got: ${activeSameKey.map((row) => row.text).join(" | ")})`,
+      );
+      assert.equal(activeSameKey[0].text, "favorite drink: coffee", "the last writer's replacement must be the surviving active row");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
