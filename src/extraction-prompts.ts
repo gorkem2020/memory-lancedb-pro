@@ -678,6 +678,14 @@ export function buildGroundingRejudgePrompt(
     grounding: string;
   }>,
 ): SplitPrompt {
+  // The reviewer judges the conversation as one whole; the extractor's
+  // context-vs-new distinction is noise here. Normalize the context tags to
+  // the plain speaker tags so no "context" concept reaches the judge.
+  const reviewTranscript = conversationText
+    .replaceAll("<context_only_user_turn>", "<user_message>")
+    .replaceAll("</context_only_user_turn>", "</user_message>")
+    .replaceAll("<context_only_assistant_turn>", "<assistant_message>")
+    .replaceAll("</context_only_assistant_turn>", "</assistant_message>");
   const candidateList = candidates
     .map(
       (c) =>
@@ -716,7 +724,7 @@ Return JSON only (the raw object, no markdown code fences):
 Include every candidate index exactly once.`;
 
   const user = `## Conversation
-${conversationText}
+${reviewTranscript}
 
 ## First-pass register
 "${conversationRegister}"

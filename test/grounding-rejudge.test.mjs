@@ -67,6 +67,24 @@ const { buildGroundingRejudgePrompt } = jiti("../src/extraction-prompts.ts");
     assert.ok(order[0] < order[1] && order[1] < order[2], "user sections keep the prescribed order");
 }
 
+// The reviewer must never see the extractor's context concept: context tags in
+// the incoming transcript are normalized to the plain speaker tags.
+{
+    const tagged = [
+        "<context_only_user_turn>\nolder user turn\n</context_only_user_turn>",
+        "<context_only_assistant_turn>\nassistant reply\n</context_only_assistant_turn>",
+        "<user_message>\nnewest turn\n</user_message>",
+    ].join("\n");
+    const built = buildGroundingRejudgePrompt(tagged, "mixed", [
+        { index: 1, category: "events", abstract: "a", content: "c", grounding: "real" },
+    ]);
+    const user = typeof built === "string" ? built : built.user;
+    assert.ok(!user.includes("context_only_"), "no context tag may reach the reviewer");
+    assert.ok(user.includes("<user_message>\nolder user turn\n</user_message>"), "context user turns become plain user_message blocks");
+    assert.ok(user.includes("<assistant_message>\nassistant reply\n</assistant_message>"), "context assistant turns become plain assistant_message blocks");
+    assert.ok(user.includes("<user_message>\nnewest turn\n</user_message>"), "the newest turn is untouched");
+}
+
 const EMBEDDING_DIMENSIONS = 2560;
 
 function createEmbeddingServer() {
