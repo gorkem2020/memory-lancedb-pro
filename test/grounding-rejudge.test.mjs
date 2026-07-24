@@ -39,6 +39,33 @@ const { MemoryStore } = jiti("../src/store.ts");
 const { createEmbedder } = jiti("../src/embedder.ts");
 const { SmartExtractor } = jiti("../src/smart-extractor.ts");
 const { createLlmClient } = jiti("../src/llm-client.ts");
+const { buildGroundingRejudgePrompt } = jiti("../src/extraction-prompts.ts");
+
+// Structural pin, shape-agnostic: on the split shape the doctrine lives in the
+// system half and the three data sections ride the user half; on the
+// single-string shape the same texts are concatenated in that order.
+{
+    const built = buildGroundingRejudgePrompt("conv text", "mixed", [
+        { index: 1, category: "preferences", abstract: "a", content: "c", grounding: "real" },
+    ]);
+    const system = typeof built === "string" ? built : built.system;
+    const user = typeof built === "string" ? built : built.user;
+    assert.ok(
+        system.startsWith("You are a grounding reviewer for a memory system."),
+        "the system half must open with the focused identity",
+    );
+    assert.ok(system.includes("Your verdict is final."), "the one-liner task must sit in the opening paragraph");
+    assert.ok(system.includes("## How to judge") && system.includes("## Output"), "doctrine and contract live in the system half");
+    for (const header of ["## Conversation", "## First-pass register", "## Candidate memories"]) {
+        assert.ok(user.includes(header), `user half must carry ${header}`);
+    }
+    if (typeof built !== "string") {
+        assert.ok(!built.system.includes("## Conversation"), "no data section may leak into the system half");
+        assert.ok(!built.user.includes("## How to judge"), "no doctrine may leak into the user half");
+    }
+    const order = ["## Conversation", "## First-pass register", "## Candidate memories"].map((h) => user.indexOf(h));
+    assert.ok(order[0] < order[1] && order[1] < order[2], "user sections keep the prescribed order");
+}
 
 const EMBEDDING_DIMENSIONS = 2560;
 

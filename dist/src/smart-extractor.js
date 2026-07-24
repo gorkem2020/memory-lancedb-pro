@@ -856,7 +856,7 @@ export class SmartExtractor {
                 content: String(m.content ?? "").trim().slice(0, 400),
                 grounding: isRawConstructed(m) ? "constructed" : "real",
             })));
-            const verdict = await this.llm.completeJson(rejudgePrompt, "grounding-rejudge");
+            const verdict = await this.llm.completeJson(rejudgePrompt.user, "grounding-rejudge", rejudgePrompt.system);
             const verdictResults = verdict && Array.isArray(verdict.results) ? verdict.results : null;
             if (!verdictResults) {
                 rejudgeFailedClosed = true;

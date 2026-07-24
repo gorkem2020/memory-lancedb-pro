@@ -663,7 +663,9 @@ ${blocks.join("\n\n")}`;
  * Scoped second pass fired only when the extraction's register verdict and its
  * per-item grounding tags are incoherent (e.g. register says fiction exists but
  * no item is tagged constructed), or when real-tagged durables sit beside
- * constructed siblings. One call; its verdict is final.
+ * constructed siblings. One call; its verdict is final. The doctrine lives in
+ * the system half; the conversation, first-pass register, and candidate rows
+ * ride the user half.
  */
 export function buildGroundingRejudgePrompt(
   conversationText: string,
@@ -675,7 +677,7 @@ export function buildGroundingRejudgePrompt(
     content: string;
     grounding: string;
   }>,
-): string {
+): SplitPrompt {
   const candidateList = candidates
     .map(
       (c) =>
@@ -683,20 +685,11 @@ export function buildGroundingRejudgePrompt(
     )
     .join("\n");
 
-  return `You are a grounding reviewer for a memory system. A first pass read the conversation below, judged its register, and tagged each candidate memory's grounding. Those two judgments do not fit together, so you must re-judge them. Your verdict is final.
-
-## Conversation
-${conversationText}
-
-## First-pass register
-"${conversationRegister}"
-
-## Candidate memories
-${candidateList}
-
-## How to judge
+  const system = `You are a grounding reviewer for a memory system. A first pass read a conversation, judged its register, and tagged each candidate memory's grounding. The register and the grounding tags do not fit together, so you must re-judge them. Your verdict is final.
 
 Factual content is actual, real, and certain — it describes the actual user and the real world. Hypothetical content is supposed, imagined, speculative, conjectural, or fictional — it holds only inside a "what if", a premise, a thought experiment, or a made-up situation.
+
+## How to judge
 
 1. Re-judge the register of the WHOLE conversation:
    - "real": every part is factual.
@@ -706,9 +699,11 @@ Factual content is actual, real, and certain — it describes the actual user an
 
 2. Re-tag each candidate's grounding by the stretch its claim comes from:
    - "real": the claim comes from a factual stretch — the user said it as themselves, about the real world. Name that stretch to yourself; if you cannot, the tag is "constructed".
-   - "constructed": the claim comes from a hypothetical stretch — including the premise of a what-if question, and including everyday-sounding details spoken from inside a made-up situation.
+   - "constructed": the claim comes from a hypothetical stretch — including the premise of a what-if question, and everyday-sounding details spoken from inside a made-up situation.
    One-line rule: about-the-hypothetical is real; within-the-hypothetical is constructed. A note THAT the user explored a hypothetical is "real"; every claim living INSIDE the hypothetical is "constructed".
    If you are genuinely unsure about an item, tag it "constructed" — a wrongly stored fact is worse than a missed one.
+
+## Output
 
 Return JSON only (the raw object, no markdown code fences):
 {
@@ -719,4 +714,15 @@ Return JSON only (the raw object, no markdown code fences):
 }
 
 Include every candidate index exactly once.`;
+
+  const user = `## Conversation
+${conversationText}
+
+## First-pass register
+"${conversationRegister}"
+
+## Candidate memories
+${candidateList}`;
+
+  return { system, user };
 }
