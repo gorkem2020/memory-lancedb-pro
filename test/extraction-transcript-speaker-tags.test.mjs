@@ -167,20 +167,20 @@ describe("buildExtractionPrompt speaker teaching", () => {
   it("teaches the symmetric context tags when the context window is on (captureAssistant=false)", () => {
     const { system, user } = buildExtractionPrompt(transcript, "User", { contextWindow: true });
     assert.ok(
-      user.includes("<context_assistant_message>...</context_assistant_message> wraps ONE message written by the AI assistant. Context only"),
-      "format teaching must describe self replies as context_assistant_message",
+      user.includes("<context_only_assistant_turn>...</context_only_assistant_turn> wraps ONE message written by the AI assistant. Context only"),
+      "format teaching must describe self replies as context_only_assistant_turn",
     );
     assert.ok(
-      user.includes("<context_user_message>...</context_user_message> wraps a user message that was ALREADY processed by a previous extraction run."),
+      user.includes("<context_only_user_turn>...</context_only_user_turn> wraps a user message that was ALREADY processed by a previous extraction run."),
       "format teaching must describe processed user turns",
     );
     assert.ok(
       user.includes("a fact that appears only in a context block must not be stored"),
-      "the context-only storage rule now rides the context_user_message bullet",
+      "the context-only storage rule now rides the context_only_user_turn bullet",
     );
     assert.ok(
-      user.indexOf("<context_user_message>") < user.indexOf("<user_message>..."),
-      "the context_user_message bullet leads the tag list",
+      user.indexOf("<context_only_user_turn>") < user.indexOf("<user_message>..."),
+      "the context_only_user_turn bullet leads the tag list",
     );
     assert.ok(user.includes("wraps ONE NEW message written by the human user."), "user_message is taught as the NEW delta");
     assert.ok(

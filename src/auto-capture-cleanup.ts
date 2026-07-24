@@ -254,7 +254,7 @@ export interface ConversationTurn {
  * can no longer be confused with transcript structure.
  */
 export function neutralizeSpeakerTagSpoof(text: string): string {
-  return text.replace(/<(\/?)((?:context_)?(?:user|assistant)_message)>/g, "‹$1$2›");
+  return text.replace(/<(\/?)((?:context_)?(?:user|assistant)_message|context_only_(?:user|assistant)_turn)>/g, "‹$1$2›");
 }
 
 /**
@@ -276,10 +276,10 @@ export function formatConversationTranscript(
       const tag =
         turn.role === "user"
           ? turn.context
-            ? "context_user_message"
+            ? "context_only_user_turn"
             : "user_message"
           : turn.context || options.assistantContextOnly === true
-            ? "context_assistant_message"
+            ? "context_only_assistant_turn"
             : "assistant_message";
       return `<${tag}>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</${tag}>`;
     })
@@ -296,7 +296,7 @@ export function trimTranscriptToTagBoundary(transcript: string, maxChars: number
     return transcript;
   }
   const sliced = transcript.slice(-maxChars);
-  const tagStarts = ["<user_message>", "<assistant_message>", "<context_user_message>", "<context_assistant_message>"]
+  const tagStarts = ["<user_message>", "<assistant_message>", "<context_only_user_turn>", "<context_only_assistant_turn>"]
     .map((tag) => sliced.indexOf(tag))
     .filter((index) => index >= 0);
   if (tagStarts.length === 0) {
