@@ -658,3 +658,65 @@ ${blocks.join("\n\n")}`;
 
   return { system, user };
 }
+
+/**
+ * Scoped second pass fired only when the extraction's register verdict and its
+ * per-item grounding tags are incoherent (e.g. register says fiction exists but
+ * no item is tagged constructed), or when real-tagged durables sit beside
+ * constructed siblings. One call; its verdict is final.
+ */
+export function buildGroundingRejudgePrompt(
+  conversationText: string,
+  conversationRegister: string,
+  candidates: Array<{
+    index: number;
+    category: string;
+    abstract: string;
+    content: string;
+    grounding: string;
+  }>,
+): string {
+  const candidateList = candidates
+    .map(
+      (c) =>
+        `${c.index}. [${c.category}] (first-pass grounding: "${c.grounding}")\n   Abstract: ${c.abstract}\n   Content: ${c.content}`,
+    )
+    .join("\n");
+
+  return `You are a grounding reviewer for a memory system. A first pass read the conversation below, judged its register, and tagged each candidate memory's grounding. Those two judgments do not fit together, so you must re-judge them. Your verdict is final.
+
+## Conversation
+${conversationText}
+
+## First-pass register
+"${conversationRegister}"
+
+## Candidate memories
+${candidateList}
+
+## How to judge
+
+Factual content is actual, real, and certain — it describes the actual user and the real world. Hypothetical content is supposed, imagined, speculative, conjectural, or fictional — it holds only inside a "what if", a premise, a thought experiment, or a made-up situation.
+
+1. Re-judge the register of the WHOLE conversation:
+   - "real": every part is factual.
+   - "fiction": the whole conversation sits inside one hypothetical frame.
+   - "mixed": factual and hypothetical content appear together.
+   Mark to yourself which stretches of the conversation are hypothetical and which are factual. A stretch turns hypothetical the moment the user pretends, imagines a situation, supposes a premise, or speaks as if from inside a made-up situation; it turns factual again only when the user drops that frame.
+
+2. Re-tag each candidate's grounding by the stretch its claim comes from:
+   - "real": the claim comes from a factual stretch — the user said it as themselves, about the real world. Name that stretch to yourself; if you cannot, the tag is "constructed".
+   - "constructed": the claim comes from a hypothetical stretch — including the premise of a what-if question, and including everyday-sounding details spoken from inside a made-up situation.
+   One-line rule: about-the-hypothetical is real; within-the-hypothetical is constructed. A note THAT the user explored a hypothetical is "real"; every claim living INSIDE the hypothetical is "constructed".
+   If you are genuinely unsure about an item, tag it "constructed" — a wrongly stored fact is worse than a missed one.
+
+Return JSON only (the raw object, no markdown code fences):
+{
+  "conversation_register": "real|mixed|fiction",
+  "results": [
+    { "index": 1, "grounding": "real|constructed", "reason": "one short sentence naming the stretch the claim rests on" }
+  ]
+}
+
+Include every candidate index exactly once.`;
+}
