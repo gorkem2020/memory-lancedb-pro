@@ -57,8 +57,8 @@ describe("prompt under captureAssistant=false (default)", () => {
     assert.ok(!user.includes("<assistant_message> blocks are context"));
   });
 
-  it("keeps the user-only grounding contract", () => {
-    assert.ok(system.includes("Memories may only be grounded here."));
+  it("keeps the user-only extraction contract", () => {
+    assert.ok(user.includes("Memories may be extracted only from here."));
     assert.ok(user.includes("Extract memory candidates ONLY from <user_message> blocks."));
   });
 });
@@ -71,8 +71,8 @@ describe("prompt under captureAssistant=true", () => {
   );
 
   it("documents assistant blocks in the transcript format, without the authorship over-explanation", () => {
-    assert.ok(system.includes("wraps ONE message written by the AI assistant"));
-    assert.ok(!system.includes("Every line inside it"));
+    assert.ok(user.includes("wraps ONE message written by the AI assistant"), "the block legend rides the user-prompt format section");
+    assert.ok(!(system + user).includes("Every line inside it"));
   });
 
   it("carries the simplified source and attribution rules", () => {
@@ -86,8 +86,8 @@ describe("prompt under captureAssistant=true", () => {
     assert.ok(!user.includes("Extract memory candidates ONLY from <user_message> blocks."));
   });
 
-  it("drops the user-only grounding suffix", () => {
-    assert.ok(!system.includes("Memories may only be grounded here."));
+  it("drops the user-only extraction suffix", () => {
+    assert.ok(!(system + user).includes("Memories may be extracted only from here."));
   });
 });
 
@@ -113,8 +113,8 @@ describe("user-half layout (both modes)", () => {
   });
 
   it("avoids the overloaded 'conversation in the user message' phrasing", () => {
-    const { system } = buildExtractionPrompt("t", "User");
-    assert.ok(!system.includes("conversation in the user message"));
-    assert.ok(system.includes("The conversation is a sequence of tagged blocks"));
+    const { system, user } = buildExtractionPrompt("t", "User");
+    assert.ok(!(system + user).includes("conversation in the user message"));
+    assert.ok(user.includes("The conversation is written as tagged blocks"), "the format intro rides the user-prompt legend");
   });
 });

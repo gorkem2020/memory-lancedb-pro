@@ -278,7 +278,7 @@ describe("pair-window retention across successful extractions", () => {
     const first = extractionPrompts[0];
     assert.ok(first.includes(`<context_assistant_message>\n${A1}`), "self replies must appear as context_assistant_message blocks");
     assert.ok(first.includes("Context only"), "the prompt must teach the assistant tag as context");
-    assert.ok(first.includes("NEVER extract memories from them"), "the context-only extraction rule must be present");
+    assert.ok(first.includes("a fact that appears only in a context block must not be stored"), "the context-only extraction rule must be present");
     assert.ok(!/(?<!context_)<assistant_message>/.test(first) && !first.includes("\n<assistant_message>"), "no eligible assistant tag may appear under captureAssistant=false");
 
     await fireAgentEnd(hook, turnMessages(6), ctx);
@@ -408,7 +408,7 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(prompt.includes("ceramic planter"), "the user text stays extractable");
     assert.ok(!prompt.includes("must never become a source"), "assistant text is excluded on groups despite captureAssistant=true");
     assert.ok(!prompt.includes("also valid sources"), "the eligible-mode prompt teaching must not appear on groups");
-    assert.ok(prompt.includes("Memories may only be grounded here."), "groups fall back to user-only grounding teaching");
+    assert.ok(prompt.includes("Memories may be extracted only from here."), "groups fall back to user-only extraction teaching");
   });
 
   it("keeps captureAssistant=true fully live on direct session keys (both eligible tags on the new delta)", async () => {

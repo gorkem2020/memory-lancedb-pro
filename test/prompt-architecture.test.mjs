@@ -57,8 +57,9 @@ describe("buildExtractionPrompt system/user split", () => {
     assert.match(system, /extraction agent/i);
     assert.match(system, /Memory Extraction Criteria/i);
     assert.match(system, /Memory Classification/i);
-    assert.match(system, /Few-shot Examples/i);
+    assert.doesNotMatch(system, /Few-shot Examples/i, "the example-free prompt ships without the few-shot block");
     assert.match(system, /Output Format/i);
+    assert.doesNotMatch(system, /## Transcript format/, "the format legend lives in the user prompt, beside the conversation it describes");
   });
 
   it("user carries only the per-call data, not the static criteria", () => {
@@ -526,13 +527,16 @@ describe("identity-first prompt openers", () => {
 });
 
 describe("extraction transcript block and assistant-line policy", () => {
-  it("embeds the tag-wrapped conversation unfenced under the header, behind the user_message-only reminder", () => {
+  it("embeds the tag-wrapped conversation unfenced under the header, behind the scope reminder, format legend, and reading-order line", () => {
     const transcript = "<user_message>\nhi\n</user_message>\n<assistant_message>\nhello\n</assistant_message>";
     const { user } = buildExtractionPrompt(transcript, "User");
-    assert.match(
-      user,
-      /Extract memory candidates ONLY from <user_message> blocks\.\n\n## Recent Conversation\n<user_message>\nhi\n<\/user_message>/,
-    );
+    assert.match(user, /Extract memory candidates ONLY from <user_message> blocks\./);
+    const scopeAt = user.indexOf("Extract memory candidates ONLY");
+    const formatAt = user.indexOf("## Transcript format");
+    const readingAt = user.indexOf("Read the conversation in chronological order");
+    const convoAt = user.indexOf("## Recent Conversation\n<user_message>\nhi\n</user_message>");
+    assert.ok(scopeAt >= 0 && formatAt > scopeAt && readingAt > formatAt && convoAt > readingAt,
+      "user prompt order must be: scope reminder -> Transcript format -> reading-order -> Recent Conversation");
     assert.doesNotMatch(user, /```/, "speaker tags replaced the code fence as the transcript delimiter");
   });
 
@@ -550,8 +554,8 @@ describe("extraction transcript block and assistant-line policy", () => {
   });
 
   it("adds the assistant-block format and source rule when assistant turns are capture-eligible", () => {
-    const { system } = buildExtractionPrompt("t", "User", { assistantEligible: true });
+    const { system, user } = buildExtractionPrompt("t", "User", { assistantEligible: true });
     assert.match(system, /also valid sources/);
-    assert.match(system, /wraps ONE message written by the AI assistant/);
+    assert.match(user, /wraps ONE message written by the AI assistant/, "the block legend rides the user-prompt format section");
   });
 });

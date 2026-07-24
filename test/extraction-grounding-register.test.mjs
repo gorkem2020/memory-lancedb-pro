@@ -284,8 +284,8 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
 
     assert.match(prompt, /grounding/i);
     assert.match(prompt, /"real"\s*\|\s*"constructed"|real.*constructed/i);
-    assert.match(prompt, /about-the-fiction is real/i, "the v3 about/within one-line rule must be present");
-    assert.match(prompt, /within-the-fiction/i, "the within-the-fiction definition of constructed must be present");
+    assert.match(prompt, /about-the-hypothetical is real/i, "the about/within one-line rule must be present in its generalized form");
+    assert.match(prompt, /within-the-hypothetical/i, "the within-the-hypothetical definition of constructed must be present");
     assert.doesNotMatch(prompt, /at most one/i, "the per-extraction constructed cap must be fully removed from the prompt");
   });
 
@@ -534,7 +534,8 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
 
     assert.match(prompt, /conversation_register/);
     assert.match(prompt, /"real\|mixed\|fiction"/);
-    assert.match(prompt, /self-consistency/i, "the batch self-consistency instruction must be present");
+    assert.match(prompt, /Check before you answer \(only when the register is "fiction" or "mixed"\)/, "the register-scoped final check must be present");
+    assert.match(prompt, /name to yourself the factual stretch/i, "the per-item provenance obligation must be present");
     assert.doesNotMatch(prompt, /storage rule applied after tagging/i, "the deleted per-extraction cap language must not remain in the prompt");
   });
 });

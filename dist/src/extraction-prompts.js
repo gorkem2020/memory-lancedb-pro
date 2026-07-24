@@ -35,36 +35,37 @@ export function buildExtractionPrompt(conversationText, user, options = {}) {
     const assistantEligible = options.assistantEligible === true;
     const contextWindow = options.contextWindow === true;
     const assistantContext = !assistantEligible && contextWindow;
+    const contextUserBullet = contextWindow
+        ? `
+- <context_user_message>...</context_user_message> wraps a user message that was ALREADY processed by a previous extraction run. Context only — do not extract it again; a fact that appears only in a context block must not be stored. You may use it, if needed, to understand the conversation's flow and what the user means.`
+        : "";
+    const userGroundingSuffix = assistantEligible ? "" : " Memories may be extracted only from here.";
     const assistantFormatBullet = assistantEligible
         ? `
 - <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.`
         : assistantContext
             ? `
-- <context_assistant_message>...</context_assistant_message> wraps ONE message written by the AI assistant. Context only — use it to resolve what the user meant (pronouns, follow-ups, corrections); it is NEVER a source of memories.`
+- <context_assistant_message>...</context_assistant_message> wraps ONE message written by the AI assistant. Context only — you may use it, if needed, to resolve what the user meant (pronouns, follow-ups, corrections); it is never a source of memories.`
             : "";
-    const contextUserBullet = contextWindow
-        ? `
-- <context_user_message>...</context_user_message> wraps a user message that was ALREADY processed by a previous extraction run. Context only — do not extract it again.`
-        : "";
     const contextAssistantEligibleBullet = contextWindow && assistantEligible
         ? `
 - <context_assistant_message>...</context_assistant_message> wraps an assistant message that was ALREADY processed by a previous extraction run. Context only.`
         : "";
-    const userGroundingSuffix = assistantEligible ? "" : " Memories may only be grounded here.";
     const assistantBlocksRule = assistantEligible
         ? `
 - <assistant_message> blocks: also valid sources — but only for concrete facts the user did not correct. Skip the assistant's greetings, guesses, and self-description.
 - Attribute every memory to whoever actually said it. When both said it, use the <user_message> version.${contextWindow ? `
 - <context_user_message> and <context_assistant_message> blocks: already processed in previous runs — NEVER extract memories from them again.` : ""}`
-        : assistantContext
-            ? `
-- <context_user_message> and <context_assistant_message> blocks: context only — NEVER extract memories from them. A fact that appears only in a context block must not be stored.`
-            : "";
+        : "";
+    // Operator adoption 2026-07-24: the Transcript format section lives in the USER
+    // prompt, directly above the conversation it describes — a deliberate exception
+    // to the system-static/user-dynamic split. Comprehension adjacency measurably
+    // improved register accuracy on the A/B bench, and a constant user prefix is
+    // caching-neutral.
+    const transcriptFormatSection = `## Transcript format
+The conversation is written as tagged blocks. Inside the Recent Conversation section, the blocks appear in chronological order. The block types are:${contextUserBullet}
+- <user_message>...</user_message> wraps ONE${contextWindow ? " NEW" : ""} message written by the human user.${userGroundingSuffix}${assistantFormatBullet}${contextAssistantEligibleBullet}`;
     const system = `${EXTRACTION_AGENT_IDENTITY} Analyze session context and extract memories worth long-term preservation.
-
-## Transcript format
-The conversation is a sequence of tagged blocks in chronological order:
-- <user_message>...</user_message> wraps ONE${contextWindow ? " NEW" : ""} message written by the human user.${userGroundingSuffix}${assistantFormatBullet}${contextUserBullet}${contextAssistantEligibleBullet}
 
 # Memory Extraction Criteria
 
@@ -82,10 +83,10 @@ The conversation is a sequence of tagged blocks in chronological order:
 - Runtime scaffolding or orchestration wrappers such as "[Subagent Context]", "[Subagent Task]", bootstrap wrappers, task envelopes, or agent instructions — these are execution metadata, NEVER store them as memories
 - Recall queries / meta-questions: "Do you remember X?", "你还记得X吗?", "你知道我喜欢什么吗" — these are retrieval requests, NOT new information to store
 - Degraded or incomplete references: If the user mentions something vaguely ("that thing I said"), do NOT invent details or create a hollow memory
-- Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete profile detail, preference, entity state, event, case, or pattern from them or skip.
+- Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete profile detail, preference, entity state, event, case, or pattern from them, or skip.
 - System/runtime artifacts: content containing "System:", compaction notices, model-switch/session-reset traces, tool-call transcripts, raw JSON blobs, or similar internal execution traces must be rejected unless a clean user fact can be extracted.
 - Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.${assistantBlocksRule}
-- Atomic memory shape: each stored memory must read like one durable fact, preference, decision, entity state, event, case, or reusable pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement or skip it.
+- Atomic memory shape: each stored memory must read like one durable fact, preference, decision, entity state, event, case, or reusable pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement, or skip it.
 - Length/distillation gate: if a candidate is longer than about 200 characters and reads like raw conversation instead of a distilled insight, rewrite it as a single factual statement before storing; if that is not possible, skip it.
 
 # Memory Classification
@@ -116,42 +117,55 @@ The conversation is a sequence of tagged blocks in chronological order:
 - "User prefers X" -> preferences (not profile)
 - "Encountered problem A, used solution B" -> cases (not events)
 - "General process for handling certain problems" -> patterns (not cases)
-- "Switched my commute to the M4" / "Spanish lesson before breakfast" -> preferences or patterns, not events: recurring or durable state and habit changes are the user's new normal, not a one-off occurrence. Reserve events for genuinely one-off happenings.
+- "Switched my commute to the M4" / "Spanish lesson before breakfast" -> preferences or patterns, not events: a change that creates a new routine or a lasting state is the user's new normal, not a one-off occurrence. Reserve events for genuinely one-off happenings.
 
 # Conversational Grounding
 
-First judge the register of the WHOLE conversation once, then tag each memory item independently.
+A conversation carries two kinds of content. Factual content is actual, real, and certain — it describes the actual user and the real world. Hypothetical content is supposed, imagined, speculative, conjectural, or fictional — it holds only inside a "what if", a premise, a thought experiment, or a made-up situation. Never store hypothetical content as a fact about the user.
 
-## Batch register (one judgment per extraction)
+Judge grounding in two steps: first judge the register of the whole conversation and mark its hypothetical stretches; then tag each memory item on its own.
 
-Set the top-level "conversation_register" field:
+## Step 1 — Conversation register and its stretches
+
+Judge the register over the whole conversation you just read. It is a property of the conversation, not of any single message. Set the top-level "conversation_register" field.
 
 | conversation_register | Meaning |
 |-----------------------|---------|
-| "real" | An ordinary working/personal conversation about the actual user and the real world |
-| "fiction" | The conversation is inside a constructed frame: a game in progress, roleplay, in-character dialogue, drafted fiction, a hypothetical scenario, or a sample-data exercise |
-| "mixed" | A constructed frame AND genuine out-of-character content are interleaved |
+| "real" | Every part is factual: about the actual user and the real world. |
+| "fiction" | The whole conversation sits inside one hypothetical frame: a what-if question, a supposed premise, a thought experiment, or a made-up situation. |
+| "mixed" | Factual content and hypothetical content appear together — for example, a genuine real-life aside dropped into a made-up situation, or a real fact stated beside a supposed one. |
 
-## Per-item grounding
+The label "fiction" covers every hypothetical frame, not only openly invented ones. A quiet what-if question or a casual thought experiment is just as hypothetical as an obvious imagined one, and is judged the same way.
 
-Grounding describes the truth-grounding of the ASSERTION ITSELF, not which register the conversation happened in. Ask: is this claim true about the real world, or true only inside the fiction?
+If the register is "fiction" or "mixed", mark to yourself — before tagging anything — which stretches of the conversation are hypothetical and which are factual. A stretch turns hypothetical the moment the user pretends, imagines a situation, supposes a premise, or speaks as if from inside a made-up situation instead of as themselves about the real world (or asks you to do the same). It turns factual again only when the user drops that frame — an explicit real-life aside, or a clear return to reality. Everything from the opening of a hypothetical stretch to its close is inside the frame, including every everyday-sounding detail in it — a preference, a belonging, a habit, a name. An ordinary detail spoken from inside a made-up situation belongs to that situation, not to the real user.
 
-Tag every memory's "grounding" field:
+## Step 2 — Per-item grounding (one tag per memory)
+
+If conversation_register is "real", the whole conversation is factual: tag every memory "real" and extract normally, exactly as you would with no frame at all. The checks in the rest of this step apply only when the register is "fiction" or "mixed".
+
+Grounding is about the CLAIM itself, not about how factual it sounds. Tag every memory's "grounding" field.
+
+For each item, find the stretch of conversation the claim comes from.
+- If that stretch is a hypothetical one you marked in Step 1 -> "constructed", even if the claim by itself sounds like an ordinary real-life fact.
+- If that stretch is a factual one -> "real", once you confirm the claim still stands on its own there.
 
 | grounding | Meaning |
 |-----------|---------|
-| "real" | The assertion is about the real world — INCLUDING an assertion ABOUT the fiction (e.g. "user and assistant played a one-round roleplay game where user was Admiral Vex" is a true statement about a real session, even though it describes fictional play). Also covers a genuine first-person aside stated in passing during a game (e.g. "btw my flight is Tuesday") |
-| "constructed" | The assertion holds only WITHIN the fiction — true in-character, in-game, or in-story, but not a fact about the real user or the real world (e.g. "user's favorite drink is plasma coffee", a persona's invented backstory, a game's score or rules) |
+| "real" | The claim comes from a factual stretch and is true about the real user or the real world on its own. |
+| "constructed" | The claim comes from a hypothetical stretch: it is supposed, imagined, speculative, or conjectural, and is not a fact about the actual user. |
 
-One-line rule: **about-the-fiction is real; within-the-fiction is constructed.**
+One-line rule: **about-the-hypothetical is real; within-the-hypothetical is constructed.**
 
 Rules:
-- Grounding is judged PER ITEM, on that item's own content. There is no expected number of "real" or "constructed" tags per batch: a batch may be all-real, all-constructed, or anything between.
-- A session-scoped "events" note that the real participants engaged in a game, roleplay, or other fiction is a REAL assertion — it is a true statement about what happened in the real session, not a claim that lives inside the fiction. Extract it like any other events item, under its natural category, with grounding "real".
-- Do NOT lift any in-character proposition — an invented rule, a score, a bet, a persona's claim, a fictional preference or trait — into profile, preferences, entities, cases, or patterns. Such claims are true only within the fiction; if you extract one at all, tag it "constructed" so it is never mistaken for a fact about the real user.
-- A real aside spoken during play is still "real" and should be extracted normally under its natural category, even though it occurred inside a constructed register.
-- Self-consistency check before answering: an item asserting what happened in the real session (including a session that was itself a game) is "real"; an item asserting a claim that is only true inside the story/game/persona is "constructed". If your draft tags the session-summary note itself as "constructed", re-check — it almost certainly describes a real event and should be "real".
-- If you are genuinely unsure about a single item, default to "constructed" — this lane is best-effort: a wrongly-stored "fact" is worse than a lost capture, and anything important can still be stored deliberately (the memory_store tool, or the user asking to remember it).
+- The premise of a question is not a fact. A message that supposes something in order to ask about it asserts nothing actual about the user. Tag anything taken from the premise "constructed".
+- A claim from a hypothetical stretch stays "constructed" even when the user really typed it, even when it sounds ordinary, and even after you distill it into one clean sentence. Distilling supposed content does not make it real; the tidy sentence still describes something from inside the frame. Tag by which stretch the claim comes from, not by how factual the summary reads.
+- Do not lift any within-frame detail — an imagined possession, an imagined situation, a supposed preference or trait — into profile, preferences, entities, cases, or patterns as if it were true. If you record it at all, tag it "constructed".
+- Do not store a generalized taste for the made-up. An item that says the user likes, enjoys, or is interested in supposed, imagined, or made-up activity is speculative — tag it "constructed". That the user did such a thing once is a real event (next rule); that they "enjoy" or "prefer" it is an inference, not a stated fact.
+- A genuine factual aside stays "real", even when it sits in the middle of a hypothetical stretch. Extract it normally under its natural category. It is real because it comes from a factual stretch the user stepped into, not because it sits near the frame.
+- A note THAT the real user explored a hypothetical is itself "real" — a true statement about what happened in the real session. Record it as an "events" item with grounding "real". Keep it as a one-time event; do not restate it as a durable preference or trait.
+- If you are genuinely unsure about a single item, default to "constructed". A wrongly stored fact is worse than a missed one, and anything important can still be saved deliberately later.
+
+Check before you answer (only when the register is "fiction" or "mixed"): for every item you tagged "real", name to yourself the factual stretch it rests on — the real-life words the user said as themselves about the real world. If you cannot name one, change it to "constructed". Exception: a note that the session explored a hypothetical stays "real" because the exploring really happened; but an item about the user liking or enjoying made-up activity is not such a note — tag it "constructed".
 
 # Three-Level Structure
 
@@ -165,86 +179,10 @@ Each memory contains three levels:
 
 **content (L2)**: Full narrative with background and details
 
-# Few-shot Examples
-
-Each example is a full output batch, because register and grounding are judged together.
-
-## Ordinary working conversation (register "real", single memory)
-{
-  "conversation_register": "real",
-  "memories": [
-    {
-      "category": "cases",
-      "abstract": "LanceDB BigInt numeric handling issue",
-      "overview": "## Problem\\nLanceDB 0.26+ returns BigInt for numeric columns\\n\\n## Solution\\nCoerce values with Number(...) before arithmetic",
-      "content": "When LanceDB returns BigInt values, wrap them with Number() before doing arithmetic operations.",
-      "grounding": "real"
-    }
-  ]
-}
-
-## Ordinary personal conversation (register "real", two memories)
-{
-  "conversation_register": "real",
-  "memories": [
-    {
-      "category": "profile",
-      "abstract": "User basic info: AI development engineer, 3 years LLM experience",
-      "overview": "## Background\\n- Occupation: AI development engineer\\n- Experience: 3 years LLM development\\n- Tech stack: Python, LangChain",
-      "content": "User is an AI development engineer with 3 years of LLM application development experience.",
-      "grounding": "real"
-    },
-    {
-      "category": "preferences",
-      "abstract": "Python code style: No type hints, concise and direct",
-      "overview": "## Preference Domain\\n- Language: Python\\n- Topic: Code style\\n\\n## Details\\n- No type hints\\n- Concise function comments\\n- Direct implementation",
-      "content": "User prefers Python code without type hints, with concise function comments.",
-      "grounding": "real"
-    }
-  ]
-}
-
-## Mid-game conversation (register "fiction", session note is real; canon is not extracted)
-Input was one round of an in-character guessing game where a persona claimed to live on a moon base and named an invented drink.
-{
-  "conversation_register": "fiction",
-  "memories": [
-    {
-      "category": "events",
-      "abstract": "agent-one and agent-two ran a two-round puzzle exercise",
-      "overview": "## What happened\\n- Two agents played a puzzle guessing game with invented rules and a bet",
-      "content": "agent-one and agent-two ran a two-round puzzle guessing exercise. The house rules, scores, and bet are part of the game, not durable facts.",
-      "grounding": "real"
-    }
-  ]
-}
-Note: the persona's home, the invented drink, the house rule, and the bet are NOT extracted at all — not as profile, not as preferences, not as entities. This session note is a true statement about a real session (the session happened), so it carries grounding "real" even though the batch register is "fiction" — about-the-fiction is real.
-
-## Game with a genuine out-of-character aside (register "mixed")
-{
-  "conversation_register": "mixed",
-  "memories": [
-    {
-      "category": "events",
-      "abstract": "User mentioned their new laptop arrives Thursday",
-      "overview": "## Real-world aside\\n- Stated in passing during a game",
-      "content": "In the middle of the game the user mentioned, out of character, that their new laptop arrives Thursday.",
-      "grounding": "real"
-    },
-    {
-      "category": "events",
-      "abstract": "User and assistant played a riddle game",
-      "overview": "## What happened\\n- One riddle game session",
-      "content": "User and assistant played a short riddle game this session.",
-      "grounding": "real"
-    }
-  ]
-}
-
 # Output Format
 
 Return JSON only (the raw object, no markdown code fences):
-${jsonShape(`{
+{
   "conversation_register": "real|mixed|fiction",
   "memories": [
     {
@@ -255,23 +193,30 @@ ${jsonShape(`{
       "grounding": "real|constructed"
     }
   ]
-}`)}
+}
 
 Notes:
 - Output language should match the dominant language in the conversation
 - Only extract truly valuable personalized information
-- If nothing worth recording, return {"conversation_register": "real|mixed|fiction", "memories": []}
+- If nothing is worth recording, return {"conversation_register": "real|mixed|fiction", "memories": []}
 - Maximum 5 memories per extraction
 - Preferences should be aggregated by topic
 - Always set the top-level "conversation_register" field, and tag every memory's "grounding" field, per the Conversational Grounding rules above`;
     // "User: User" with the default generic identity confused live agents;
     // the name line only appears when a real name is configured.
     const userNameLine = user && user !== "User" ? `User: ${user}\n\n` : "";
+    const readingOrder = `Read the conversation in chronological order, top to bottom, and understand it as a whole before extracting anything. ${assistantEligible
+        ? "Extraction draws from the <user_message> and <assistant_message> blocks — but interpret each one through your understanding of the full conversation, not in isolation."
+        : "Extraction still draws only from the <user_message> blocks — but interpret each one through your understanding of the full conversation, not in isolation."} As you read, notice which stretches describe the real world and which step into a supposed, imagined, or made-up frame.`;
     const userMessage = `${userNameLine}Target Output Language: auto (detect from recent messages)
 
 ${assistantEligible
         ? "Extract memory candidates from <user_message> and <assistant_message> blocks, attributed to their true speaker."
         : "Extract memory candidates ONLY from <user_message> blocks."}
+
+${transcriptFormatSection}
+
+${readingOrder}
 
 ## Recent Conversation
 ${conversationText}`;
