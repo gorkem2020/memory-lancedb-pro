@@ -314,6 +314,8 @@ interface PluginConfig {
     maxConcurrentRuns?: number;
     /** Agent/session patterns excluded from reflection injection. Supports exact match, wildcard prefix (e.g. "pi-"), and "temp:*". */
     excludeAgents?: string[];
+    /** Run the reflection distiller for group-chat sessions (session keys carrying a ":group:" or ":channel:" segment). Default: true. Set false to skip reflection generation on group channels. */
+    includeGroupChats?: boolean;
   };
   mdMirror?: { enabled?: boolean; dir?: string };
   workspaceBoundary?: WorkspaceBoundaryConfig;
@@ -1216,6 +1218,31 @@ function asNonEmptyString(value: unknown): string | undefined {
 
 function isInternalReflectionSessionKey(sessionKey: unknown): boolean {
   return typeof sessionKey === "string" && sessionKey.trim().startsWith("temp:memory-reflection");
+}
+
+// Multi-party vs direct peer kinds at the session key's STRUCTURAL kind
+// position, mirroring core's parseSessionDeliveryRoute shape
+// (src/sessions/session-key-utils.ts): agent:<agentId>:<channel>:<peerKind>:
+// <opaque peer id...>, with an optional ":thread:<id>" suffix. The peer id
+// tail is opaque and may itself contain segments like ":channel:" (e.g.
+// "agent:main:discord:direct:user:channel:1" is a DIRECT route), so only the
+// kind position may decide -- never a full-key search. Unrecognized shapes
+// (main sessions, subagents, account-scoped forms, cron) fail toward
+// generating reflections, matching the toggle's enabled default.
+const GROUP_SESSION_PEER_KINDS = new Set(["group", "channel", "room"]);
+
+function isGroupChatSessionKey(sessionKey: string | undefined): boolean {
+  if (typeof sessionKey !== "string" || sessionKey.length === 0) {
+    return false;
+  }
+  const lower = sessionKey.toLowerCase();
+  const threadAt = lower.lastIndexOf(":thread:");
+  const base = threadAt === -1 ? lower : lower.slice(0, threadAt);
+  const parts = base.split(":");
+  if (parts[0] !== "agent" || parts.length < 5) {
+    return false;
+  }
+  return GROUP_SESSION_PEER_KINDS.has(parts[3]);
 }
 
 // Any :subagent:/:active-memory: sub-build (delegated subagents in general, not only
@@ -5595,6 +5622,23 @@ const memoryLanceDBProPlugin = {
           );
           return;
         }
+        // Group-chat opt-out (memoryReflection.includeGroupChats=false): the
+        // distiller input for multi-party sessions misattributes speakers, so
+        // operators can skip reflection generation on group channels entirely.
+        if (config.memoryReflection?.includeGroupChats === false && isGroupChatSessionKey(sessionKey)) {
+          // A boundary command still rotates the session even though
+          // generation is skipped: drop its per-session error state here
+          // (normally the generation path's finally does this), or a
+          // pre-boundary tool error leaks an <error-detected> reminder into
+          // the next session's prompts until session_end cleanup wins the race.
+          if (sessionKey && isSessionBoundaryReflectionAction(action)) {
+            reflectionErrorStateBySession.delete(sessionKey);
+          }
+          api.logger.info(
+            `memory-reflection: command:${action} skipped (group-chat reflection disabled, sessionKey=${sessionKey ?? "(none)"})`,
+          );
+          return;
+        }
 
         let emptyEventGuardKey: string | undefined;
         const isBoundaryAction = isSessionBoundaryReflectionAction(action);
@@ -6952,6 +6996,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         excludeAgents: Array.isArray(memoryReflectionRaw.excludeAgents)
           ? memoryReflectionRaw.excludeAgents.filter((id: unknown): id is string => typeof id === "string" && id.trim() !== "")
           : undefined,
+        includeGroupChats: memoryReflectionRaw.includeGroupChats !== false,
       }
       : {
         enabled: sessionStrategy === "memoryReflection",
@@ -6968,6 +7013,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         serialCooldownMs: DEFAULT_SERIAL_GUARD_COOLDOWN_MS,
         maxConcurrentRuns: DEFAULT_REFLECTION_MAX_CONCURRENT_RUNS,
         excludeAgents: undefined,
+        includeGroupChats: true,
       },
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
