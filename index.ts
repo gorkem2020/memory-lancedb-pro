@@ -630,14 +630,21 @@ function resolveLlmTimeoutMs(config: PluginConfig): number {
   return parsePositiveInt(config.llm?.timeoutMs) ?? 30000;
 }
 
+/**
+ * Hook identity: an explicit agent id, else the id parsed out of the session
+ * key, else NULL. There is deliberately no "main" fallback. A synthesized
+ * identity passes agent-id validation (main is a declared agent) and then
+ * resolves MAIN's scopes, so an unattributable session would read and write
+ * main's private content. Callers must skip agent-specific work on null.
+ */
 function resolveHookAgentId(
   explicitAgentId: string | undefined,
   sessionKey: string | undefined,
-): string {
+): string | null {
   const trimmedExplicit = explicitAgentId?.trim();
-  return (trimmedExplicit && trimmedExplicit.length > 0
-    ? trimmedExplicit
-    : parseAgentIdFromSessionKey(sessionKey)) || "main";
+  if (trimmedExplicit && trimmedExplicit.length > 0) return trimmedExplicit;
+  const fromSessionKey = parseAgentIdFromSessionKey(sessionKey)?.trim();
+  return fromSessionKey && fromSessionKey.length > 0 ? fromSessionKey : null;
 }
 
 // Detect when agentId came from a chat_id / user: source (e.g. "657229412030480397").
@@ -3573,7 +3580,7 @@ const memoryLanceDBProPlugin = {
         // - Else if autoRecallExcludeAgents is set: all agents EXCEPT these receive auto-recall
 
         const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-        if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+        if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
           api.logger.debug?.(
             `memory-lancedb-pro: auto-recall skipped \u2014 invalid agentId format '${agentId}'`,
           );
@@ -3629,7 +3636,7 @@ const memoryLanceDBProPlugin = {
         const recallWork = async (): Promise<{ prependContext: string; ephemeral?: boolean } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
             api.logger.debug?.(`memory-lancedb-pro: auto-recall skip \u2014 invalid agentId '${agentId}'`);
             return undefined;
           }
@@ -4072,7 +4079,7 @@ const memoryLanceDBProPlugin = {
 
           // Determine agent ID and default scope
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
             api.logger.debug(`memory-lancedb-pro: auto-capture skip \u2014 invalid agentId '${agentId}'`);
             return;
           }
@@ -5101,7 +5108,7 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
-          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
             api.logger.debug?.(`memory-lancedb-pro: reflection inheritance skip \u2014 invalid agentId '${agentId}'`);
             return;
           }
@@ -5132,7 +5139,7 @@ const memoryLanceDBProPlugin = {
           typeof ctx.agentId === "string" ? ctx.agentId : undefined,
           sessionKey,
         );
-        if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+        if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
           api.logger.debug?.(`memory-lancedb-pro: reflection derived+error skip \u2014 invalid agentId '${agentId}'`);
           return;
         }
@@ -5411,18 +5418,11 @@ const memoryLanceDBProPlugin = {
           const timeHms = timeIso.split(".")[0];
           const timeCompact = timeIso.replace(/[:.]/g, "");
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
-          const targetScope = isSystemBypassId(sourceAgentId)
-            ? config.scopes?.default ?? "global"
-            : parsedAgentId
-              ? scopeManager.getDefaultScope(sourceAgentId)
-              // A session that never resolved to a real agent must not be routed into
-              // main's default scope: ownerAgentId is already blanked for exactly this
-              // case so the row is not inheritable via isOwnedByAgent(), but a plain
-              // scope-filtered read (list/vectorSearch/etc. with no ownership check)
-              // would still see it if it landed in "agent:main". Route it into a scope
-              // no agent's getAccessibleScopes() ever grants instead, so it stays
-              // findable by an unrestricted/admin read but invisible to every agent.
-              : "unattributed:reflection";
+          // Attribution is guaranteed here: the unattributable-sessionKey early
+          // return above skips reflection outright (quarantine-by-skip), and
+          // parseAgentIdFromSessionKey rejects bypass ids, so sourceAgentId is
+          // always a real agent and its default scope is the only destination.
+          const targetScope = scopeManager.getDefaultScope(sourceAgentId);
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
@@ -5544,11 +5544,6 @@ const memoryLanceDBProPlugin = {
           const MAX_MAPPED_ENTRIES = 100;
           const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
           const mappedEntries: Array<{ text: string; vector: number[]; importance: number; category: string; scope: string; metadata: string }> = [];
-          const mappedGatedItems: Array<{
-            candidate: import("./src/memory-categories.js").CandidateMemory;
-            vector: number[];
-            buildEntry: (v: number[]) => Omit<MemoryEntry, "id" | "timestamp">;
-          }> = [];
           // Per-row embed + near-duplicate pre-check first, collecting the
           // gate-eligible rows so the whole burst can share one admission call.
           const gateEligible: Array<{ mapped: (typeof mappedReflectionMemories)[number]; vector: number[] }> = [];
@@ -5579,9 +5574,17 @@ const memoryLanceDBProPlugin = {
             if (searchFailed) {
               continue;
             }
-            // Admitted rows take the SAME dedup/merge pipeline extraction
-            // candidates get (persistGatedCandidates below), so no bespoke
-            // similarity cutoff runs here anymore.
+            // Near-duplicate pre-check ahead of admission gating. This is the only dedup mapped
+            // rows get: a single vector-similarity threshold, direct skip, no LLM-mediated
+            // merge/contextualize/contradict decision. Extraction candidates own deduplicate()
+            // (src/smart-extractor.ts) is a genuinely different, richer pipeline (a 0.7
+            // pre-filter feeding an LLM decision, not a single hard cutoff) - deliberately not
+            // reused here yet. AdmissionController's "pass_to_dedup" decision for a mapped row
+            // is therefore always treated as "admit, subject to this cheaper pre-check" below,
+            // not "route through the same merge pipeline extraction candidates get".
+            if (existing.length > 0 && existing[0].score > 0.95) {
+              continue;
+            }
             gateEligible.push({ mapped, vector });
           }
 
@@ -5592,15 +5595,11 @@ const memoryLanceDBProPlugin = {
           // historical per-row path otherwise; passthrough when admission
           // control (or smart extraction) is disabled.
           const mappedGateResults = await gateMappedReflectionEntries({
-            admissionController: resolveMappedRowAdmissionController(
-              admissionControllerReflectionLane,
-              smartExtractor?.getAdmissionController() ?? null,
-            ),
+            admissionController: smartExtractor?.getAdmissionController() ?? null,
             attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
             rows: gateEligible.map(({ mapped, vector }) => ({
               text: mapped.text,
               category: mapped.category,
-              kind: mapped.mappedKind,
               heading: mapped.heading,
               vector,
             })),
@@ -5854,10 +5853,15 @@ const memoryLanceDBProPlugin = {
         const now = new Date(params.timestampMs ?? Date.now());
         const dateStr = now.toISOString().split("T")[0];
         const timeStr = now.toISOString().split("T")[1].split(".")[0];
+        // Session key/id stay out of `text`: it is the FTS index surface, and
+        // the `simple` tokenizer splits a key like
+        // `agent:main:cron:<uuid>:run:<uuid>` on its punctuation — so every session
+        // summary ends up indexed under `agent`, `main`, `cron`, `run`. A query
+        // mentioning any of those then BM25-matches every session summary in the
+        // store regardless of content. Both ids are already recorded structurally
+        // in metadata below, so provenance is unaffected.
         const memoryText = [
           `Session: ${dateStr} ${timeStr} UTC`,
-          `Session Key: ${params.sessionKey}`,
-          `Session ID: ${params.sessionId}`,
           `Source: ${params.source}`,
           "",
           "Conversation Summary:",
@@ -5916,7 +5920,7 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
-          if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
+          if (!agentId || isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
             api.logger.debug?.(`session-memory [before_reset]: skip \u2014 invalid agentId '${agentId}'`);
             return;
           }
@@ -5966,6 +5970,10 @@ const memoryLanceDBProPlugin = {
             typeof ctx.agentId === "string" ? ctx.agentId : undefined,
             sessionKey,
           );
+          if (!agentId) {
+            api.logger.warn(`session-memory: failed to save: ${String(err)}`);
+            return;
+          }
           const defaultScope = isSystemBypassId(agentId)
             ? config.scopes?.default ?? "global"
             : scopeManager.getDefaultScope(agentId);

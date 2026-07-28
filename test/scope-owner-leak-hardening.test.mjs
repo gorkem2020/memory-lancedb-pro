@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import jitiFactory from "jiti";
+import { Command } from "commander";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { MemoryStore, normalizeMemoryTimestamp } = jiti("../src/store.ts");
@@ -296,13 +297,13 @@ describe("(a3) ID-based read/write paths no longer treat a NULL scope as literal
 describe("(b) isOwnedByAgent no longer grants universal main or blank-owner access", () => {
   it("rejects a blank-owner legacy/invariant row for any requesting agent", () => {
     const metadata = { type: "memory-reflection", agentId: "" };
-    assert.equal(isOwnedByAgent(metadata, "dave"), false);
+    assert.equal(isOwnedByAgent(metadata, "agent-two"), false);
     assert.equal(isOwnedByAgent(metadata, "main"), false);
   });
 
   it("rejects a main-owned legacy/invariant row when a different agent requests it", () => {
     const metadata = { type: "memory-reflection", agentId: "main" };
-    assert.equal(isOwnedByAgent(metadata, "dave"), false, "main ownership must not be universally inheritable");
+    assert.equal(isOwnedByAgent(metadata, "agent-two"), false, "main ownership must not be universally inheritable");
   });
 
   it("still grants main access to its own main-owned row (regression)", () => {
@@ -311,14 +312,14 @@ describe("(b) isOwnedByAgent no longer grants universal main or blank-owner acce
   });
 
   it("still grants an agent access to its own exactly-owned row (regression)", () => {
-    const metadata = { type: "memory-reflection", agentId: "dave" };
-    assert.equal(isOwnedByAgent(metadata, "dave"), true);
+    const metadata = { type: "memory-reflection", agentId: "agent-two" };
+    assert.equal(isOwnedByAgent(metadata, "agent-two"), true);
     assert.equal(isOwnedByAgent(metadata, "carol"), false);
   });
 
   it("still fail-closes a blank-owner derived item (itemKind=derived, pre-existing regression)", () => {
     const metadata = { type: "memory-reflection-item", itemKind: "derived", agentId: "" };
-    assert.equal(isOwnedByAgent(metadata, "dave"), false);
+    assert.equal(isOwnedByAgent(metadata, "agent-two"), false);
   });
 });
 
@@ -353,16 +354,16 @@ describe("(c) reflection ownership is never minted as main when the sessionKey f
 
     const metadata = { type: "memory-reflection", agentId: ownerAgentId };
     assert.equal(isOwnedByAgent(metadata, "main"), false, "must not be inheritable by main");
-    assert.equal(isOwnedByAgent(metadata, "dave"), false, "must not be inheritable by any other agent either");
+    assert.equal(isOwnedByAgent(metadata, "agent-two"), false, "must not be inheritable by any other agent either");
   });
 
   it("attributes to the true agent when the sessionKey does parse (regression)", () => {
-    const sessionKey = "agent:dave:session:xyz";
+    const sessionKey = "agent:agent-two:session:xyz";
     const ownerAgentId = deriveOwnerAgentId(sessionKey);
-    assert.equal(ownerAgentId, "dave");
+    assert.equal(ownerAgentId, "agent-two");
 
     const metadata = { type: "memory-reflection", agentId: ownerAgentId };
-    assert.equal(isOwnedByAgent(metadata, "dave"), true);
+    assert.equal(isOwnedByAgent(metadata, "agent-two"), true);
     assert.equal(isOwnedByAgent(metadata, "main"), false);
   });
 
@@ -397,7 +398,7 @@ describe("(c) reflection ownership is never minted as main when the sessionKey f
         const metadata = JSON.parse(entry.metadata);
         assert.notEqual(metadata.agentId, "main", "must never persist as main-owned on parse failure");
         assert.equal(isOwnedByAgent(metadata, "main"), false);
-        assert.equal(isOwnedByAgent(metadata, "dave"), false);
+        assert.equal(isOwnedByAgent(metadata, "agent-two"), false);
       }
 
       // The real leak this closes: a plain scope-filtered read for main's own
@@ -517,7 +518,7 @@ describe("(f) legacy NULL/blank-scope migration path", () => {
       assert.equal(globalBefore.length, 0, "legacy rows must be invisible to scoped readers before repair");
 
       const outcome = await store.repairLegacyScopes("global");
-      assert.deepEqual(outcome, { repaired: 2, failed: 0, unrecovered: [] });
+      assert.deepEqual(outcome, { repaired: 2, failed: 0, skipped: 0, unrecovered: [] });
 
       const globalAfter = await store.list(["global"], undefined, 10, 0);
       assert.equal(globalAfter.length, 2, "repaired rows must be visible under the target scope");
@@ -662,6 +663,9 @@ describe("(e) legacy-scope repair is BigInt-safe and recoverable", () => {
     try {
       await store.ensureInitialized();
       const realTable = store.table;
+      // Covers both query shapes findLegacyScopeRows now issues: the legacy
+      // NULL/'' pushdown (where -> limit -> toArray) and the whitespace-scope
+      // projection (select -> where -> toArray, returning none here).
       store.table = {
         query: () => ({
           where: () => ({
@@ -676,6 +680,11 @@ describe("(e) legacy-scope repair is BigInt-safe and recoverable", () => {
                 timestamp: 9223372036854775807n,
                 metadata: "{}",
               }],
+            }),
+          }),
+          select: () => ({
+            where: () => ({
+              toArray: async () => [],
             }),
           }),
         }),
@@ -794,5 +803,345 @@ describe("(f) bulkStore write-boundary reporting and canonicalization", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("(g) upsert and importEntry persist the canonical trimmed scope", () => {
+  it("upsert() trims a padded scope so the replacement stays visible to the canonical filter", async () => {
+    const { store, dir } = makeStore();
+    try {
+      const stored = await store.store({ text: "canonical row", vector: [1, 0, 0], category: "fact", scope: "agent-a", importance: 0.5, metadata: "{}" });
+
+      await store.upsert({ ...stored, text: "replacement row", scope: "  agent-a  " });
+
+      const row = await store.getById(stored.id, ["agent-a"]);
+      assert.ok(row, "the replacement must remain visible under the canonical scope filter");
+      assert.equal(row.scope, "agent-a", "the persisted scope must be the trimmed canonical form");
+      assert.equal(row.text, "replacement row");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("importEntry() trims a padded scope and rejects blank or whitespace-only scopes outright", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await store.importEntry({ id: "import-padded", text: "padded import", vector: [1, 0, 0], category: "fact", scope: "  agent-b ", importance: 0.5, timestamp: Date.now(), metadata: "{}" });
+
+      const padded = await store.getById("import-padded", ["agent-b"]);
+      assert.ok(padded, "a padded import scope must canonicalize to the trimmed scope");
+      assert.equal(padded.scope, "agent-b");
+
+      // Fail-closed like store(): silently coercing a blank scope to "global"
+      // turned invisible data into globally visible data at import time.
+      for (const blankScope of [undefined, "", "   "]) {
+        await assert.rejects(
+          () => store.importEntry({ id: "import-blank", text: "whitespace-only import", vector: [0, 1, 0], category: "fact", scope: blankScope, importance: 0.5, timestamp: Date.now(), metadata: "{}" }),
+          /non-empty scope/,
+          `scope ${JSON.stringify(blankScope)} must be rejected, not coerced to global`,
+        );
+      }
+      const blank = await store.getById("import-blank");
+      assert.equal(blank, null, "no row may be written for a rejected import");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(h) repairLegacyScopes re-validates each row under the write lock", () => {
+  it("skips a row that gained a real scope after discovery, preserving the concurrent write", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "race-reassigned", text: "stale snapshot text", vector: [1, 0, 0], category: "fact", scope: null });
+      await seedLegacyRow(store, { id: "still-legacy", text: "still legacy row", vector: [0, 1, 0], category: "fact", scope: "" });
+
+      const realFind = store.findLegacyScopeRows.bind(store);
+      store.findLegacyScopeRows = async (limit) => {
+        const snapshot = await realFind(limit);
+        await store.table.delete("id = 'race-reassigned'");
+        await store.table.add([{ id: "race-reassigned", text: "updated by concurrent writer", vector: [1, 0, 0], category: "fact", scope: "agent-live", importance: 0.5, timestamp: Date.now(), metadata: "{}" }]);
+        return snapshot;
+      };
+
+      const outcome = await store.repairLegacyScopes("global");
+      assert.equal(outcome.repaired, 1, "only the still-legacy row may be repaired");
+      assert.equal(outcome.skipped, 1, "the concurrently reassigned row must be skipped, not overwritten");
+      assert.equal(outcome.failed, 0);
+
+      const live = await store.getById("race-reassigned", ["agent-live"]);
+      assert.ok(live, "the concurrent write must survive the repair pass");
+      assert.equal(live.text, "updated by concurrent writer");
+      assert.equal(live.scope, "agent-live");
+
+      const repairedRow = await store.getById("still-legacy", ["global"]);
+      assert.ok(repairedRow, "the genuinely legacy row must still be repaired");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs from the row's current content, not the discovery snapshot", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "race-content", text: "content at discovery time", vector: [1, 0, 0], category: "fact", scope: null });
+
+      const realFind = store.findLegacyScopeRows.bind(store);
+      store.findLegacyScopeRows = async (limit) => {
+        const snapshot = await realFind(limit);
+        await store.table.delete("id = 'race-content'");
+        await store.table.add([{ id: "race-content", text: "revised while queued", vector: [1, 0, 0], category: "fact", scope: null, importance: 0.5, timestamp: Date.now(), metadata: "{}" }]);
+        return snapshot;
+      };
+
+      const outcome = await store.repairLegacyScopes("global");
+      assert.equal(outcome.repaired, 1);
+
+      const row = await store.getById("race-content", ["global"]);
+      assert.ok(row, "the still-legacy row must be repaired");
+      assert.equal(row.text, "revised while queued", "the repair must persist the re-read content, not the stale snapshot");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips a row deleted after discovery instead of resurrecting it from the snapshot", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "race-deleted", text: "deleted before the lock", vector: [1, 0, 0], category: "fact", scope: null });
+
+      const realFind = store.findLegacyScopeRows.bind(store);
+      store.findLegacyScopeRows = async (limit) => {
+        const snapshot = await realFind(limit);
+        await store.table.delete("id = 'race-deleted'");
+        return snapshot;
+      };
+
+      const outcome = await store.repairLegacyScopes("global");
+      assert.equal(outcome.repaired, 0);
+      assert.equal(outcome.skipped, 1, "a row deleted between discovery and the lock must be skipped");
+
+      const row = await store.getById("race-deleted");
+      assert.equal(row, null, "the deleted row must not be resurrected from the snapshot");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(h2) repair validates against the LATEST table version, not this handle's snapshot", () => {
+  it("a second connection's update is neither overwritten nor reassigned (two-handle, default read consistency)", async () => {
+    const { store: storeA, dir } = makeStore();
+    const storeB = new MemoryStore({ dbPath: dir, vectorDim: 3 });
+    try {
+      await seedLegacyRow(storeA, { id: "two-handle-row", text: "legacy text at discovery", vector: [1, 0, 0], category: "fact", scope: null });
+      // Warm A's cached table handle on the current version, then write the
+      // row's real scope through an INDEPENDENT connection. With the default
+      // (unset) read-consistency interval, A's handle does not see B's write
+      // on its own — the negative control in read-consistency-interval.test.mjs
+      // pins that — so only an explicit under-lock refresh can save the row.
+      assert.equal((await storeA.findLegacyScopeRows()).length, 1);
+      await storeB.upsert({ id: "two-handle-row", text: "updated by the second connection", vector: [1, 0, 0], category: "fact", scope: "agent-live", importance: 0.5, timestamp: Date.now(), metadata: "{}" });
+
+      const outcome = await storeA.repairLegacyScopes("global");
+
+      assert.equal(outcome.repaired, 0, "a row scoped by another connection must not be repaired");
+      assert.equal(outcome.skipped, 1, "the concurrently scoped row must be skipped");
+      const current = await storeB.getById("two-handle-row", ["agent-live"]);
+      assert.ok(current, "the second connection's write must survive the repair pass");
+      assert.equal(current.text, "updated by the second connection", "repair must not restore the stale snapshot text");
+      const leaked = await storeB.getById("two-handle-row", ["global"]);
+      assert.equal(leaked, null, "the row must not be reassigned to the target scope");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("whitespace-only scopes are discoverable and repairable as legacy rows", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "ws-scope-row", text: "whitespace scope row", vector: [1, 0, 0], category: "fact", scope: "   " });
+      await store.store({ text: "properly scoped row", vector: [0, 1, 0], category: "fact", scope: "agent-a", importance: 0.5, metadata: "{}" });
+
+      const found = await store.findLegacyScopeRows();
+      assert.equal(found.length, 1, "a whitespace-only scope is invalid under the write validator and must be discoverable");
+      assert.equal(found[0].id, "ws-scope-row");
+
+      const outcome = await store.repairLegacyScopes("global");
+      assert.equal(outcome.repaired, 1, "the whitespace-scoped row must be repairable");
+      const repaired = await store.getById("ws-scope-row", ["global"]);
+      assert.ok(repaired, "the repaired row must be visible under the target scope");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(h3) repair failure diagnostics and lifecycle", () => {
+  it("logs per-row reasons and aborts after consecutive systemic failures instead of hammering the lock", async () => {
+    const { store, dir } = makeStore();
+    try {
+      for (let i = 0; i < 15; i++) {
+        await seedLegacyRow(store, { id: `sys-fail-${String(i).padStart(2, "0")}`, text: `legacy row ${i}`, vector: [1, 0, 0], category: "fact", scope: null });
+      }
+      await store.ensureInitialized();
+      store.table.checkoutLatest = async () => { throw new Error("SYSTEMIC: version refresh unavailable"); };
+
+      const warnings = [];
+      const errors = [];
+      const originalWarn = console.warn;
+      const originalError = console.error;
+      console.warn = (...parts) => warnings.push(parts.join(" "));
+      console.error = (...parts) => errors.push(parts.join(" "));
+      let outcome;
+      try {
+        outcome = await store.repairLegacyScopes("global");
+      } finally {
+        console.warn = originalWarn;
+        console.error = originalError;
+      }
+
+      assert.equal(outcome.repaired, 0);
+      assert.equal(outcome.failed, 10, "the pass must abort after the consecutive-failure threshold, not run all 15 rows");
+      assert.ok(
+        warnings.some((w) => w.includes("SYSTEMIC: version refresh unavailable")),
+        "the per-row failure reason must be logged, not swallowed",
+      );
+      assert.ok(
+        errors.some((e) => e.includes("aborting after") && e.includes("unattempted")),
+        "the abort must announce itself and the unattempted remainder",
+      );
+      const remaining = await store.findLegacyScopeRows();
+      assert.equal(remaining.length, 15, "unattempted rows must remain legacy and discoverable for the next run");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a commit-then-reject add as repaired instead of rolling back into a duplicate id", async () => {
+    const { store, dir } = makeStore();
+    try {
+      await seedLegacyRow(store, { id: "commit-reject-row", text: "legacy commit-reject row", vector: [1, 0, 0], category: "fact", scope: null });
+      await store.ensureInitialized();
+      const realAdd = store.table.add.bind(store.table);
+      let armed = true;
+      store.table.add = async (rows) => {
+        const result = await realAdd(rows);
+        if (armed) {
+          armed = false;
+          throw new Error("post-commit step failed after the write landed");
+        }
+        return result;
+      };
+
+      const outcome = await store.repairLegacyScopes("global");
+
+      assert.equal(outcome.repaired, 1, "a write that landed must count as repaired even when the client saw an error");
+      assert.equal(outcome.failed, 0);
+      assert.equal(outcome.unrecovered.length, 0);
+      const rows = await store.table.query().where("id = 'commit-reject-row'").toArray();
+      assert.equal(rows.length, 1, "the row must not be duplicated by a blind rollback re-add");
+      assert.equal(rows[0].scope, "global");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("(i) repair-scopes command wiring", () => {
+  function buildCliProgram(storeStubs) {
+    const { createMemoryCLI } = jiti("../cli.ts");
+    const { createScopeManager } = jiti("../src/scopes.ts");
+    const program = new Command();
+    program.exitOverride();
+    // The real scope manager IS the wiring under test: --target-scope now
+    // routes through its validateScope, so a stub {} would mask the contract.
+    createMemoryCLI({ store: storeStubs, retriever: {}, scopeManager: createScopeManager(), migrator: {} })({ program });
+    return program;
+  }
+
+  async function runRepairScopes(storeStubs, extraArgs = []) {
+    const program = buildCliProgram(storeStubs);
+    const logs = [];
+    const errors = [];
+    const originalLog = console.log;
+    const originalError = console.error;
+    const priorExitCode = process.exitCode;
+    console.log = (...parts) => logs.push(parts.join(" "));
+    console.error = (...parts) => errors.push(parts.join(" "));
+    let exitCode;
+    try {
+      await program.parseAsync(["node", "cli", "memory-pro", "repair-scopes", ...extraArgs]);
+    } finally {
+      exitCode = process.exitCode;
+      process.exitCode = priorExitCode;
+      console.log = originalLog;
+      console.error = originalError;
+    }
+    return { logs: logs.join("\n"), errors: errors.join("\n"), exitCode };
+  }
+
+  it("attaches repair-scopes to the memory-pro group the host routes", () => {
+    const program = buildCliProgram({});
+    const memoryPro = program.commands.find((c) => c.name() === "memory-pro");
+    assert.ok(memoryPro, "memory-pro group must be registered");
+    const groupNames = memoryPro.commands.map((c) => c.name());
+    assert.ok(
+      groupNames.includes("repair-scopes"),
+      `expected "repair-scopes" under the memory-pro group, got: ${groupNames.join(", ")}`,
+    );
+  });
+
+  it("exits nonzero when rows failed or were unrecovered, and zero on a clean repair", async () => {
+    const failing = await runRepairScopes({
+      async findLegacyScopeRows() { return [{ id: "legacy-x", text: "legacy row" }]; },
+      async repairLegacyScopes() { return { repaired: 1, failed: 2, skipped: 0, unrecovered: [{ id: "lost-1", text: "lost row" }] }; },
+    }, ["--apply"]);
+    assert.equal(failing.exitCode, 1, "failed or unrecovered rows must fail the process for non-interactive callers");
+
+    const clean = await runRepairScopes({
+      async findLegacyScopeRows() { return [{ id: "legacy-y", text: "legacy row" }]; },
+      async repairLegacyScopes() { return { repaired: 1, failed: 0, skipped: 1, unrecovered: [] }; },
+    }, ["--apply"]);
+    assert.notEqual(clean.exitCode, 1, "a clean repair (skips included) must not fail the exit code");
+  });
+
+  it("rejects a --target-scope the scope validator does not recognize, before touching the store", async () => {
+    let discoveryCalls = 0;
+    let repairCalls = 0;
+    const result = await runRepairScopes({
+      async findLegacyScopeRows() { discoveryCalls += 1; return []; },
+      async repairLegacyScopes() { repairCalls += 1; return { repaired: 0, failed: 0, skipped: 0, unrecovered: [] }; },
+    }, ["--apply", "--target-scope", "definitely not a scope"]);
+
+    assert.equal(result.exitCode, 1, "an unknown target scope must fail the command");
+    assert.match(result.errors, /invalid --target-scope/, "the error must name the rejected scope option");
+    assert.equal(repairCalls, 0, "no repair may run against an unreachable scope");
+    assert.equal(discoveryCalls, 0, "validation happens before any store access");
+  });
+
+  it("requires --allow-new-scope for a well-formed scope the config has never defined", async () => {
+    let repairCalls = 0;
+    const withoutFlag = await runRepairScopes({
+      async findLegacyScopeRows() { return []; },
+      async repairLegacyScopes() { repairCalls += 1; return { repaired: 0, failed: 0, skipped: 0, unrecovered: [] }; },
+    }, ["--apply", "--target-scope", "agent:mian"]);
+    assert.equal(withoutFlag.exitCode, 1, "a well-formed but never-defined scope is exactly the typo shape (agent:mian)");
+    assert.match(withoutFlag.errors, /--allow-new-scope/, "the error must name the confirmation flag");
+    assert.equal(repairCalls, 0);
+
+    const withFlag = await runRepairScopes({
+      async findLegacyScopeRows() { return []; },
+      async repairLegacyScopes() { return { repaired: 0, failed: 0, skipped: 0, unrecovered: [] }; },
+    }, ["--apply", "--target-scope", "agent:live", "--allow-new-scope"]);
+    assert.notEqual(withFlag.exitCode, 1, "an explicitly confirmed novel scope must proceed");
+  });
+
+  it("the default global target needs no confirmation flag", async () => {
+    const result = await runRepairScopes({
+      async findLegacyScopeRows() { return []; },
+      async repairLegacyScopes() { return { repaired: 0, failed: 0, skipped: 0, unrecovered: [] }; },
+    }, ["--apply"]);
+    assert.notEqual(result.exitCode, 1, "global is always a defined destination");
   });
 });

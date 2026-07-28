@@ -8,6 +8,7 @@ import { access as accessAsync, lstat as lstatAsync, mkdir as mkdirAsync, realpa
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchesMemoryCategoryFilter, resolveCategoryFilterCandidates } from "./memory-categories.js";
+import { drainManualRecallMetadata, ManualRecallMetadataBatchSettledError, } from "./manual-recall-metadata-queue.js";
 import { RedisLockAcquisitionError, RedisLockLeaseIntegrityError, RedisLockManager, RedisLockUnavailableError, } from "./redis-lock.js";
 import { buildSmartMetadata, isMemoryActiveAt, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 // ============================================================================
@@ -697,6 +698,12 @@ export class MemoryStore {
             void this.foldIndices("write-threshold");
         }
     }
+    async checkoutLatestTableForWrite() {
+        const table = this.table;
+        if (typeof table?.checkoutLatest === "function") {
+            await table.checkoutLatest();
+        }
+    }
     async scheduleStartupIndexCatchUp() {
         try {
             const table = this.table;
@@ -1026,6 +1033,11 @@ export class MemoryStore {
         if (!hasValidEntryScope(entry.scope)) {
             throw new Error(`upsert() requires a non-empty scope: refusing to delete row ${entry.id} for a scope-less replacement`);
         }
+        // Canonicalize scope whitespace before the destructive replace (same
+        // write-boundary contract as bulkStore): a validated-but-padded scope
+        // would delete the canonical row and persist a replacement invisible to
+        // its own scope filter.
+        const canonicalScope = entry.scope.trim();
         await this.ensureInitialized();
         const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
             const safeId = escapeSqlLiteral(entry.id);
@@ -1035,6 +1047,7 @@ export class MemoryStore {
             // is idempotent and preserves legitimate v2+ 0~1 values.
             const normalizedEntry = {
                 ...entry,
+                scope: canonicalScope,
                 metadata: entry.metadata || "{}",
                 importance: clampImportance(entry.importance),
             };
@@ -1338,6 +1351,7 @@ export class MemoryStore {
      * @public
      */
     async destroy() {
+        await drainManualRecallMetadata(this);
         if (this.flushTimer) {
             clearTimeout(this.flushTimer);
             this.flushTimer = null;
@@ -1404,9 +1418,17 @@ export class MemoryStore {
         if (!Array.isArray(vector) || vector.length !== this.config.vectorDim) {
             throw new Error(`Vector dimension mismatch: expected ${this.config.vectorDim}, got ${Array.isArray(vector) ? vector.length : "non-array"}`);
         }
+        // Same fail-closed contract as store(): a missing or whitespace-only
+        // scope must never be silently converted into globally visible data.
+        // Legacy callers assign an explicit scope (migrate falls back to its
+        // default scope); genuinely scope-less legacy rows are repair-scopes'
+        // job, not an import-time coercion.
+        if (!hasValidEntryScope(entry.scope)) {
+            throw new Error("importEntry requires a non-empty scope: scope-less rows are invisible to scoped readers (assign an explicit scope, or leave legacy rows to repair-scopes)");
+        }
         const full = {
             ...entry,
-            scope: entry.scope || "global",
+            scope: entry.scope.trim(),
             importance: options.legacy
                 ? normalizeLegacyImportance(entry.importance)
                 : clampImportance(entry.importance),
@@ -1432,42 +1454,6 @@ export class MemoryStore {
     async count() {
         await this.ensureInitialized();
         return await this.table.countRows();
-    }
-    /**
-     * Finds rows whose id starts with `prefix`, restricted to accessible
-     * scopes. Backs the documented "full UUID or 8+ char prefix" contract on
-     * memory_forget/memory_update: injected context shows agents truncated ids,
-     * so a unique-prefix lookup is the only way those handles can ever resolve.
-     * The prefix must be hex/dash shaped (validated here, defense in depth on
-     * top of the tool-layer classification) and at least 8 chars, so a short
-     * or malformed ref can never scan-match. Capped at `limit` matches: the
-     * caller only distinguishes zero / one / many.
-     */
-    async findByIdPrefix(prefix, scopeFilter, limit = 5) {
-        await this.ensureInitialized();
-        if (isExplicitDenyAllScopeFilter(scopeFilter))
-            return [];
-        const normalized = prefix.trim().toLowerCase();
-        if (!/^[0-9a-f][0-9a-f-]{7,35}$/.test(normalized))
-            return [];
-        const safePrefix = escapeSqlLiteral(normalized);
-        const rows = await this.table
-            .query()
-            .where(`id LIKE '${safePrefix}%'`)
-            .limit(Math.max(1, limit))
-            .toArray();
-        return rows
-            .filter((row) => isRowScopeAccessible(row.scope, scopeFilter))
-            .map((row) => ({
-            id: row.id,
-            text: row.text,
-            vector: Array.from(row.vector),
-            category: row.category,
-            scope: row.scope ?? "global",
-            importance: clampImportance(Number(row.importance)),
-            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-            metadata: row.metadata || "{}",
-        }));
     }
     async getById(id, scopeFilter) {
         await this.ensureInitialized();
@@ -1538,9 +1524,7 @@ export class MemoryStore {
         const safeLimit = clampInt(limit, 1, 20);
         // Over-fetch more aggressively when filtering inactive records,
         // because superseded historical rows can crowd out active ones.
-        // excludeInactive defaults to true: invalidated/superseded rows are
-        // invisible unless a caller opts out explicitly (item 6, PR #946).
-        const inactiveFilter = options?.excludeInactive ?? true;
+        const inactiveFilter = options?.excludeInactive ?? false;
         const overFetchMultiplier = inactiveFilter ? 20 : 10;
         const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
         if (this.disableNativeCosine && !this.nativeCosineFallbackLogged) {
@@ -1615,8 +1599,7 @@ export class MemoryStore {
         if (isExplicitDenyAllScopeFilter(scopeFilter))
             return [];
         const safeLimit = clampInt(limit, 1, 20);
-        // excludeInactive defaults to true: see vectorSearch above (item 6, PR #946).
-        const inactiveFilter = options?.excludeInactive ?? true;
+        const inactiveFilter = options?.excludeInactive ?? false;
         // Over-fetch when filtering inactive records to avoid crowding
         const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
         if (!this.ftsIndexCreated && !(await this.refreshFtsSupportFromTable())) {
@@ -1651,7 +1634,7 @@ export class MemoryStore {
                 const entry = {
                     id: row.id,
                     text: row.text,
-                    vector: toNumberVector(row.vector),
+                    vector: row.vector,
                     category: row.category,
                     scope: rowScope,
                     importance: clampImportance(Number(row.importance)),
@@ -1710,7 +1693,7 @@ export class MemoryStore {
             const entry = {
                 id: row.id,
                 text: row.text,
-                vector: toNumberVector(row.vector),
+                vector: row.vector,
                 category: row.category,
                 scope: rowScope,
                 importance: clampImportance(Number(row.importance)),
@@ -1718,9 +1701,8 @@ export class MemoryStore {
                 metadata: row.metadata || "{}",
             };
             const metadata = parseSmartMetadata(entry.metadata, entry);
-            // Skip inactive (superseded) records unless explicitly opted out
-            // (excludeInactive defaults to true -- item 6, PR #946).
-            if ((options?.excludeInactive ?? true) && !isMemoryActiveAt(metadata)) {
+            // Skip inactive (superseded) records when requested
+            if (options?.excludeInactive && !isMemoryActiveAt(metadata)) {
                 continue;
             }
             const score = scoreLexicalHit(trimmedQuery, [
@@ -1787,7 +1769,7 @@ export class MemoryStore {
             return true;
         });
     }
-    async list(scopeFilter, category, limit = 20, offset = 0, options) {
+    async list(scopeFilter, category, limit = 20, offset = 0) {
         await this.ensureInitialized();
         if (isExplicitDenyAllScopeFilter(scopeFilter))
             return [];
@@ -1829,15 +1811,9 @@ export class MemoryStore {
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
         }));
-        // excludeInactive defaults to true: invalidated/superseded rows are
-        // invisible to list() unless a caller opts out explicitly (item 6, PR #946).
-        const excludeInactive = options?.excludeInactive ?? true;
-        const activeEntries = excludeInactive
-            ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
-            : entries;
         return (category
-            ? activeEntries.filter((entry) => matchesMemoryCategoryFilter(entry.category, category, entry.metadata))
-            : activeEntries)
+            ? entries.filter((entry) => matchesMemoryCategoryFilter(entry.category, category, entry.metadata))
+            : entries)
             .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
             .slice(offset, offset + limit);
     }
@@ -1859,7 +1835,6 @@ export class MemoryStore {
         if (isExplicitDenyAllScopeFilter(scopeFilter)) {
             return {
                 totalCount: 0,
-                liveCount: 0,
                 scopeCounts: {},
                 categoryCounts: {},
             };
@@ -1874,31 +1849,274 @@ export class MemoryStore {
             conditions.push(`(${scopeConditions})`);
         }
         const applyConditions = (query) => conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
-        // scopeCounts/categoryCounts stay blended (total, historical record
-        // included) -- only the top-level total/live split is added here, per
-        // item 6 (PR #946): "report a live vs total split rather than one
-        // blended count."
-        const results = await this.queryRowsWithProjectionFallback(applyConditions, ["scope", "category", "metadata", "timestamp"]);
+        const results = await this.queryRowsWithProjectionFallback(applyConditions, ["scope", "category"]);
         const scopeCounts = {};
         const categoryCounts = {};
-        let liveCount = 0;
         for (const row of results) {
             const scope = row.scope ?? "global";
             const category = row.category;
             scopeCounts[scope] = (scopeCounts[scope] || 0) + 1;
             categoryCounts[category] = (categoryCounts[category] || 0) + 1;
-            const metadata = parseSmartMetadata(row.metadata || "{}", {
-                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-            });
-            if (isMemoryActiveAt(metadata))
-                liveCount += 1;
         }
         return {
             totalCount: results.length,
-            liveCount,
             scopeCounts,
             categoryCounts,
         };
+    }
+    /**
+     * Merge coalesced manual-recall reinforcement into exact IDs under one lock.
+     *
+     * The row read and metadata merge both happen after the write lock is held,
+     * so concurrent recall events cannot overwrite a newer counter/timestamp
+     * snapshot. `expectedScope` preserves the authorization decision made by the
+     * retrieval path without widening the caller's readable scopes.
+     */
+    async applyManualRecallMetadataBatch(updates) {
+        await this.ensureInitialized();
+        if (updates.length === 0)
+            return [];
+        let settledResults = null;
+        const applyBatch = () => this.runSerializedUpdate(async () => {
+            await this.checkoutLatestTableForWrite();
+            const results = new Map();
+            const pending = [];
+            const seenUpdates = new Set();
+            updates.forEach((candidate, inputIndex) => {
+                const updateKey = `${candidate.id}\u0000${candidate.expectedScope}`;
+                const isValidId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate.id) ||
+                    isLegacyStableMemoryId(candidate.id);
+                if (!isValidId) {
+                    results.set(inputIndex, {
+                        id: String(candidate.id),
+                        entry: null,
+                        error: `Invalid exact memory ID: ${String(candidate.id)}`,
+                        retryable: false,
+                    });
+                    return;
+                }
+                if (seenUpdates.has(updateKey)) {
+                    results.set(inputIndex, {
+                        id: candidate.id,
+                        entry: null,
+                        error: `Duplicate exact memory ID and scope: ${candidate.id} (${candidate.expectedScope})`,
+                        retryable: false,
+                    });
+                    return;
+                }
+                if (!Number.isInteger(candidate.accessCountDelta) || candidate.accessCountDelta <= 0) {
+                    results.set(inputIndex, {
+                        id: candidate.id,
+                        entry: null,
+                        error: `Invalid accessCountDelta for ${candidate.id}`,
+                        retryable: false,
+                    });
+                    return;
+                }
+                if (!Number.isFinite(candidate.accessedAt) || candidate.accessedAt <= 0) {
+                    results.set(inputIndex, {
+                        id: candidate.id,
+                        entry: null,
+                        error: `Invalid accessedAt for ${candidate.id}`,
+                        retryable: false,
+                    });
+                    return;
+                }
+                seenUpdates.add(updateKey);
+                pending.push({ ...candidate, inputIndex });
+            });
+            for (let i = 0; i < pending.length; i += MemoryStore.MAX_BATCH_SIZE) {
+                const chunk = pending.slice(i, i + MemoryStore.MAX_BATCH_SIZE);
+                const whereClause = chunk
+                    .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+                    .join(" OR ");
+                let rows;
+                try {
+                    rows = whereClause.length > 0
+                        ? await this.table.query().where(`(${whereClause})`).toArray()
+                        : [];
+                }
+                catch (queryError) {
+                    const queryMessage = queryError instanceof Error ? queryError.message : String(queryError);
+                    for (const candidate of chunk) {
+                        results.set(candidate.inputIndex, {
+                            id: candidate.id,
+                            entry: null,
+                            error: `Failed to read recall metadata for ${candidate.id}: ${queryMessage}`,
+                            retryable: true,
+                        });
+                    }
+                    continue;
+                }
+                const rowsById = new Map();
+                for (const row of rows)
+                    rowsById.set(row.id, row);
+                const originals = [];
+                const updatedEntries = [];
+                const updatedInputIndices = [];
+                for (const candidate of chunk) {
+                    const row = rowsById.get(candidate.id);
+                    if (!row) {
+                        results.set(candidate.inputIndex, { id: candidate.id, entry: null });
+                        continue;
+                    }
+                    const rowScope = row.scope ?? "global";
+                    if (rowScope !== candidate.expectedScope) {
+                        results.set(candidate.inputIndex, {
+                            id: candidate.id,
+                            entry: null,
+                            error: `Memory ${candidate.id} scope changed from ` +
+                                `${candidate.expectedScope} to ${rowScope}`,
+                            retryable: false,
+                        });
+                        continue;
+                    }
+                    const original = {
+                        id: row.id,
+                        text: row.text,
+                        vector: Array.from(row.vector),
+                        category: row.category,
+                        scope: rowScope,
+                        importance: clampImportance(Number(row.importance)),
+                        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+                        metadata: row.metadata || "{}",
+                    };
+                    const current = parseSmartMetadata(original.metadata, original);
+                    const accessedAt = Math.max(current.last_accessed_at, candidate.accessedAt);
+                    const confirmedAt = Math.max(current.last_confirmed_use_at ?? 0, candidate.accessedAt);
+                    const snapshot = candidate.governanceSnapshot;
+                    const governanceUnchanged = snapshot !== undefined &&
+                        current.bad_recall_count === snapshot.badRecallCount &&
+                        current.suppressed_until_turn === snapshot.suppressedUntilTurn &&
+                        current.suppressed_until_ms === snapshot.suppressedUntilMs;
+                    const governanceReset = governanceUnchanged
+                        ? {
+                            bad_recall_count: 0,
+                            suppressed_until_turn: 0,
+                            suppressed_until_ms: 0,
+                        }
+                        : {};
+                    const metadata = stringifySmartMetadata(buildSmartMetadata(original, {
+                        access_count: current.access_count + candidate.accessCountDelta,
+                        last_accessed_at: accessedAt,
+                        last_confirmed_use_at: confirmedAt,
+                        ...governanceReset,
+                    }));
+                    originals.push(original);
+                    updatedEntries.push({ ...original, metadata });
+                    updatedInputIndices.push(candidate.inputIndex);
+                }
+                if (updatedEntries.length === 0)
+                    continue;
+                const mergeWhereClause = updatedEntries
+                    .map(({ id }) => `id = '${escapeSqlLiteral(id)}'`)
+                    .join(" OR ");
+                const classifyUncertainMerge = async (reason) => {
+                    let dataMayHaveChanged = false;
+                    let rowsAfterFailure;
+                    try {
+                        await this.checkoutLatestTableForWrite();
+                        rowsAfterFailure = await this.table.query()
+                            .where(`(${mergeWhereClause})`)
+                            .toArray();
+                    }
+                    catch (recoveryError) {
+                        this.noteDataModification();
+                        const recoveryMessage = recoveryError instanceof Error
+                            ? recoveryError.message
+                            : String(recoveryError);
+                        for (let index = 0; index < updatedEntries.length; index++) {
+                            results.set(updatedInputIndices[index], {
+                                id: updatedEntries[index].id,
+                                entry: null,
+                                error: `Atomic recall metadata merge failed for ${updatedEntries[index].id}: ` +
+                                    `${reason}. Commit state could not be verified: ${recoveryMessage}`,
+                                retryable: false,
+                            });
+                        }
+                        return;
+                    }
+                    const rowsAfterFailureById = new Map();
+                    for (const row of rowsAfterFailure)
+                        rowsAfterFailureById.set(row.id, row);
+                    for (let index = 0; index < updatedEntries.length; index++) {
+                        const original = originals[index];
+                        const updatedEntry = updatedEntries[index];
+                        const row = rowsAfterFailureById.get(updatedEntry.id);
+                        const rowScope = row?.scope ?? "global";
+                        const persistedMetadata = typeof row?.metadata === "string" ? row.metadata : "{}";
+                        if (row && rowScope === updatedEntry.scope && persistedMetadata === updatedEntry.metadata) {
+                            dataMayHaveChanged = true;
+                            results.set(updatedInputIndices[index], {
+                                id: updatedEntry.id,
+                                entry: updatedEntry,
+                            });
+                            continue;
+                        }
+                        if (row && rowScope === original.scope && persistedMetadata === original.metadata) {
+                            results.set(updatedInputIndices[index], {
+                                id: original.id,
+                                entry: null,
+                                error: `Atomic recall metadata merge failed for ${original.id}: ${reason}`,
+                                retryable: true,
+                            });
+                            continue;
+                        }
+                        results.set(updatedInputIndices[index], {
+                            id: updatedEntry.id,
+                            entry: null,
+                            error: `Atomic recall metadata merge failed for ${updatedEntry.id}: ${reason}. ` +
+                                `Persisted state no longer matches either the original or updated row`,
+                            retryable: false,
+                        });
+                        dataMayHaveChanged = true;
+                    }
+                    if (dataMayHaveChanged)
+                        this.noteDataModification();
+                };
+                try {
+                    const mergeResult = await this.table
+                        .mergeInsert("id")
+                        .whenMatchedUpdateAll({
+                        where: "target.scope = source.scope OR " +
+                            "(target.scope IS NULL AND source.scope = 'global')",
+                    })
+                        .execute(updatedEntries);
+                    if (mergeResult.numUpdatedRows !== updatedEntries.length) {
+                        await classifyUncertainMerge(`updated ${mergeResult.numUpdatedRows} of ${updatedEntries.length} expected rows`);
+                        continue;
+                    }
+                    this.noteDataModification();
+                    for (let index = 0; index < updatedEntries.length; index++) {
+                        results.set(updatedInputIndices[index], {
+                            id: updatedEntries[index].id,
+                            entry: updatedEntries[index],
+                        });
+                    }
+                }
+                catch (writeError) {
+                    const writeMessage = writeError instanceof Error ? writeError.message : String(writeError);
+                    await classifyUncertainMerge(writeMessage);
+                }
+            }
+            settledResults = updates.map((candidate, inputIndex) => results.get(inputIndex) ?? {
+                id: candidate.id,
+                entry: null,
+                error: `Memory ${candidate.id} was not processed`,
+                retryable: false,
+            });
+            return settledResults;
+        });
+        try {
+            return await this.runWithWriteLock(applyBatch);
+        }
+        catch (error) {
+            if (settledResults !== null) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new ManualRecallMetadataBatchSettledError(`Manual recall metadata batch settled before the write lock failed: ${message}`, settledResults, { cause: error });
+            }
+            throw error;
+        }
     }
     /**
      * Update multiple already-resolved memory IDs under one write lock.
@@ -2085,125 +2303,116 @@ export class MemoryStore {
         if (isExplicitDenyAllScopeFilter(scopeFilter)) {
             throw new Error(`Memory ${id} is outside accessible scopes`);
         }
-        return this.runWithWriteLock(() => this.runSerializedUpdate(() => this.performUpdate(id, updates, scopeFilter)));
-    }
-    /**
-     * Core of update(): resolve the row, apply the patch, and persist via
-     * delete + re-add with rollback. Must be called while already holding the
-     * write lock and the serialized-update queue: update() wraps it, and the
-     * supersede commit path calls it from inside its own atomic section.
-     */
-    async performUpdate(id, updates, scopeFilter) {
-        // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
-        // from older stores (for example "mem-md-..." or "data-pointer-...").
-        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-        const prefixRegex = /^[0-9a-f]{8,}$/i;
-        const isFullId = uuidRegex.test(id);
-        const isPrefix = !isFullId && prefixRegex.test(id);
-        const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
-        if (!isFullId && !isPrefix && !isLegacyStableId) {
-            throw new Error(`Invalid memory ID format: ${id}`);
-        }
-        let rows;
-        if (isFullId || isLegacyStableId) {
-            // Legacy IDs use exact string match like full UUIDs.
-            const safeId = escapeSqlLiteral(id);
-            rows = await this.table.query()
-                .where(`id = '${safeId}'`)
-                .limit(1)
-                .toArray();
-        }
-        else {
-            // Prefix match
-            const all = await this.table.query()
-                .select([
-                "id",
-                "text",
-                "vector",
-                "category",
-                "scope",
-                "importance",
-                "timestamp",
-                "metadata",
-            ])
-                .limit(1000)
-                .toArray();
-            rows = all.filter((r) => r.id.startsWith(id));
-            if (rows.length > 1) {
-                throw new Error(`Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`);
+        return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+            // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
+            // from older stores (for example "mem-md-..." or "data-pointer-...").
+            const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+            const prefixRegex = /^[0-9a-f]{8,}$/i;
+            const isFullId = uuidRegex.test(id);
+            const isPrefix = !isFullId && prefixRegex.test(id);
+            const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
+            if (!isFullId && !isPrefix && !isLegacyStableId) {
+                throw new Error(`Invalid memory ID format: ${id}`);
             }
-        }
-        if (rows.length === 0)
-            return null;
-        const row = rows[0];
-        const realScope = row.scope;
-        // Check scope permissions
-        if (!isRowScopeAccessible(realScope, scopeFilter)) {
-            throw new Error(`Memory ${id} is outside accessible scopes`);
-        }
-        const rowScope = realScope ?? "global";
-        // Display mask only. Mutations must persist the RAW stored scope: writing
-        // the "global" mask back would turn an invisible legacy NULL-scope row
-        // into a globally visible one (cross-agent disclosure). Valid scopes are
-        // canonicalized by trim; legacy NULL/blank stays NULL.
-        const persistedScope = (hasValidEntryScope(realScope) ? realScope.trim() : null);
-        const original = {
-            id: row.id,
-            text: row.text,
-            vector: Array.from(row.vector),
-            category: row.category,
-            scope: rowScope,
-            importance: clampImportance(Number(row.importance)),
-            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-            metadata: row.metadata || "{}",
-        };
-        // Build updated entry, preserving original timestamp
-        const updated = {
-            ...original,
-            text: updates.text ?? original.text,
-            vector: updates.vector ?? original.vector,
-            category: updates.category ?? original.category,
-            scope: rowScope,
-            // F3 fix (PR #828 follow-up): clamp importance on update path so
-            // update() callers cannot persist out-of-range values.
-            importance: clampImportance(updates.importance ?? original.importance),
-            timestamp: original.timestamp, // preserve original
-            metadata: updates.metadata ?? original.metadata,
-        };
-        // LanceDB doesn't support in-place update; delete + re-add.
-        // Serialize updates per store instance to avoid stale rollback races.
-        // If the add fails after delete, attempt best-effort recovery without
-        // overwriting a newer concurrent successful update.
-        const rollbackSource = (await this.getById(original.id).catch(() => null)) ?? original;
-        // getById masks a NULL scope as "global" for display; restore the raw
-        // stored scope before any write (scope is immutable through update patches).
-        const rollbackCandidate = { ...rollbackSource, scope: persistedScope };
-        const resolvedId = escapeSqlLiteral(row.id);
-        await this.table.delete(`id = '${resolvedId}'`);
-        try {
-            await this.table.add([{ ...updated, scope: persistedScope }]);
-        }
-        catch (addError) {
-            const current = await this.getById(original.id).catch(() => null);
-            if (current) {
-                throw new Error(`Failed to update memory ${id}: write failed after delete, but an existing record was preserved. ` +
+            let rows;
+            if (isFullId || isLegacyStableId) {
+                // Legacy IDs use exact string match like full UUIDs.
+                const safeId = escapeSqlLiteral(id);
+                rows = await this.table.query()
+                    .where(`id = '${safeId}'`)
+                    .limit(1)
+                    .toArray();
+            }
+            else {
+                // Prefix match
+                const all = await this.table.query()
+                    .select([
+                    "id",
+                    "text",
+                    "vector",
+                    "category",
+                    "scope",
+                    "importance",
+                    "timestamp",
+                    "metadata",
+                ])
+                    .limit(1000)
+                    .toArray();
+                rows = all.filter((r) => r.id.startsWith(id));
+                if (rows.length > 1) {
+                    throw new Error(`Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`);
+                }
+            }
+            if (rows.length === 0)
+                return null;
+            const row = rows[0];
+            const realScope = row.scope;
+            // Check scope permissions
+            if (!isRowScopeAccessible(realScope, scopeFilter)) {
+                throw new Error(`Memory ${id} is outside accessible scopes`);
+            }
+            const rowScope = realScope ?? "global";
+            // Display mask only. Mutations must persist the RAW stored scope: writing
+            // the "global" mask back would turn an invisible legacy NULL-scope row
+            // into a globally visible one (cross-agent disclosure). Valid scopes are
+            // canonicalized by trim; legacy NULL/blank stays NULL.
+            const persistedScope = (hasValidEntryScope(realScope) ? realScope.trim() : null);
+            const original = {
+                id: row.id,
+                text: row.text,
+                vector: Array.from(row.vector),
+                category: row.category,
+                scope: rowScope,
+                importance: clampImportance(Number(row.importance)),
+                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+                metadata: row.metadata || "{}",
+            };
+            // Build updated entry, preserving original timestamp
+            const updated = {
+                ...original,
+                text: updates.text ?? original.text,
+                vector: updates.vector ?? original.vector,
+                category: updates.category ?? original.category,
+                scope: rowScope,
+                // F3 fix (PR #828 follow-up): clamp importance on update path so
+                // update() callers cannot persist out-of-range values.
+                importance: clampImportance(updates.importance ?? original.importance),
+                timestamp: original.timestamp, // preserve original
+                metadata: updates.metadata ?? original.metadata,
+            };
+            // LanceDB doesn't support in-place update; delete + re-add.
+            // Serialize updates per store instance to avoid stale rollback races.
+            // If the add fails after delete, attempt best-effort recovery without
+            // overwriting a newer concurrent successful update.
+            const rollbackSource = (await this.getById(original.id).catch(() => null)) ?? original;
+            // getById masks a NULL scope as "global" for display; restore the raw
+            // stored scope before any write (scope is immutable through update patches).
+            const rollbackCandidate = { ...rollbackSource, scope: persistedScope };
+            const resolvedId = escapeSqlLiteral(row.id);
+            await this.table.delete(`id = '${resolvedId}'`);
+            try {
+                await this.table.add([{ ...updated, scope: persistedScope }]);
+            }
+            catch (addError) {
+                const current = await this.getById(original.id).catch(() => null);
+                if (current) {
+                    throw new Error(`Failed to update memory ${id}: write failed after delete, but an existing record was preserved. ` +
+                        `Write error: ${addError instanceof Error ? addError.message : String(addError)}`);
+                }
+                try {
+                    await this.table.add([rollbackCandidate]);
+                }
+                catch (rollbackError) {
+                    throw new Error(`Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
+                        `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
+                        `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+                }
+                throw new Error(`Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
                     `Write error: ${addError instanceof Error ? addError.message : String(addError)}`);
             }
-            try {
-                await this.table.add([rollbackCandidate]);
-            }
-            catch (rollbackError) {
-                throw new Error(`Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
-                    `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
-                    `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
-            }
-            throw new Error(`Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
-                `Write error: ${addError instanceof Error ? addError.message : String(addError)}`);
-        }
-        this.noteDataModification();
-        return updated;
-        this.noteDataModification();
-        return updated;
+            this.noteDataModification();
+            return updated;
+        }));
     }
     async runSerializedUpdate(action) {
         const previous = this.updateQueue;
@@ -2232,6 +2441,24 @@ export class MemoryStore {
      * every scoped reader. These two methods are the migration path: find them,
      * then reassign them to an explicit scope.
      */
+    materializeLegacyScopeRow(row) {
+        const rawVector = row.vector;
+        const vector = Array.isArray(rawVector)
+            ? rawVector
+            : rawVector && typeof rawVector.toArray === "function"
+                ? Array.from(rawVector.toArray())
+                : Array.from(rawVector ?? []);
+        return {
+            id: String(row.id),
+            text: String(row.text ?? ""),
+            vector,
+            category: String(row.category ?? "fact"),
+            scope: row.scope ?? null,
+            importance: clampImportance(Number(row.importance)),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: row.metadata || "{}",
+        };
+    }
     async findLegacyScopeRows(limit = 1000) {
         await this.ensureInitialized();
         const rows = await this.table
@@ -2239,24 +2466,34 @@ export class MemoryStore {
             .where("scope IS NULL OR scope = ''")
             .limit(limit)
             .toArray();
-        return rows.map((row) => {
-            const rawVector = row.vector;
-            const vector = Array.isArray(rawVector)
-                ? rawVector
-                : rawVector && typeof rawVector.toArray === "function"
-                    ? Array.from(rawVector.toArray())
-                    : Array.from(rawVector ?? []);
-            return {
-                id: String(row.id),
-                text: String(row.text ?? ""),
-                vector,
-                category: String(row.category ?? "fact"),
-                scope: row.scope ?? null,
-                importance: clampImportance(Number(row.importance)),
-                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-                metadata: row.metadata || "{}",
-            };
-        });
+        const legacy = rows.map((row) => this.materializeLegacyScopeRow(row));
+        // Whitespace-only scopes are invalid under the public write validator, so
+        // they are exactly as invisible to scoped readers as NULL and '' — repair
+        // must discover them too. Lance's SQL pushdown rejects trim(), so project
+        // only id+scope over the remaining rows and filter client-side, then
+        // materialize the (rare) hits individually with their full content.
+        if (legacy.length < limit) {
+            const scopedRows = await this.table
+                .query()
+                .select(["id", "scope"])
+                .where("scope IS NOT NULL AND scope != ''")
+                .toArray();
+            const whitespaceIds = scopedRows
+                .filter((row) => typeof row.scope === "string" && row.scope.trim() === "")
+                .map((row) => String(row.id))
+                .slice(0, limit - legacy.length);
+            for (const id of whitespaceIds) {
+                const full = await this.table
+                    .query()
+                    .where(`id = '${escapeSqlLiteral(id)}'`)
+                    .limit(1)
+                    .toArray();
+                if (full.length > 0) {
+                    legacy.push(this.materializeLegacyScopeRow(full[0]));
+                }
+            }
+        }
+        return legacy;
     }
     async repairLegacyScopes(targetScope) {
         if (!hasValidEntryScope(targetScope)) {
@@ -2265,99 +2502,108 @@ export class MemoryStore {
         const legacyRows = await this.findLegacyScopeRows(100000);
         let repaired = 0;
         let failed = 0;
+        let skipped = 0;
         const unrecovered = [];
-        for (const row of legacyRows) {
+        // A systemic failure (version refresh unavailable, lock unacquirable,
+        // storage errors) must be distinguishable from per-row races: log the
+        // per-row reason (bounded), and stop hammering the cross-process lock
+        // once failures are clearly not row-specific. Unattempted rows stay
+        // legacy, so a later run rediscovers them.
+        const MAX_LOGGED_FAILURES = 20;
+        const MAX_CONSECUTIVE_FAILURES = 10;
+        let consecutiveFailures = 0;
+        for (const candidate of legacyRows) {
             try {
-                await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
-                    const safeId = escapeSqlLiteral(row.id);
+                const outcome = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+                    // The discovery snapshot can go stale before this row's turn under
+                    // the lock: re-read and repair only a row whose stored scope is
+                    // still legacy, from its current content. A concurrent write must
+                    // be neither overwritten with the snapshot nor reassigned to the
+                    // target scope, and a concurrently deleted row must not be
+                    // resurrected.
+                    //
+                    // The lock serializes writers; it does NOT advance this handle's
+                    // cached table version, so a re-read through a stale handle can
+                    // still validate against a snapshot that predates another
+                    // connection's update. Check out the latest version under the lock
+                    // before validating. If the refresh fails, this throw fails the row
+                    // (reported in `failed`) instead of writing from a stale snapshot.
+                    await this.table.checkoutLatest();
+                    const safeId = escapeSqlLiteral(candidate.id);
+                    const currentRows = await this.table.query().where(`id = '${safeId}'`).limit(1).toArray();
+                    if (currentRows.length === 0)
+                        return "skipped";
+                    const currentRaw = currentRows[0];
+                    const currentScope = currentRaw.scope;
+                    // Whitespace-only counts as still-legacy, matching the discovery
+                    // query and the public write validator.
+                    if (currentScope != null && currentScope.trim() !== "")
+                        return "skipped";
+                    const row = this.materializeLegacyScopeRow(currentRaw);
                     const replacement = { ...row, scope: targetScope.trim() };
                     await this.table.delete(`id = '${safeId}'`);
                     try {
                         await this.table.add([replacement]);
                     }
                     catch (addError) {
+                        // Commit-then-reject: the add can persist and STILL surface an
+                        // error (post-commit step failure, retried conflict where the
+                        // retry landed). Re-read before rolling back — blindly re-adding
+                        // the original would leave two rows under the same id.
+                        let landed = null;
                         try {
-                            await this.table.add([{ ...row }]);
+                            const postRows = await this.table.query().where(`id = '${safeId}'`).limit(1).toArray();
+                            landed = postRows.length > 0 ? postRows[0] : null;
                         }
                         catch {
-                            // Both the replacement and the rollback write failed after the
-                            // delete, so the row is no longer in the table. Surface its full
-                            // content to the caller instead of silently losing the data.
-                            unrecovered.push({ ...row });
+                            landed = null;
+                        }
+                        const landedScope = typeof landed?.scope === "string" ? landed.scope.trim() : "";
+                        if (landedScope === targetScope.trim()) {
+                            return "repaired";
+                        }
+                        if (landed === null) {
+                            try {
+                                await this.table.add([{ ...row }]);
+                            }
+                            catch {
+                                // Both the replacement and the rollback write failed after the
+                                // delete, so the row is no longer in the table. Surface its full
+                                // content to the caller instead of silently losing the data.
+                                unrecovered.push({ ...row });
+                            }
                         }
                         throw addError;
                     }
+                    return "repaired";
                 }));
-                repaired += 1;
+                if (outcome === "repaired")
+                    repaired += 1;
+                else
+                    skipped += 1;
+                consecutiveFailures = 0;
             }
-            catch {
+            catch (rowError) {
                 failed += 1;
+                consecutiveFailures += 1;
+                if (failed <= MAX_LOGGED_FAILURES) {
+                    console.warn(`repairLegacyScopes: row ${String(candidate.id).slice(0, 8)} failed: ${rowError instanceof Error ? rowError.message : String(rowError)}`);
+                }
+                else if (failed === MAX_LOGGED_FAILURES + 1) {
+                    console.warn("repairLegacyScopes: further per-row failure logs suppressed");
+                }
+                if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                    const unattempted = legacyRows.length - repaired - failed - skipped;
+                    console.error(`repairLegacyScopes: aborting after ${consecutiveFailures} consecutive failures — the cause looks systemic, not row-specific. ` +
+                        `${unattempted} row(s) unattempted; they remain legacy and discoverable by the next run. ` +
+                        `Last failure: ${rowError instanceof Error ? rowError.message : String(rowError)}`);
+                    break;
+                }
             }
         }
         if (repaired > 0)
             this.noteDataModification();
-        return { repaired, failed, unrecovered };
-    }
-    /**
-     * Atomic supersede-and-store: re-discovers the target rows, inserts the new
-     * row, and invalidates every confirmed target inside ONE write-lock +
-     * serialized-update section. The caller's advisory discovery only decides
-     * whether to enter this path; the target set that actually commits is the
-     * one discovered here, so two concurrent same-key writers converge on a
-     * single active row (the second writer's recheck sees the first writer's
-     * replacement and supersedes it) instead of leaving both replacements
-     * standing.
-     *
-     * Only CONFIRMED invalidations are reported in supersededIds; a null or
-     * throwing patch lands in invalidationFailures instead of being silently
-     * counted as success.
-     */
-    async storeSuperseding(options) {
-        await this.ensureInitialized();
-        const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
-            const targets = await options.discoverTargets();
-            const fullEntry = {
-                ...options.entry,
-                id: randomUUID(),
-                timestamp: Date.now(),
-                metadata: options.finalizeEntryMetadata
-                    ? options.finalizeEntryMetadata(targets)
-                    : options.entry.metadata || "{}",
-                importance: clampImportance(Number(options.entry.importance)),
-            };
-            await this.table.add([fullEntry]);
-            const supersededIds = [];
-            const invalidationFailures = [];
-            for (const target of targets) {
-                try {
-                    const existing = await this.getById(target.id, options.scopeFilter);
-                    if (!existing) {
-                        invalidationFailures.push({
-                            id: target.id,
-                            reason: "row not found or outside accessible scopes at commit time",
-                        });
-                        continue;
-                    }
-                    const metadata = buildSmartMetadata(existing, options.buildTargetPatch(existing, fullEntry.id));
-                    const updated = await this.performUpdate(target.id, { metadata: stringifySmartMetadata(metadata) }, options.scopeFilter);
-                    if (updated == null) {
-                        invalidationFailures.push({ id: target.id, reason: "update persisted no row" });
-                    }
-                    else {
-                        supersededIds.push(target.id);
-                    }
-                }
-                catch (err) {
-                    invalidationFailures.push({
-                        id: target.id,
-                        reason: err instanceof Error ? err.message : String(err),
-                    });
-                }
-            }
-            return { entry: fullEntry, supersededIds, invalidationFailures };
-        }));
-        this.noteDataModification();
-        return result;
+        return { repaired, failed, skipped, unrecovered };
     }
     async bulkDelete(scopeFilter, beforeTimestamp) {
         await this.ensureInitialized();
@@ -2457,7 +2703,7 @@ export class MemoryStore {
      * omitted from `list()` for performance, but compaction needs them for
      * cosine-similarity clustering.
      */
-    async fetchForCompaction(maxTimestamp, scopeFilter, limit = 200, options) {
+    async fetchForCompaction(maxTimestamp, scopeFilter, limit = 200) {
         await this.ensureInitialized();
         // An explicitly empty scope filter is a deny-all contract, matching the
         // other scoped readers: compaction must never widen into every scope.
@@ -2477,24 +2723,17 @@ export class MemoryStore {
             .query()
             .where(whereClause)
             .toArray();
-        const entries = results
+        return results
             .map((row) => ({
             id: row.id,
             text: row.text,
-            vector: toNumberVector(row.vector),
+            vector: Array.isArray(row.vector) ? row.vector : [],
             category: row.category,
             scope: row.scope ?? "global",
             importance: clampImportance(Number(row.importance)),
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
-        }));
-        // excludeInactive defaults to true: a background compactor or
-        // consolidate run must not cluster already-dead rows (item 6, PR #946).
-        const excludeInactive = options?.excludeInactive ?? true;
-        const activeEntries = excludeInactive
-            ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
-            : entries;
-        return activeEntries
+        }))
             .sort((a, b) => b.timestamp - a.timestamp)
             .slice(0, limit);
     }

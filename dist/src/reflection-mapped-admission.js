@@ -18,11 +18,30 @@
  * reasons, and audit records are identical either way — only the LLM call
  * topology differs.
  */
-import { getReflectionMappedMemoryCategory, } from "./reflection-mapped-metadata.js";
+/**
+ * Admission typePriors are keyed by the six smart registers, but mapped rows
+ * carry legacy store categories. Score them under the smart register that
+ * matches their shape: user-model/agent-model deltas are preference-shaped
+ * statements about the human or the assistant ("preference"), lessons are
+ * symptom/cause/fix/prevention pairs ("fact" here, cases-shaped), and
+ * decisions are episodic records of something decided ("events").
+ */
+export function mapReflectionMappedCategoryToSmartRegister(category) {
+    switch (category) {
+        case "preference":
+            return "preferences";
+        case "fact":
+            return "cases";
+        case "decision":
+            return "events";
+        default:
+            return "events";
+    }
+}
 function buildGateItem(row, conversationText, scopeFilter) {
     return {
         candidate: {
-            category: getReflectionMappedMemoryCategory(row.kind),
+            category: mapReflectionMappedCategoryToSmartRegister(row.category),
             abstract: row.text,
             overview: `## ${row.heading}`,
             content: row.text,
@@ -132,7 +151,6 @@ export async function gateMappedReflectionEntry(params) {
             {
                 text: params.text,
                 category: params.category,
-                kind: params.kind,
                 heading: params.heading,
                 vector: params.vector,
             },

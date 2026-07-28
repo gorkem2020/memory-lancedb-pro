@@ -31,6 +31,10 @@ const {
   registerMemoryRecallTool,
   registerMemoryStoreTool,
 } = jiti("../src/tools.ts");
+const {
+  flushManualRecallMetadataForTest,
+  ManualRecallMetadataQueue,
+} = jiti("../src/manual-recall-metadata-queue.ts");
 const { MemoryRetriever } = jiti("../src/retriever.js");
 const { buildSmartMetadata, stringifySmartMetadata } = jiti("../src/smart-metadata.ts");
 
@@ -395,6 +399,8 @@ function makeRecallContext(results = makeResults()) {
     },
     store: {
       patchMetadata: async () => null,
+      applyManualRecallMetadataBatch: async (updates) =>
+        updates.map((update) => ({ id: update.id, entry: { id: update.id } })),
     },
     scopeManager: {
       getAccessibleScopes: () => ["global"],
@@ -458,6 +464,113 @@ describe("recall text cleanup", () => {
     assert.equal(typeof res.details.memories[1].score, "number");
     assert.ok(res.details.memories[1].sources.vector);
     assert.ok(res.details.memories[1].sources.bm25);
+  });
+
+  it("returns manual recall results before the metadata batch settles", async () => {
+    const context = makeRecallContext();
+    let releaseBatchGate;
+    const batchGate = new Promise((resolve) => {
+      releaseBatchGate = resolve;
+    });
+    const batches = [];
+    let batchSettled = false;
+
+    context.store.applyManualRecallMetadataBatch = async (updates) => {
+      batches.push(updates);
+      await batchGate;
+      batchSettled = true;
+      return updates.map((update) => ({ id: update.id, entry: { id: update.id } }));
+    };
+
+    const tool = createTool(registerMemoryRecallTool, context);
+    const output = await tool.execute(null, { query: "test" });
+    const flushPromise = flushManualRecallMetadataForTest(context.store);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    try {
+      assert.match(output.content[0].text, /<relevant-memories>/);
+      assert.equal(batches.length, 1, "queued updates should share one store batch");
+      assert.equal(batchSettled, false, "manual recall should return before the batch settles");
+      assert.deepEqual(
+        batches[0].map(({ id, expectedScope, accessCountDelta }) => ({
+          id,
+          expectedScope,
+          accessCountDelta,
+        })),
+        [
+          { id: "m1", expectedScope: "global", accessCountDelta: 1 },
+          { id: "m2", expectedScope: "global", accessCountDelta: 1 },
+        ],
+      );
+    } finally {
+      releaseBatchGate();
+      await flushPromise;
+    }
+
+    assert.equal(batchSettled, true, "background metadata batch should eventually settle");
+  });
+
+  it("coalesces concurrent recall deltas by memory ID", async () => {
+    const context = makeRecallContext();
+    const batches = [];
+    context.store.applyManualRecallMetadataBatch = async (updates) => {
+      batches.push(updates);
+      return updates.map((update) => ({ id: update.id, entry: { id: update.id } }));
+    };
+    const tool = createTool(registerMemoryRecallTool, context);
+
+    const outputs = await Promise.all([
+      tool.execute(null, { query: "test" }),
+      tool.execute(null, { query: "test" }),
+      tool.execute(null, { query: "test" }),
+      tool.execute(null, { query: "test" }),
+    ]);
+    await flushManualRecallMetadataForTest(context.store);
+
+    assert.ok(outputs.every((output) => /<relevant-memories>/.test(output.content[0].text)));
+    assert.equal(batches.length, 1);
+    assert.deepEqual(
+      batches[0].map(({ id, accessCountDelta }) => ({ id, accessCountDelta })),
+      [
+        { id: "m1", accessCountDelta: 4 },
+        { id: "m2", accessCountDelta: 4 },
+      ],
+    );
+  });
+
+  it("retries only failed metadata batch entries with useful ID logging", async () => {
+    const calls = [];
+    const warnings = [];
+    const writer = {
+      async applyManualRecallMetadataBatch(updates) {
+        calls.push(updates);
+        if (calls.length === 1) {
+          return updates.map((update) => ({
+            id: update.id,
+            entry: null,
+            error: update.id === "m1" ? "simulated lock timeout" : undefined,
+          }));
+        }
+        return updates.map((update) => ({ id: update.id, entry: { id: update.id } }));
+      },
+    };
+    const queue = new ManualRecallMetadataQueue(writer, {
+      debounceMs: 60_000,
+      retryDelayMs: () => 0,
+      warn: (message) => warnings.push(message),
+    });
+
+    queue.enqueue([
+      { id: "m1", expectedScope: "global", accessCountDelta: 1, accessedAt: 100, governanceSnapshot: { badRecallCount: 0, suppressedUntilTurn: 0 } },
+      { id: "m2", expectedScope: "global", accessCountDelta: 1, accessedAt: 100, governanceSnapshot: { badRecallCount: 0, suppressedUntilTurn: 0 } },
+    ]);
+    await queue.flush();
+    await new Promise((resolve) => setImmediate(resolve));
+    await queue.flush();
+
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[1].map(({ id }) => id), ["m1"]);
+    assert.ok(warnings.some((line) => /retry id=m1 attempt=1\/3/.test(line)));
   });
 
   it("keeps memory_recall neighbor summaries within the per-item character budget", async () => {

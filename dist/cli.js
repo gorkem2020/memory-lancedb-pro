@@ -11,8 +11,6 @@ import { loadLanceDB } from "./src/store.js";
 import { parseSmartMetadata, buildSmartMetadata, stringifySmartMetadata, } from "./src/smart-metadata.js";
 import { createRetriever } from "./src/retriever.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
-import { runConsolidate, formatConsolidateCostPreview, formatConsolidatePlanForDisplay, pluralCount } from "./src/consolidate.js";
-import { clampBatchChunkSize } from "./src/memory-categories.js";
 import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSupported, listOAuthProviders, normalizeOauthModel, normalizeOAuthProviderId, performOAuthLogin, } from "./src/llm-oauth.js";
 // ============================================================================
 // Utility Functions
@@ -696,11 +694,12 @@ export async function runImportMarkdown(ctx, workspaceGlob, options) {
         if (typeof ctx.store.bulkStore === "function") {
             try {
                 bulkStoreCalls++;
-                await ctx.store.bulkStore(entries, ({ index, reason }) => {
+                const persisted = await ctx.store.bulkStore(entries, ({ index, reason }) => {
                     console.warn(`  [import-markdown] dropped invalid entry ${index}: ${reason}`);
                 });
-                console.log(`  [import] stored batch ${bulkStoreCalls} (${entries.length} entries, total: ${imported + entries.length})`);
-                return { imported: entries.length, skipped: 0 };
+                const persistedCount = Array.isArray(persisted) ? persisted.length : entries.length;
+                console.log(`  [import] stored batch ${bulkStoreCalls} (${persistedCount}/${entries.length} entries, total: ${imported + persistedCount})`);
+                return { imported: persistedCount, skipped: entries.length - persistedCount };
             }
             catch (err) {
                 console.warn(`  [import-markdown] batch store failed (${err}); retrying entries individually`);
@@ -1048,7 +1047,6 @@ export function registerMemoryCLI(program, context) {
         .option("--limit <n>", "Maximum number of results", "20")
         .option("--offset <n>", "Number of results to skip", "0")
         .option("--json", "Output as JSON")
-        .option("--include-invalidated", "Include invalidated/superseded rows (excluded by default)", false)
         .action(async (options) => {
         try {
             const limit = parseInt(options.limit) || 20;
@@ -1057,7 +1055,7 @@ export function registerMemoryCLI(program, context) {
             if (options.scope) {
                 scopeFilter = [options.scope];
             }
-            const memories = await context.store.list(scopeFilter, options.category, limit, offset, { excludeInactive: !options.includeInvalidated });
+            const memories = await context.store.list(scopeFilter, options.category, limit, offset);
             if (options.json) {
                 writeJson(memories);
             }
@@ -1167,7 +1165,6 @@ export function registerMemoryCLI(program, context) {
             }
             else {
                 console.log(`Memory Statistics:`);
-                console.log(`• Live memories: ${stats.liveCount}`);
                 console.log(`• Total memories: ${stats.totalCount}`);
                 console.log(`• Available scopes: ${scopeStats.totalScopes}`);
                 console.log(`• Retrieval mode: ${retrievalConfig.mode}`);
@@ -1272,11 +1269,8 @@ export function registerMemoryCLI(program, context) {
             if (options.scope) {
                 scopeFilter = [options.scope];
             }
-            // excludeInactive:false -- export is a backup/forensic view and must
-            // keep full-dump semantics, including invalidated/superseded rows
-            // (item 6, PR #946).
-            const memories = await context.store.list(scopeFilter, options.category, 1000, // Large limit for export
-            0, { excludeInactive: false });
+            const memories = await context.store.list(scopeFilter, options.category, 1000 // Large limit for export
+            );
             const exportData = {
                 version: "1.0",
                 exportedAt: new Date().toISOString(),
@@ -1316,12 +1310,11 @@ export function registerMemoryCLI(program, context) {
         .option("--category <category>", "Export specific category")
         .option("--limit <number>", "Maximum memories to export", "1000")
         .option("--dry-run", "Show what would be written without creating files")
-        .option("--include-invalidated", "Include invalidated/superseded rows (excluded by default)", false)
         .action(async (options) => {
         try {
             const limit = clampInt(Number(options.limit), 1, 10000);
             const scopeFilter = options.scope ? [String(options.scope)] : undefined;
-            const memories = await context.store.list(scopeFilter, options.category, limit, 0, { excludeInactive: !options.includeInvalidated });
+            const memories = await context.store.list(scopeFilter, options.category, limit);
             const vault = path.resolve(String(options.vault));
             const root = path.join(vault, "00-AI-Memory");
             let created = 0;
@@ -1574,6 +1567,7 @@ export function registerMemoryCLI(program, context) {
             let processed = 0;
             let imported = 0;
             let skipped = 0;
+            let scopeless = 0;
             for (let i = 0; i < rows.length; i += batchSize) {
                 const batch = rows.slice(i, i + batchSize);
                 const texts = batch.map((r) => String(r.text));
@@ -1594,12 +1588,23 @@ export function registerMemoryCLI(program, context) {
                             continue;
                         }
                     }
+                    // Never launder a missing/blank scope into "global": that would
+                    // promote rows invisible to every scoped reader into data every
+                    // agent can see, bypassing importEntry's fail-closed contract.
+                    const rowScope = typeof row.scope === "string" ? row.scope.trim() : "";
+                    if (!rowScope) {
+                        scopeless++;
+                        if (scopeless <= 20) {
+                            console.warn(`  Skipping scope-less legacy row ${id.slice(0, 8)}: assign scopes in the source store (memory-pro repair-scopes) and re-run.`);
+                        }
+                        continue;
+                    }
                     const entry = {
                         id,
                         text: String(row.text),
                         vector,
                         category: row.category || "other",
-                        scope: row.scope || "global",
+                        scope: rowScope,
                         importance: (row.importance != null) ? Number(row.importance) : 0.7,
                         timestamp: (row.timestamp != null) ? Number(row.timestamp) : Date.now(),
                         metadata: typeof row.metadata === "string" ? row.metadata : "{}",
@@ -1611,7 +1616,7 @@ export function registerMemoryCLI(program, context) {
                     console.log(`Progress: ${processed}/${rows.length} processed, ${imported} imported, ${skipped} skipped`);
                 }
             }
-            console.log(`Re-embed completed: ${imported} imported, ${skipped} skipped (processed=${processed}).`);
+            console.log(`Re-embed completed: ${imported} imported, ${skipped} skipped, ${scopeless} scope-less legacy row(s) left for repair-scopes (processed=${processed}).`);
         }
         catch (error) {
             console.error("Re-embed failed:", error);
@@ -1627,30 +1632,11 @@ export function registerMemoryCLI(program, context) {
         .option("--no-llm", "Skip LLM calls; use simple text truncation for L0/L1")
         .option("--limit <n>", "Maximum number of memories to upgrade")
         .option("--scope <scope>", "Only upgrade memories in this scope")
-        .option("--categories-only", "Only re-stamp memory_category on reflection-mapped rows (skip the general legacy L0/L1/L2 upgrade)")
         .action(async (options) => {
         try {
             const upgrader = createMemoryUpgrader(context.store, options.llm === false ? null : (context.llmClient ?? null), { log: console.log });
-            const scopeFilter = options.scope ? [options.scope] : undefined;
-            if (options.categoriesOnly) {
-                const result = await upgrader.normalizeMappedRowCategories({
-                    dryRun: !!options.dryRun,
-                    scopeFilter,
-                });
-                console.log(`Mapped-Row Category Normalization:`);
-                console.log(`• Reflection-mapped rows scanned: ${result.totalMapped}`);
-                console.log(`• Already correct: ${result.alreadyCorrect}`);
-                console.log(`${options.dryRun ? "• [DRY-RUN] Would normalize" : "• Normalized"}: ${result.normalized}`);
-                if (result.errors.length > 0) {
-                    console.log(`• Errors: ${result.errors.length}`);
-                    result.errors.slice(0, 5).forEach(err => console.log(`  - ${err}`));
-                    if (result.errors.length > 5) {
-                        console.log(`  ... and ${result.errors.length - 5} more`);
-                    }
-                }
-                return;
-            }
             // Show current status first
+            const scopeFilter = options.scope ? [options.scope] : undefined;
             const counts = await upgrader.countLegacy(scopeFilter);
             console.log(`Memory Upgrade Status:`);
             console.log(`• Total memories: ${counts.total}`);
@@ -1778,7 +1764,7 @@ export function registerMemoryCLI(program, context) {
         }
     });
     // reindex-fts: Rebuild FTS index
-    memory
+    program
         .command("reindex-fts")
         .description("Rebuild the BM25 full-text search index")
         .action(async () => {
@@ -1800,7 +1786,7 @@ export function registerMemoryCLI(program, context) {
         }
     });
     // repair-summaries: Detect and fix stale L0/L1/L2 summaries
-    memory
+    program
         .command("repair-summaries")
         .description("Detect and fix L0/L1/L2 summaries that are inconsistent with text (text updated but summaries not regenerated)")
         .option("--scope <scope>", "Filter by scope (e.g. agent:bs-intern)")
@@ -1873,14 +1859,40 @@ export function registerMemoryCLI(program, context) {
         }
     });
     // repair-scopes: migration path for legacy NULL/blank-scope rows that the
-    // scope hardening makes invisible to every scoped reader
+    // scope hardening makes invisible to every scoped reader. Must attach to
+    // the `memory` group: the host routes only `memory-pro <sub>`, so a command
+    // chained off the root program is unreachable in production.
     memory
         .command("repair-scopes")
         .description("Detect legacy NULL/blank-scope rows (invisible to scoped readers) and reassign them to an explicit scope")
         .option("--target-scope <scope>", "Scope assigned to legacy rows on --apply", "global")
+        .option("--allow-new-scope", "Allow a --target-scope that is not globally defined in scope config (built-in patterns like agent:<id> for an id this config has never seen)", false)
         .option("--apply", "Apply the reassignment (default: report only)", false)
         .action(async (options) => {
         try {
+            // Validate through the normal scope validator up front: a typo here
+            // would strand every repaired row in a scope no reader resolves,
+            // recreating the invisibility this command exists to fix.
+            const targetScope = String(options.targetScope ?? "").trim();
+            if (!context.scopeManager.validateScope(targetScope)) {
+                console.error(`repair-scopes: invalid --target-scope "${options.targetScope}": not a defined scope or built-in pattern ` +
+                    "(global, agent:<id>, custom:<name>, project:<id>, user:<id>, reflection:agent:<id>). " +
+                    "Rows assigned to an unknown scope would be unreachable to every reader.");
+                process.exitCode = 1;
+                return;
+            }
+            // Format validation alone cannot catch a well-formed typo: "agent:mian"
+            // matches the agent:<id> built-in pattern, yet reassigned rows would
+            // sit in a scope no configured reader resolves AND stop being
+            // discoverable as legacy. Novel scopes need explicit intent.
+            const knownScopes = new Set(["global", ...context.scopeManager.getAllScopes()]);
+            if (!knownScopes.has(targetScope) && !options.allowNewScope) {
+                console.error(`repair-scopes: --target-scope "${targetScope}" is well-formed but not defined in scope config. ` +
+                    "A typo here would strand every repaired row in a scope no reader resolves, and the rows would no longer be discoverable as legacy. " +
+                    "Pass --allow-new-scope to confirm this scope is intended.");
+                process.exitCode = 1;
+                return;
+            }
             const legacy = await context.store.findLegacyScopeRows(100000);
             console.log(`Found ${legacy.length} legacy row(s) with NULL/blank scope${legacy.length > 0 ? ":" : "."}`);
             for (const entry of legacy.slice(0, 20)) {
@@ -1891,12 +1903,12 @@ export function registerMemoryCLI(program, context) {
             }
             if (!options.apply) {
                 if (legacy.length > 0) {
-                    console.log(`\nReport-only mode. Re-run with --apply to assign scope "${options.targetScope}".`);
+                    console.log(`\nReport-only mode. Re-run with --apply to assign scope "${targetScope}".`);
                 }
                 return;
             }
-            const { repaired, failed, unrecovered } = await context.store.repairLegacyScopes(options.targetScope);
-            console.log(`\nRepair complete: ${repaired} reassigned to "${options.targetScope}", ${failed} failed.`);
+            const { repaired, failed, skipped, unrecovered } = await context.store.repairLegacyScopes(targetScope);
+            console.log(`\nRepair complete: ${repaired} reassigned to "${targetScope}", ${skipped} skipped (changed or removed since discovery), ${failed} failed.`);
             if (unrecovered.length > 0) {
                 console.error(`\n${unrecovered.length} row(s) could not be restored after a failed replacement write. ` +
                     "Full row content follows (JSON, one per line) so the data is not lost:");
@@ -1904,189 +1916,12 @@ export function registerMemoryCLI(program, context) {
                     console.error(JSON.stringify(entry));
                 }
             }
+            if (failed > 0 || unrecovered.length > 0) {
+                process.exitCode = 1;
+            }
         }
         catch (error) {
             console.error("repair-scopes failed:", error);
-            process.exit(1);
-        }
-    });
-    // consolidate: reconcile duplicate/contradictory rows already in the store
-    registerConsolidateCommand(memory, context);
-}
-/**
- * Item 7: the real confirm implementation wired to a real CLI invocation.
- * Fails closed -- non-interactive (either stream not a TTY) resolves false
- * without ever reading anything, so a scripted/piped invocation without
- * --yes aborts cleanly instead of hanging on stdin or silently proceeding.
- * Streams are injectable so tests can drive both branches deterministically.
- */
-export function createConsolidateConfirm(streams) {
-    const stdin = streams?.stdin ?? process.stdin;
-    const stdout = streams?.stdout ?? process.stdout;
-    return async (promptText) => {
-        if (!stdin.isTTY || !stdout.isTTY) {
-            return false;
-        }
-        const rl = readline.createInterface({ input: stdin, output: stdout });
-        try {
-            const answer = await new Promise((resolve) => rl.question(promptText, resolve));
-            return answer.trim() === "YES";
-        }
-        finally {
-            rl.close();
-        }
-    };
-}
-/** Item 8: renders the full plan (verdict, member ids, survivor, exact merge content) for user review before the apply prompt. */
-async function loadConsolidateSettledLedger(ledgerPath) {
-    try {
-        const raw = await readFile(ledgerPath, "utf-8");
-        const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === "object" ? parsed : {};
-    }
-    catch {
-        return {};
-    }
-}
-async function saveConsolidateSettledLedger(ledgerPath, ledger, scope, newlySettled) {
-    if (newlySettled.length === 0)
-        return;
-    try {
-        const merged = new Set([...(ledger[scope] ?? []), ...newlySettled]);
-        ledger[scope] = [...merged];
-        await writeFile(ledgerPath, JSON.stringify(ledger, null, 2), "utf-8");
-    }
-    catch (err) {
-        console.warn(`consolidate: could not persist settled ledger: ${String(err)}`);
-    }
-}
-function registerConsolidateCommand(memory, context) {
-    memory
-        .command("consolidate")
-        .description("Reconcile duplicate or contradictory memories already in the store across write lanes (dry-run by default)")
-        .requiredOption("--agent <agentId>", "Agent whose memory to consolidate (scope agent:<agentId>; journal-mirror writes route to this agent's workspace)")
-        .option("--category <category>", "Limit to one smart category (profile|preferences|entities|events|cases|patterns)")
-        .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
-        .option("--apply", "Apply the consolidation plan immediately (default is a dry-run preview with an interactive apply prompt)", false)
-        .option("--yes", "Skip the LLM-cost confirmation prompt (required for non-interactive/automated runs)", false)
-        .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
-        .action(async (options) => {
-        try {
-            if (!context.llmClient) {
-                console.error("consolidate: no LLM client configured, cannot make consolidation decisions");
-                process.exit(1);
-            }
-            if (!context.embedder) {
-                console.error("consolidate: no embedder configured, cannot re-embed merged rows");
-                process.exit(1);
-            }
-            const llmClient = context.llmClient;
-            const embedder = context.embedder;
-            let sinceMs;
-            if (options.since) {
-                const parsed = Date.parse(options.since);
-                if (Number.isNaN(parsed)) {
-                    console.error(`consolidate: invalid --since timestamp "${options.since}"`);
-                    process.exit(1);
-                }
-                sinceMs = parsed;
-            }
-            const mdMirror = context.mdMirror;
-            const confirm = createConsolidateConfirm();
-            const scope = `agent:${options.agent}`;
-            const settledLedgerPath = typeof context.store.dbPath === "string" && context.store.dbPath.length > 0
-                ? path.join(context.store.dbPath, "consolidate-settled.json")
-                : undefined;
-            const settledLedger = settledLedgerPath ? await loadConsolidateSettledLedger(settledLedgerPath) : {};
-            const result = await runConsolidate({
-                fetchRows: (scopeFilter, maxTimestamp, limit) => context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit),
-                update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
-                getById: (id, scopeFilter) => context.store.getById(id, scopeFilter),
-                embed: (text) => embedder.embedPassage(text),
-                completeJson: (prompt, label, system, temperature) => llmClient.completeJson(prompt, label, system, temperature),
-                log: (message) => console.warn(message),
-                confirmCost: async (message) => {
-                    console.log(`\n${message}`);
-                    return confirm("Proceed with these LLM calls? Type YES to continue: ");
-                },
-                confirmApply: async (message, clusters) => {
-                    console.log(`\n${formatConsolidatePlanForDisplay(clusters)}`);
-                    console.log(`\n${message}`);
-                    return confirm("Type YES to apply: ");
-                },
-                onAudit: mdMirror
-                    ? async (audit) => {
-                        const summary = `${audit.action} survivor=${audit.survivorId.slice(0, 8)} absorbed=${audit.absorbedIds.map((id) => id.slice(0, 8)).join(",")} reason="${audit.reason}"`;
-                        await mdMirror({ text: summary, category: "consolidation", scope: audit.scope, timestamp: Date.now() }, { source: `memory-consolidate:${audit.action}`, agentId: options.agent });
-                    }
-                    : undefined,
-            }, {
-                scope,
-                category: options.category,
-                sinceMs,
-                includeReflectionSlices: options.includeReflectionSlices,
-                apply: options.apply === true,
-                autoConfirm: options.yes === true,
-                mergeChunkSize: clampBatchChunkSize(context.pluginConfig?.batchChunkSize),
-                settledFingerprints: new Set(settledLedger[scope] ?? []),
-            });
-            if (result.status === "aborted") {
-                const declined = (result.abortReason ?? "").includes("cost gate declined");
-                if (declined) {
-                    console.log(`consolidate: cancelled at the cost gate — no LLM calls were made.`);
-                    console.log(`Pass --yes to skip this prompt (e.g. for automation).`);
-                }
-                else {
-                    console.error(`consolidate: aborted -- ${result.abortReason}`);
-                    if (result.costPreview) {
-                        console.error(formatConsolidateCostPreview(result.costPreview));
-                    }
-                    console.error(`Pass --yes to skip this prompt (e.g. for automation), or re-run interactively and type YES.`);
-                }
-                process.exit(1);
-            }
-            console.log(`Scanned ${pluralCount(result.scanned, "row")}, ${result.eligible} eligible for consolidation.`);
-            const settledNote = result.settledSkipped > 0 ? ` (${result.settledSkipped} settled in previous runs)` : "";
-            if (result.clusters.length === 0) {
-                console.log(`0 candidates${settledNote} — nothing to consolidate.\n`);
-            }
-            else {
-                console.log(`Decided ${pluralCount(result.clusters.length, "cluster")}${settledNote}:\n`);
-            }
-            for (const cluster of result.clusters) {
-                if (cluster.malformed) {
-                    const label = cluster.failure === "call-failed" ? "undecided: LLM call failed" : "skipped: malformed verdict";
-                    console.log(`  [${label}] ${pluralCount(cluster.memberIds.length, "row")}`);
-                    for (const text of cluster.memberTexts)
-                        console.log(`    - "${text}"`);
-                    continue;
-                }
-                const blockedNote = cluster.blocked === "append-only-shield" ? " — BLOCKED by append-only shield (not applied)" : "";
-                console.log(`  [${cluster.verdict.verdict}] ${pluralCount(cluster.memberIds.length, "row")} — ${cluster.verdict.reason}${blockedNote}`);
-                for (const text of cluster.memberTexts)
-                    console.log(`    - "${text}"`);
-            }
-            if (result.staleSkipped.length > 0) {
-                console.log(`\n${pluralCount(result.staleSkipped.length, "cluster")} skipped: changed since the plan was built (stale).`);
-            }
-            if (result.status === "completed" && settledLedgerPath) {
-                await saveConsolidateSettledLedger(settledLedgerPath, settledLedger, scope, result.newlySettled);
-            }
-            if (!result.executed) {
-                if (!options.apply) {
-                    console.log(`\nNo changes applied.`);
-                }
-                return;
-            }
-            const failureNotes = [];
-            if (result.skippedMalformed > 0)
-                failureNotes.push(`${pluralCount(result.skippedMalformed, "cluster")} skipped due to malformed verdicts`);
-            if (result.undecidedCallFailed > 0)
-                failureNotes.push(`${pluralCount(result.undecidedCallFailed, "cluster")} undecided because the decide call failed`);
-            console.log(`\nApplied ${pluralCount(result.applied.length, "action")}${failureNotes.length ? "; " + failureNotes.join("; ") : ""}.`);
-        }
-        catch (error) {
-            console.error("consolidate failed:", error);
             process.exit(1);
         }
     });

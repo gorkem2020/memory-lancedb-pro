@@ -16,6 +16,7 @@ import { appendSelfImprovementEntry, countSelfImprovementEntries, DEFAULT_SELF_I
 import { getDisplayCategoryTag, parseReflectionMetadata } from "./reflection-metadata.js";
 import { filterUserMdExclusiveRecallResults, isUserMdExclusiveMemory, } from "./workspace-boundary.js";
 import { isSuppressed as isTier1Suppressed } from "./auto-recall-tier1.js";
+import { enqueueManualRecallMetadata } from "./manual-recall-metadata-queue.js";
 // ============================================================================
 // Types
 // ============================================================================
@@ -735,21 +736,22 @@ function createMemoryRecallTool(runtimeContext, options) {
                     };
                 }
                 const now = Date.now();
-                await Promise.allSettled(results.map((result) => {
-                    const meta = parseSmartMetadata(result.entry.metadata, result.entry);
-                    return runtimeContext.store.patchMetadata(result.entry.id, {
-                        access_count: meta.access_count + 1,
-                        last_accessed_at: now,
-                        last_confirmed_use_at: now,
-                        bad_recall_count: 0,
-                        suppressed_until_turn: 0,
-                        // Manual recall is a strong positive signal — clear active
-                        // ms-based suppression too, matching pre-Tier1 semantics
-                        // where zeroing the turn field cleared the only suppression
-                        // mechanism. Without this, governance keeps suppressing a
-                        // memory the user just explicitly searched for.
-                        suppressed_until_ms: 0,
-                    }, scopeFilter);
+                // Manual recall is a strong positive governance signal. Coalesce
+                // access deltas and suppression resets behind the response path so
+                // concurrent agents share one lock-safe metadata batch.
+                enqueueManualRecallMetadata(runtimeContext.store, results.map((result) => {
+                    const metadata = parseSmartMetadata(result.entry.metadata, result.entry);
+                    return {
+                        id: result.entry.id,
+                        expectedScope: result.entry.scope,
+                        accessCountDelta: 1,
+                        accessedAt: now,
+                        governanceSnapshot: {
+                            badRecallCount: metadata.bad_recall_count,
+                            suppressedUntilTurn: metadata.suppressed_until_turn,
+                            suppressedUntilMs: metadata.suppressed_until_ms,
+                        },
+                    };
                 }));
                 const text = results
                     .map((r, i) => {
