@@ -1754,48 +1754,6 @@ export class MemoryStore {
     return await this.table!.countRows();
   }
 
-  /**
-   * Finds rows whose id starts with `prefix`, restricted to accessible
-   * scopes. Backs the documented "full UUID or 8+ char prefix" contract on
-   * memory_forget/memory_update: injected context shows agents truncated ids,
-   * so a unique-prefix lookup is the only way those handles can ever resolve.
-   * The prefix must be hex/dash shaped (validated here, defense in depth on
-   * top of the tool-layer classification) and at least 8 chars, so a short
-   * or malformed ref can never scan-match. Capped at `limit` matches: the
-   * caller only distinguishes zero / one / many.
-   */
-  async findByIdPrefix(
-    prefix: string,
-    scopeFilter?: string[],
-    limit = 5,
-  ): Promise<MemoryEntry[]> {
-    await this.ensureInitialized();
-
-    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
-    const normalized = prefix.trim().toLowerCase();
-    if (!/^[0-9a-f][0-9a-f-]{7,35}$/.test(normalized)) return [];
-
-    const safePrefix = escapeSqlLiteral(normalized);
-    const rows = await this.table!
-      .query()
-      .where(`id LIKE '${safePrefix}%'`)
-      .limit(Math.max(1, limit))
-      .toArray();
-
-    return rows
-      .filter((row) => isRowScopeAccessible(row.scope as string | null | undefined, scopeFilter))
-      .map((row) => ({
-        id: row.id as string,
-        text: row.text as string,
-        vector: Array.from(row.vector as Iterable<number>),
-        category: row.category as MemoryEntry["category"],
-        scope: (row.scope as string | null | undefined) ?? "global",
-        importance: clampImportance(Number(row.importance)),
-        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-        metadata: (row.metadata as string) || "{}",
-      }));
-  }
-
   async getById(id: string, scopeFilter?: string[]): Promise<MemoryEntry | null> {
     await this.ensureInitialized();
 
@@ -2837,28 +2795,19 @@ export class MemoryStore {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    return this.runWithWriteLock(() => this.runSerializedUpdate(() => this.performUpdate(id, updates, scopeFilter)));
-  }
+    return this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+      // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
+      // from older stores (for example "mem-md-..." or "data-pointer-...").
+      const uuidRegex =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const prefixRegex = /^[0-9a-f]{8,}$/i;
+      const isFullId = uuidRegex.test(id);
+      const isPrefix = !isFullId && prefixRegex.test(id);
+      const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
 
-  /**
-   * Core of update(): resolve the row, apply the patch, and persist via
-   * delete + re-add with rollback. Must be called while already holding the
-   * write lock and the serialized-update queue: update() wraps it, and the
-   * supersede commit path calls it from inside its own atomic section.
-   */
-  private async performUpdate(
-    id: string,
-    updates: MemoryUpdatePatch,
-    scopeFilter?: string[],
-  ): Promise<MemoryEntry | null> {
-    // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
-    // from older stores (for example "mem-md-..." or "data-pointer-...").
-    const uuidRegex =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const prefixRegex = /^[0-9a-f]{8,}$/i;
-    const isFullId = uuidRegex.test(id);
-    const isPrefix = !isFullId && prefixRegex.test(id);
-    const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
+      if (!isFullId && !isPrefix && !isLegacyStableId) {
+        throw new Error(`Invalid memory ID format: ${id}`);
+      }
 
       let rows: any[];
       if (isFullId || isLegacyStableId) {
@@ -2965,6 +2914,83 @@ export class MemoryStore {
             `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
           );
         }
+
+        throw new Error(
+          `Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
+          `Write error: ${addError instanceof Error ? addError.message : String(addError)}`,
+        );
+      }
+
+      this.noteDataModification();
+      return updated;
+    }));
+  }
+
+  /**
+   * Finds rows whose id starts with `prefix`, restricted to accessible
+   * scopes. Backs the documented "full UUID or 8+ char prefix" contract on
+   * memory_forget/memory_update: injected context shows agents truncated ids,
+   * so a unique-prefix lookup is the only way those handles can ever resolve.
+   * The prefix must be hex/dash shaped (validated here, defense in depth on
+   * top of the tool-layer classification) and at least 8 chars, so a short
+   * or malformed ref can never scan-match. Capped at `limit` matches: the
+   * caller only distinguishes zero / one / many.
+   */
+  async findByIdPrefix(
+    prefix: string,
+    scopeFilter?: string[],
+    limit = 5,
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+
+    if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
+    const normalized = prefix.trim().toLowerCase();
+    if (!/^[0-9a-f][0-9a-f-]{7,35}$/.test(normalized)) return [];
+
+    const safePrefix = escapeSqlLiteral(normalized);
+    const rows = await this.table!
+      .query()
+      .where(`id LIKE '${safePrefix}%'`)
+      .limit(Math.max(1, limit))
+      .toArray();
+
+    return rows
+      .filter((row) => isRowScopeAccessible(row.scope as string | null | undefined, scopeFilter))
+      .map((row) => ({
+        id: row.id as string,
+        text: row.text as string,
+        vector: Array.from(row.vector as Iterable<number>),
+        category: row.category as MemoryEntry["category"],
+        scope: (row.scope as string | null | undefined) ?? "global",
+        importance: clampImportance(Number(row.importance)),
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+        metadata: (row.metadata as string) || "{}",
+      }));
+  }
+
+  /**
+   * Core of update(): resolve the row, apply the patch, and persist via
+   * delete + re-add with rollback. Must be called while already holding the
+   * write lock and the serialized-update queue: update() wraps it, and the
+   * supersede commit path calls it from inside its own atomic section.
+   */
+  private async performUpdate(
+    id: string,
+    updates: MemoryUpdatePatch,
+    scopeFilter?: string[],
+  ): Promise<MemoryEntry | null> {
+    // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
+    // from older stores (for example "mem-md-..." or "data-pointer-...").
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const prefixRegex = /^[0-9a-f]{8,}$/i;
+    const isFullId = uuidRegex.test(id);
+    const isPrefix = !isFullId && prefixRegex.test(id);
+    const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
+
+    if (!isFullId && !isPrefix && !isLegacyStableId) {
+      throw new Error(`Invalid memory ID format: ${id}`);
+    }
 
     let rows: any[];
     if (isFullId || isLegacyStableId) {
@@ -3080,8 +3106,83 @@ export class MemoryStore {
 
     this.noteDataModification();
     return updated;
+  }
+
+  /**
+   * Atomic supersede-and-store: re-discovers the target rows, inserts the new
+   * row, and invalidates every confirmed target inside ONE write-lock +
+   * serialized-update section. The caller's advisory discovery only decides
+   * whether to enter this path; the target set that actually commits is the
+   * one discovered here, so two concurrent same-key writers converge on a
+   * single active row (the second writer's recheck sees the first writer's
+   * replacement and supersedes it) instead of leaving both replacements
+   * standing.
+   *
+   * Only CONFIRMED invalidations are reported in supersededIds; a null or
+   * throwing patch lands in invalidationFailures instead of being silently
+   * counted as success.
+   */
+  async storeSuperseding(options: {
+    entry: Omit<MemoryEntry, "id" | "timestamp">;
+    discoverTargets: () => Promise<MemoryEntry[]>;
+    finalizeEntryMetadata?: (targets: MemoryEntry[]) => string;
+    buildTargetPatch: (target: MemoryEntry, newEntryId: string) => MetadataPatch;
+    scopeFilter?: string[];
+  }): Promise<{
+    entry: MemoryEntry;
+    supersededIds: string[];
+    invalidationFailures: Array<{ id: string; reason: string }>;
+  }> {
+    await this.ensureInitialized();
+    const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+      const targets = await options.discoverTargets();
+
+      const fullEntry: MemoryEntry = {
+        ...options.entry,
+        id: randomUUID(),
+        timestamp: Date.now(),
+        metadata: options.finalizeEntryMetadata
+          ? options.finalizeEntryMetadata(targets)
+          : options.entry.metadata || "{}",
+        importance: clampImportance(Number(options.entry.importance)),
+      } as MemoryEntry;
+      await this.table!.add([fullEntry]);
+
+      const supersededIds: string[] = [];
+      const invalidationFailures: Array<{ id: string; reason: string }> = [];
+      for (const target of targets) {
+        try {
+          const existing = await this.getById(target.id, options.scopeFilter);
+          if (!existing) {
+            invalidationFailures.push({
+              id: target.id,
+              reason: "row not found or outside accessible scopes at commit time",
+            });
+            continue;
+          }
+          const metadata = buildSmartMetadata(existing, options.buildTargetPatch(existing, fullEntry.id));
+          const updated = await this.performUpdate(
+            target.id,
+            { metadata: stringifySmartMetadata(metadata) },
+            options.scopeFilter,
+          );
+          if (updated == null) {
+            invalidationFailures.push({ id: target.id, reason: "update persisted no row" });
+          } else {
+            supersededIds.push(target.id);
+          }
+        } catch (err) {
+          invalidationFailures.push({
+            id: target.id,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      return { entry: fullEntry, supersededIds, invalidationFailures };
+    }));
     this.noteDataModification();
-    return updated;
+    return result;
   }
 
   private async runSerializedUpdate<T>(action: () => Promise<T>): Promise<T> {
@@ -3282,83 +3383,6 @@ export class MemoryStore {
     }
     if (repaired > 0) this.noteDataModification();
     return { repaired, failed, skipped, unrecovered };
-  }
-
-  /**
-   * Atomic supersede-and-store: re-discovers the target rows, inserts the new
-   * row, and invalidates every confirmed target inside ONE write-lock +
-   * serialized-update section. The caller's advisory discovery only decides
-   * whether to enter this path; the target set that actually commits is the
-   * one discovered here, so two concurrent same-key writers converge on a
-   * single active row (the second writer's recheck sees the first writer's
-   * replacement and supersedes it) instead of leaving both replacements
-   * standing.
-   *
-   * Only CONFIRMED invalidations are reported in supersededIds; a null or
-   * throwing patch lands in invalidationFailures instead of being silently
-   * counted as success.
-   */
-  async storeSuperseding(options: {
-    entry: Omit<MemoryEntry, "id" | "timestamp">;
-    discoverTargets: () => Promise<MemoryEntry[]>;
-    finalizeEntryMetadata?: (targets: MemoryEntry[]) => string;
-    buildTargetPatch: (target: MemoryEntry, newEntryId: string) => MetadataPatch;
-    scopeFilter?: string[];
-  }): Promise<{
-    entry: MemoryEntry;
-    supersededIds: string[];
-    invalidationFailures: Array<{ id: string; reason: string }>;
-  }> {
-    await this.ensureInitialized();
-    const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
-      const targets = await options.discoverTargets();
-
-      const fullEntry: MemoryEntry = {
-        ...options.entry,
-        id: randomUUID(),
-        timestamp: Date.now(),
-        metadata: options.finalizeEntryMetadata
-          ? options.finalizeEntryMetadata(targets)
-          : options.entry.metadata || "{}",
-        importance: clampImportance(Number(options.entry.importance)),
-      } as MemoryEntry;
-      await this.table!.add([fullEntry]);
-
-      const supersededIds: string[] = [];
-      const invalidationFailures: Array<{ id: string; reason: string }> = [];
-      for (const target of targets) {
-        try {
-          const existing = await this.getById(target.id, options.scopeFilter);
-          if (!existing) {
-            invalidationFailures.push({
-              id: target.id,
-              reason: "row not found or outside accessible scopes at commit time",
-            });
-            continue;
-          }
-          const metadata = buildSmartMetadata(existing, options.buildTargetPatch(existing, fullEntry.id));
-          const updated = await this.performUpdate(
-            target.id,
-            { metadata: stringifySmartMetadata(metadata) },
-            options.scopeFilter,
-          );
-          if (updated == null) {
-            invalidationFailures.push({ id: target.id, reason: "update persisted no row" });
-          } else {
-            supersededIds.push(target.id);
-          }
-        } catch (err) {
-          invalidationFailures.push({
-            id: target.id,
-            reason: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-
-      return { entry: fullEntry, supersededIds, invalidationFailures };
-    }));
-    this.noteDataModification();
-    return result;
   }
 
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {

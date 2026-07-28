@@ -5433,11 +5433,18 @@ const memoryLanceDBProPlugin = {
           const timeHms = timeIso.split(".")[0];
           const timeCompact = timeIso.replace(/[:.]/g, "");
           const reflectionRunAgentId = resolveReflectionRunAgentId(cfg, sourceAgentId);
-          // Attribution is guaranteed here: the unattributable-sessionKey early
-          // return above skips reflection outright (quarantine-by-skip), and
-          // parseAgentIdFromSessionKey rejects bypass ids, so sourceAgentId is
-          // always a real agent and its default scope is the only destination.
-          const targetScope = scopeManager.getDefaultScope(sourceAgentId);
+          const targetScope = isSystemBypassId(sourceAgentId)
+            ? config.scopes?.default ?? "global"
+            : parsedAgentId
+              ? scopeManager.getDefaultScope(sourceAgentId)
+              // A session that never resolved to a real agent must not be routed into
+              // main's default scope: ownerAgentId is already blanked for exactly this
+              // case so the row is not inheritable via isOwnedByAgent(), but a plain
+              // scope-filtered read (list/vectorSearch/etc. with no ownership check)
+              // would still see it if it landed in "agent:main". Route it into a scope
+              // no agent's getAccessibleScopes() ever grants instead, so it stays
+              // findable by an unrestricted/admin read but invisible to every agent.
+              : "unattributed:reflection";
           const toolErrorSignals = sessionKey
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
@@ -5559,6 +5566,11 @@ const memoryLanceDBProPlugin = {
           const MAX_MAPPED_ENTRIES = 100;
           const mappedReflectionMemories = extractInjectableReflectionMappedMemoryItems(reflectionText);
           const mappedEntries: Array<{ text: string; vector: number[]; importance: number; category: string; scope: string; metadata: string }> = [];
+          const mappedGatedItems: Array<{
+            candidate: import("./src/memory-categories.js").CandidateMemory;
+            vector: number[];
+            buildEntry: (v: number[]) => Omit<MemoryEntry, "id" | "timestamp">;
+          }> = [];
           // Per-row embed + near-duplicate pre-check first, collecting the
           // gate-eligible rows so the whole burst can share one admission call.
           const gateEligible: Array<{ mapped: (typeof mappedReflectionMemories)[number]; vector: number[] }> = [];
@@ -5589,17 +5601,9 @@ const memoryLanceDBProPlugin = {
             if (searchFailed) {
               continue;
             }
-            // Near-duplicate pre-check ahead of admission gating. This is the only dedup mapped
-            // rows get: a single vector-similarity threshold, direct skip, no LLM-mediated
-            // merge/contextualize/contradict decision. Extraction candidates own deduplicate()
-            // (src/smart-extractor.ts) is a genuinely different, richer pipeline (a 0.7
-            // pre-filter feeding an LLM decision, not a single hard cutoff) - deliberately not
-            // reused here yet. AdmissionController's "pass_to_dedup" decision for a mapped row
-            // is therefore always treated as "admit, subject to this cheaper pre-check" below,
-            // not "route through the same merge pipeline extraction candidates get".
-            if (existing.length > 0 && existing[0].score > 0.95) {
-              continue;
-            }
+            // Admitted rows take the SAME dedup/merge pipeline extraction
+            // candidates get (persistGatedCandidates below), so no bespoke
+            // similarity cutoff runs here anymore.
             gateEligible.push({ mapped, vector });
           }
 

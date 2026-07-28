@@ -1524,7 +1524,9 @@ export class MemoryStore {
         const safeLimit = clampInt(limit, 1, 20);
         // Over-fetch more aggressively when filtering inactive records,
         // because superseded historical rows can crowd out active ones.
-        const inactiveFilter = options?.excludeInactive ?? false;
+        // excludeInactive defaults to true: invalidated/superseded rows are
+        // invisible unless a caller opts out explicitly (item 6, PR #946).
+        const inactiveFilter = options?.excludeInactive ?? true;
         const overFetchMultiplier = inactiveFilter ? 20 : 10;
         const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
         if (this.disableNativeCosine && !this.nativeCosineFallbackLogged) {
@@ -1599,7 +1601,8 @@ export class MemoryStore {
         if (isExplicitDenyAllScopeFilter(scopeFilter))
             return [];
         const safeLimit = clampInt(limit, 1, 20);
-        const inactiveFilter = options?.excludeInactive ?? false;
+        // excludeInactive defaults to true: see vectorSearch above (item 6, PR #946).
+        const inactiveFilter = options?.excludeInactive ?? true;
         // Over-fetch when filtering inactive records to avoid crowding
         const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
         if (!this.ftsIndexCreated && !(await this.refreshFtsSupportFromTable())) {
@@ -1634,7 +1637,7 @@ export class MemoryStore {
                 const entry = {
                     id: row.id,
                     text: row.text,
-                    vector: row.vector,
+                    vector: toNumberVector(row.vector),
                     category: row.category,
                     scope: rowScope,
                     importance: clampImportance(Number(row.importance)),
@@ -1693,7 +1696,7 @@ export class MemoryStore {
             const entry = {
                 id: row.id,
                 text: row.text,
-                vector: row.vector,
+                vector: toNumberVector(row.vector),
                 category: row.category,
                 scope: rowScope,
                 importance: clampImportance(Number(row.importance)),
@@ -1701,8 +1704,9 @@ export class MemoryStore {
                 metadata: row.metadata || "{}",
             };
             const metadata = parseSmartMetadata(entry.metadata, entry);
-            // Skip inactive (superseded) records when requested
-            if (options?.excludeInactive && !isMemoryActiveAt(metadata)) {
+            // Skip inactive (superseded) records unless explicitly opted out
+            // (excludeInactive defaults to true -- item 6, PR #946).
+            if ((options?.excludeInactive ?? true) && !isMemoryActiveAt(metadata)) {
                 continue;
             }
             const score = scoreLexicalHit(trimmedQuery, [
@@ -1769,7 +1773,7 @@ export class MemoryStore {
             return true;
         });
     }
-    async list(scopeFilter, category, limit = 20, offset = 0) {
+    async list(scopeFilter, category, limit = 20, offset = 0, options) {
         await this.ensureInitialized();
         if (isExplicitDenyAllScopeFilter(scopeFilter))
             return [];
@@ -1811,9 +1815,15 @@ export class MemoryStore {
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
         }));
+        // excludeInactive defaults to true: invalidated/superseded rows are
+        // invisible to list() unless a caller opts out explicitly (item 6, PR #946).
+        const excludeInactive = options?.excludeInactive ?? true;
+        const activeEntries = excludeInactive
+            ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
+            : entries;
         return (category
-            ? entries.filter((entry) => matchesMemoryCategoryFilter(entry.category, category, entry.metadata))
-            : entries)
+            ? activeEntries.filter((entry) => matchesMemoryCategoryFilter(entry.category, category, entry.metadata))
+            : activeEntries)
             .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
             .slice(offset, offset + limit);
     }
@@ -1835,6 +1845,7 @@ export class MemoryStore {
         if (isExplicitDenyAllScopeFilter(scopeFilter)) {
             return {
                 totalCount: 0,
+                liveCount: 0,
                 scopeCounts: {},
                 categoryCounts: {},
             };
@@ -1849,17 +1860,28 @@ export class MemoryStore {
             conditions.push(`(${scopeConditions})`);
         }
         const applyConditions = (query) => conditions.length > 0 ? query.where(conditions.join(" AND ")) : query;
-        const results = await this.queryRowsWithProjectionFallback(applyConditions, ["scope", "category"]);
+        // scopeCounts/categoryCounts stay blended (total, historical record
+        // included) -- only the top-level total/live split is added here, per
+        // item 6 (PR #946): "report a live vs total split rather than one
+        // blended count."
+        const results = await this.queryRowsWithProjectionFallback(applyConditions, ["scope", "category", "metadata", "timestamp"]);
         const scopeCounts = {};
         const categoryCounts = {};
+        let liveCount = 0;
         for (const row of results) {
             const scope = row.scope ?? "global";
             const category = row.category;
             scopeCounts[scope] = (scopeCounts[scope] || 0) + 1;
             categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+            const metadata = parseSmartMetadata(row.metadata || "{}", {
+                timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            });
+            if (isMemoryActiveAt(metadata))
+                liveCount += 1;
         }
         return {
             totalCount: results.length,
+            liveCount,
             scopeCounts,
             categoryCounts,
         };
@@ -2414,6 +2436,219 @@ export class MemoryStore {
             return updated;
         }));
     }
+    /**
+     * Finds rows whose id starts with `prefix`, restricted to accessible
+     * scopes. Backs the documented "full UUID or 8+ char prefix" contract on
+     * memory_forget/memory_update: injected context shows agents truncated ids,
+     * so a unique-prefix lookup is the only way those handles can ever resolve.
+     * The prefix must be hex/dash shaped (validated here, defense in depth on
+     * top of the tool-layer classification) and at least 8 chars, so a short
+     * or malformed ref can never scan-match. Capped at `limit` matches: the
+     * caller only distinguishes zero / one / many.
+     */
+    async findByIdPrefix(prefix, scopeFilter, limit = 5) {
+        await this.ensureInitialized();
+        if (isExplicitDenyAllScopeFilter(scopeFilter))
+            return [];
+        const normalized = prefix.trim().toLowerCase();
+        if (!/^[0-9a-f][0-9a-f-]{7,35}$/.test(normalized))
+            return [];
+        const safePrefix = escapeSqlLiteral(normalized);
+        const rows = await this.table
+            .query()
+            .where(`id LIKE '${safePrefix}%'`)
+            .limit(Math.max(1, limit))
+            .toArray();
+        return rows
+            .filter((row) => isRowScopeAccessible(row.scope, scopeFilter))
+            .map((row) => ({
+            id: row.id,
+            text: row.text,
+            vector: Array.from(row.vector),
+            category: row.category,
+            scope: row.scope ?? "global",
+            importance: clampImportance(Number(row.importance)),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: row.metadata || "{}",
+        }));
+    }
+    /**
+     * Core of update(): resolve the row, apply the patch, and persist via
+     * delete + re-add with rollback. Must be called while already holding the
+     * write lock and the serialized-update queue: update() wraps it, and the
+     * supersede commit path calls it from inside its own atomic section.
+     */
+    async performUpdate(id, updates, scopeFilter) {
+        // Support full UUID, short hex prefixes, and constrained exact legacy IDs imported
+        // from older stores (for example "mem-md-..." or "data-pointer-...").
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const prefixRegex = /^[0-9a-f]{8,}$/i;
+        const isFullId = uuidRegex.test(id);
+        const isPrefix = !isFullId && prefixRegex.test(id);
+        const isLegacyStableId = !isFullId && !isPrefix && isLegacyStableMemoryId(id);
+        if (!isFullId && !isPrefix && !isLegacyStableId) {
+            throw new Error(`Invalid memory ID format: ${id}`);
+        }
+        let rows;
+        if (isFullId || isLegacyStableId) {
+            // Legacy IDs use exact string match like full UUIDs.
+            const safeId = escapeSqlLiteral(id);
+            rows = await this.table.query()
+                .where(`id = '${safeId}'`)
+                .limit(1)
+                .toArray();
+        }
+        else {
+            // Prefix match
+            const all = await this.table.query()
+                .select([
+                "id",
+                "text",
+                "vector",
+                "category",
+                "scope",
+                "importance",
+                "timestamp",
+                "metadata",
+            ])
+                .limit(1000)
+                .toArray();
+            rows = all.filter((r) => r.id.startsWith(id));
+            if (rows.length > 1) {
+                throw new Error(`Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`);
+            }
+        }
+        if (rows.length === 0)
+            return null;
+        const row = rows[0];
+        const realScope = row.scope;
+        // Check scope permissions
+        if (!isRowScopeAccessible(realScope, scopeFilter)) {
+            throw new Error(`Memory ${id} is outside accessible scopes`);
+        }
+        const rowScope = realScope ?? "global";
+        // Display mask only. Mutations must persist the RAW stored scope: writing
+        // the "global" mask back would turn an invisible legacy NULL-scope row
+        // into a globally visible one (cross-agent disclosure). Valid scopes are
+        // canonicalized by trim; legacy NULL/blank stays NULL.
+        const persistedScope = (hasValidEntryScope(realScope) ? realScope.trim() : null);
+        const original = {
+            id: row.id,
+            text: row.text,
+            vector: Array.from(row.vector),
+            category: row.category,
+            scope: rowScope,
+            importance: clampImportance(Number(row.importance)),
+            timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+            metadata: row.metadata || "{}",
+        };
+        // Build updated entry, preserving original timestamp
+        const updated = {
+            ...original,
+            text: updates.text ?? original.text,
+            vector: updates.vector ?? original.vector,
+            category: updates.category ?? original.category,
+            scope: rowScope,
+            // F3 fix (PR #828 follow-up): clamp importance on update path so
+            // update() callers cannot persist out-of-range values.
+            importance: clampImportance(updates.importance ?? original.importance),
+            timestamp: original.timestamp, // preserve original
+            metadata: updates.metadata ?? original.metadata,
+        };
+        // LanceDB doesn't support in-place update; delete + re-add.
+        // Serialize updates per store instance to avoid stale rollback races.
+        // If the add fails after delete, attempt best-effort recovery without
+        // overwriting a newer concurrent successful update.
+        const rollbackSource = (await this.getById(original.id).catch(() => null)) ?? original;
+        // getById masks a NULL scope as "global" for display; restore the raw
+        // stored scope before any write (scope is immutable through update patches).
+        const rollbackCandidate = { ...rollbackSource, scope: persistedScope };
+        const resolvedId = escapeSqlLiteral(row.id);
+        await this.table.delete(`id = '${resolvedId}'`);
+        try {
+            await this.table.add([{ ...updated, scope: persistedScope }]);
+        }
+        catch (addError) {
+            const current = await this.getById(original.id).catch(() => null);
+            if (current) {
+                throw new Error(`Failed to update memory ${id}: write failed after delete, but an existing record was preserved. ` +
+                    `Write error: ${addError instanceof Error ? addError.message : String(addError)}`);
+            }
+            try {
+                await this.table.add([rollbackCandidate]);
+            }
+            catch (rollbackError) {
+                throw new Error(`Failed to update memory ${id}: write failed after delete, and rollback also failed. ` +
+                    `Write error: ${addError instanceof Error ? addError.message : String(addError)}. ` +
+                    `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
+            }
+            throw new Error(`Failed to update memory ${id}: write failed after delete, latest available record restored. ` +
+                `Write error: ${addError instanceof Error ? addError.message : String(addError)}`);
+        }
+        this.noteDataModification();
+        return updated;
+    }
+    /**
+     * Atomic supersede-and-store: re-discovers the target rows, inserts the new
+     * row, and invalidates every confirmed target inside ONE write-lock +
+     * serialized-update section. The caller's advisory discovery only decides
+     * whether to enter this path; the target set that actually commits is the
+     * one discovered here, so two concurrent same-key writers converge on a
+     * single active row (the second writer's recheck sees the first writer's
+     * replacement and supersedes it) instead of leaving both replacements
+     * standing.
+     *
+     * Only CONFIRMED invalidations are reported in supersededIds; a null or
+     * throwing patch lands in invalidationFailures instead of being silently
+     * counted as success.
+     */
+    async storeSuperseding(options) {
+        await this.ensureInitialized();
+        const result = await this.runWithWriteLock(() => this.runSerializedUpdate(async () => {
+            const targets = await options.discoverTargets();
+            const fullEntry = {
+                ...options.entry,
+                id: randomUUID(),
+                timestamp: Date.now(),
+                metadata: options.finalizeEntryMetadata
+                    ? options.finalizeEntryMetadata(targets)
+                    : options.entry.metadata || "{}",
+                importance: clampImportance(Number(options.entry.importance)),
+            };
+            await this.table.add([fullEntry]);
+            const supersededIds = [];
+            const invalidationFailures = [];
+            for (const target of targets) {
+                try {
+                    const existing = await this.getById(target.id, options.scopeFilter);
+                    if (!existing) {
+                        invalidationFailures.push({
+                            id: target.id,
+                            reason: "row not found or outside accessible scopes at commit time",
+                        });
+                        continue;
+                    }
+                    const metadata = buildSmartMetadata(existing, options.buildTargetPatch(existing, fullEntry.id));
+                    const updated = await this.performUpdate(target.id, { metadata: stringifySmartMetadata(metadata) }, options.scopeFilter);
+                    if (updated == null) {
+                        invalidationFailures.push({ id: target.id, reason: "update persisted no row" });
+                    }
+                    else {
+                        supersededIds.push(target.id);
+                    }
+                }
+                catch (err) {
+                    invalidationFailures.push({
+                        id: target.id,
+                        reason: err instanceof Error ? err.message : String(err),
+                    });
+                }
+            }
+            return { entry: fullEntry, supersededIds, invalidationFailures };
+        }));
+        this.noteDataModification();
+        return result;
+    }
     async runSerializedUpdate(action) {
         const previous = this.updateQueue;
         let release;
@@ -2703,7 +2938,7 @@ export class MemoryStore {
      * omitted from `list()` for performance, but compaction needs them for
      * cosine-similarity clustering.
      */
-    async fetchForCompaction(maxTimestamp, scopeFilter, limit = 200) {
+    async fetchForCompaction(maxTimestamp, scopeFilter, limit = 200, options) {
         await this.ensureInitialized();
         // An explicitly empty scope filter is a deny-all contract, matching the
         // other scoped readers: compaction must never widen into every scope.
@@ -2723,17 +2958,24 @@ export class MemoryStore {
             .query()
             .where(whereClause)
             .toArray();
-        return results
+        const entries = results
             .map((row) => ({
             id: row.id,
             text: row.text,
-            vector: Array.isArray(row.vector) ? row.vector : [],
+            vector: toNumberVector(row.vector),
             category: row.category,
             scope: row.scope ?? "global",
             importance: clampImportance(Number(row.importance)),
             timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
             metadata: row.metadata || "{}",
-        }))
+        }));
+        // excludeInactive defaults to true: a background compactor or
+        // consolidate run must not cluster already-dead rows (item 6, PR #946).
+        const excludeInactive = options?.excludeInactive ?? true;
+        const activeEntries = excludeInactive
+            ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
+            : entries;
+        return activeEntries
             .sort((a, b) => b.timestamp - a.timestamp)
             .slice(0, limit);
     }
