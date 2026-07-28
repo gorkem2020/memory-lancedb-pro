@@ -4403,7 +4403,7 @@ const memoryLanceDBProPlugin = {
                     // historical per-row path otherwise; passthrough when admission
                     // control (or smart extraction) is disabled.
                     const mappedGateResults = await gateMappedReflectionEntries({
-                        admissionController: smartExtractor?.getAdmissionController() ?? null,
+                        admissionController: resolveMappedRowAdmissionController(admissionControllerReflectionLane, smartExtractor?.getAdmissionController() ?? null),
                         attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
                         rows: gateEligible.map(({ mapped, vector }) => ({
                             text: mapped.text,
