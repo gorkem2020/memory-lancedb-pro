@@ -198,7 +198,9 @@ describe("memory_forget direct-id references stay exact (destructive-path guard)
     workDir = mkdtempSync(path.join(tmpdir(), "lancedb-exact-ref-test-"));
     resetRegistration();
     harness = createPluginApiHarness({
-      pluginConfig: makePluginConfig(workDir),
+      // management tools on: memory_promote / memory_archive share the
+      // destructive-path exact-reference contract under test here
+      pluginConfig: { ...makePluginConfig(workDir), enableManagementTools: true },
       resolveRoot: workDir,
     });
     await memoryLanceDBProPlugin.register(harness.api);
@@ -238,5 +240,53 @@ describe("memory_forget direct-id references stay exact (destructive-path guard)
     const survivors = await store.list(undefined, undefined, 10, 0);
     assert.equal(survivors.length, 1, "the unrelated row must survive a legacy-id forget that matches nothing");
     assert.equal(survivors[0].id, seeded.id);
+  });
+
+  it("memory_update with a malformed UUID-shaped id cannot modify an unrelated row", async () => {
+    // The probe input: UUID-shaped but malformed (trailing comma). It fails
+    // the anchored exact classifiers, and before the fix it fell through to
+    // semantic retrieval, where a sole result is accepted with no minimum
+    // score — letting update mutate or supersede a completely unrelated row.
+    const result = await callTool(harness.toolFactories, "memory_update", {
+      memoryId: "12345678-1234-1234-1234-123456789012,",
+      text: "Poisoned replacement text that must never land",
+    });
+    const text = result.content?.[0]?.text ?? "";
+    assert.match(text, /not a memory id|not found/i, `unexpected response: ${text}`);
+    const rows = await store.list(undefined, undefined, 10, 0);
+    assert.equal(rows.length, 1, "no supersede row may appear from a malformed update reference");
+    assert.equal(rows[0].id, seeded.id);
+    assert.match(rows[0].text, /Unrelated durable note/, "the unrelated row's text must be untouched");
+  });
+
+  it("memory_archive with a malformed direct memoryId cannot archive an unrelated row", async () => {
+    const result = await callTool(harness.toolFactories, "memory_archive", {
+      memoryId: "not-an-id",
+    });
+    const text = result.content?.[0]?.text ?? "";
+    assert.match(text, /not a memory id|not found/i, `unexpected response: ${text}`);
+    const reader = new MemoryStore({ dbPath: path.join(workDir, "db"), vectorDim: EMBEDDING_DIMENSIONS });
+    const row = await reader.getById(seeded.id, ["agent:agent-one"]);
+    const meta = JSON.parse(row?.metadata ?? "{}");
+    assert.notEqual(meta.state, "archived", "the unrelated row must not be archived");
+  });
+
+  it("memory_promote with a malformed direct memoryId cannot touch an unrelated row, while the explicit query selector still resolves semantically", async () => {
+    const malformed = await callTool(harness.toolFactories, "memory_promote", {
+      memoryId: "12345678-1234-1234-1234-123456789012,",
+    });
+    const malformedText = malformed.content?.[0]?.text ?? "";
+    assert.match(malformedText, /not a memory id|not found/i, `unexpected response: ${malformedText}`);
+
+    // The dual selector keeps its documented contract: an explicit `query`
+    // is the deliberate semantic path and must still resolve.
+    const byQuery = await callTool(harness.toolFactories, "memory_promote", {
+      query: "unrelated durable note",
+    });
+    const byQueryText = JSON.stringify(byQuery?.content ?? "");
+    assert.ok(
+      byQueryText.includes(seeded.id.slice(0, 8)),
+      `promote by explicit query must still resolve semantically: ${byQueryText}`,
+    );
   });
 });

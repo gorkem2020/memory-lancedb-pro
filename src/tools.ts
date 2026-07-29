@@ -1944,11 +1944,14 @@ export function registerMemoryUpdateTool(
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
           const scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
 
-          // Resolve memoryId through the shared resolver: full UUID passes
-          // through, an 8+ char id prefix resolves against accessible rows
-          // (the tool's documented contract), anything else falls back to
-          // semantic search.
-          const resolution = await resolveMemoryId(context, memoryId, scopeFilter);
+          // memoryId promises a UUID or an 8+ char id prefix; both resolve
+          // exactly. Anything else is rejected instead of falling through to
+          // semantic retrieval: update mutates (and can supersede) whatever
+          // row it resolves, so a malformed id-shaped input must never be
+          // allowed to select an unrelated row by low-score similarity.
+          const resolution = await resolveMemoryId(context, memoryId, scopeFilter, {
+            requireExactRef: true,
+          });
           if (resolution.ok === false) {
             return {
               content: [{ type: "text", text: resolution.message }],
@@ -2606,10 +2609,14 @@ export function registerMemoryPromoteTool(
             scopeFilter = [scope];
           }
 
+          // Dual selector: memoryId is the exact reference (UUID or 8+ char
+          // prefix, resolved exactly — this path mutates state); query is the
+          // explicit semantic selector and keeps retrieval-based resolution.
           const resolved = await resolveMemoryId(
             runtimeContext,
             memoryId ?? query ?? "",
             scopeFilter,
+            memoryId ? { requireExactRef: true } : undefined,
           );
           if (resolved.ok === false) {
             return {
@@ -2713,10 +2720,14 @@ export function registerMemoryArchiveTool(
             scopeFilter = [scope];
           }
 
+          // Dual selector: memoryId is the exact reference (UUID or 8+ char
+          // prefix, resolved exactly — this path mutates state); query is the
+          // explicit semantic selector and keeps retrieval-based resolution.
           const resolved = await resolveMemoryId(
             runtimeContext,
             memoryId ?? query ?? "",
             scopeFilter,
+            memoryId ? { requireExactRef: true } : undefined,
           );
           if (resolved.ok === false) {
             return {
