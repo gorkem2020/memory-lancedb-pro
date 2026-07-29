@@ -3268,6 +3268,24 @@ const memoryLanceDBProPlugin = {
                             newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
                             watermarkAdvanceOverride = eligibleTexts.length;
                         }
+                        else if (previousSeenCount > 0 && eligibleTexts.length === previousSeenCount) {
+                            // A repeated agent_end can redeliver the identical snapshot (no
+                            // transcript growth); re-feeding the whole history through
+                            // extraction on every such wake is the settled-outcome retry loop.
+                            // Equal length alone is not identity, though: each agent_end may
+                            // deliver a fresh same-length window of new content. Compare the
+                            // ordered tail against the texts the previous run recorded; only a
+                            // matching tail is treated as the same snapshot and consumed.
+                            const recentForIdentity = autoCaptureRecentTexts.get(sessionKey) || [];
+                            const identityDepth = Math.min(recentForIdentity.length, eligibleTexts.length, 6);
+                            const identicalSnapshot = identityDepth > 0 &&
+                                eligibleTexts.slice(-identityDepth).join("\u0000") ===
+                                    recentForIdentity.slice(-identityDepth).join("\u0000");
+                            if (identicalSnapshot) {
+                                newTexts = [];
+                                newlyObservedCount = 0;
+                            }
+                        }
                         // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
                         const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newTexts.length);
                         await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
@@ -3420,6 +3438,20 @@ const memoryLanceDBProPlugin = {
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
+                                    // Settled zero-persisted runs (every candidate definitively
+                                    // rejected, dedup-skipped, supported, or superseded) consumed
+                                    // their input: requeuing them re-runs extraction and admission
+                                    // on the identical snapshot every agent_end, duplicates
+                                    // rejection audits or support evidence, and charges the
+                                    // process-wide limiter again. Only barren runs (no candidates
+                                    // at all) stay retryable.
+                                    if (stats.settledOutcomes === true && !admittedOnlyByExplicitRemember) {
+                                        api.logger.info(`memory-lancedb-pro: smart extraction settled with no persisted rows for agent ${agentId} ` +
+                                            `(rejected=${stats.rejected ?? 0}, skipped=${stats.skipped}, supported=${stats.supported ?? 0}, ` +
+                                            `superseded=${stats.superseded ?? 0}); consuming texts without retry`);
+                                        autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
+                                        return;
+                                    }
                                     api.logger.info(`memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`);
                                     // A valid-empty result (the LLM genuinely ran and confirmed
                                     // nothing worth storing) is just as conclusive as a

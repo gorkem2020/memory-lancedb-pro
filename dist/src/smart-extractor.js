@@ -510,6 +510,14 @@ export class SmartExtractor {
                 this.log("memory-pro: smart-extractor: supersede invalidation skipped because bulkStore() did not return created entries");
             }
         }
+        stats.settledOutcomes =
+            stats.created +
+                stats.merged +
+                stats.skipped +
+                (stats.rejected ?? 0) +
+                (stats.supported ?? 0) +
+                (stats.superseded ?? 0) >
+                0;
         return stats;
     }
     /**
