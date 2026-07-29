@@ -187,3 +187,56 @@ describe("memory id-prefix resolution (forget/update contract)", () => {
     assert.equal(await store.count(), before);
   });
 });
+
+describe("memory_forget direct-id references stay exact (destructive-path guard)", () => {
+  let workDir;
+  let harness;
+  let store;
+  let seeded;
+
+  beforeEach(async () => {
+    workDir = mkdtempSync(path.join(tmpdir(), "lancedb-exact-ref-test-"));
+    resetRegistration();
+    harness = createPluginApiHarness({
+      pluginConfig: makePluginConfig(workDir),
+      resolveRoot: workDir,
+    });
+    await memoryLanceDBProPlugin.register(harness.api);
+    store = new MemoryStore({ dbPath: path.join(workDir, "db"), vectorDim: EMBEDDING_DIMENSIONS });
+    seeded = await store.store({
+      text: "Unrelated durable note that must survive malformed forget calls",
+      vector: FIXED_VECTOR,
+      category: "fact",
+      scope: "agent:agent-one",
+      importance: 0.8,
+      metadata: JSON.stringify({ memory_category: "cases", l0_abstract: "Unrelated durable note" }),
+    });
+    assert.ok(seeded?.id);
+  });
+
+  afterEach(() => {
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("a malformed direct memoryId is rejected and cannot delete an unrelated row", async () => {
+    const result = await callTool(harness.toolFactories, "memory_forget", {
+      memoryId: "not-an-id",
+    });
+    const text = result.content?.[0]?.text ?? "";
+    assert.match(text, /not a memory id|not found/i, `unexpected response: ${text}`);
+    const survivors = await store.list(undefined, undefined, 10, 0);
+    assert.equal(survivors.length, 1, "the unrelated row must survive a malformed direct-id forget");
+    assert.equal(survivors[0].id, seeded.id);
+  });
+
+  it("a supported legacy mem-md-N direct id goes through exact handling and cannot delete an unrelated row", async () => {
+    const result = await callTool(harness.toolFactories, "memory_forget", {
+      memoryId: "mem-md-42",
+    });
+    const text = result.content?.[0]?.text ?? "";
+    assert.doesNotMatch(text, /(deleted|removed).*Unrelated durable note/i, "must not claim deletion of the unrelated row");
+    const survivors = await store.list(undefined, undefined, 10, 0);
+    assert.equal(survivors.length, 1, "the unrelated row must survive a legacy-id forget that matches nothing");
+    assert.equal(survivors[0].id, seeded.id);
+  });
+});

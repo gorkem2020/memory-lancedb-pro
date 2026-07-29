@@ -361,7 +361,7 @@ function formatIgnoredScopeNotice(resolvedScopes) {
         : "(none)";
     return `Ignored inaccessible scope "${resolvedScopes.ignoredScope}" and searched accessible scopes instead: ${scopes}.`;
 }
-export async function resolveMemoryId(context, memoryRef, scopeFilter) {
+export async function resolveMemoryId(context, memoryRef, scopeFilter, options) {
     // Agents copy ids out of injected context, which truncates them and often
     // appends an ellipsis ("407dec9c..."); strip that before classifying.
     const trimmed = memoryRef.trim().replace(/[.…]+$/u, "");
@@ -400,6 +400,24 @@ export async function resolveMemoryId(context, memoryRef, scopeFilter) {
             ok: false,
             message: `Memory ${trimmed} not found or access denied.`,
             details: { error: "not_found", id: trimmed },
+        };
+    }
+    // Supported legacy ids (older memory-lancedb-pro versions) pass through
+    // untouched: MemoryStore.delete/getById carry exact handling for this shape,
+    // and routing them into semantic retrieval let a sole low-score result
+    // resolve to an unrelated row.
+    if (/^mem-md-\d+$/i.test(trimmed)) {
+        return { ok: true, id: trimmed };
+    }
+    // Destructive callers pass a DIRECT id reference; anything that is not a
+    // full UUID, a validated prefix, or a supported legacy id is malformed for
+    // them, never a semantic query. Semantic resolution stays reserved for the
+    // query flow with its confidence and confirmation safeguards.
+    if (options?.requireExactRef) {
+        return {
+            ok: false,
+            message: `"${trimmed}" is not a memory id. Pass a full UUID, an 8+ character id prefix, or search by content via the query flow.`,
+            details: { error: "invalid_memory_ref", ref: trimmed },
         };
     }
     const results = await retrieveWithRetry(context.retriever, {
@@ -1350,7 +1368,7 @@ export function registerMemoryForgetTool(api, context) {
                         }
                     }
                     if (memoryId) {
-                        const resolved = await resolveMemoryId(context, memoryId, scopeFilter);
+                        const resolved = await resolveMemoryId(context, memoryId, scopeFilter, { requireExactRef: true });
                         if (resolved.ok === false) {
                             return {
                                 content: [{ type: "text", text: resolved.message }],
