@@ -103,14 +103,14 @@ describe("utility veto floor", () => {
   }
   const candidate = {
     category: "preferences",
-    abstract: "User prefers no tool usage in this session",
+    abstract: "User prefers haiku-only replies in this session",
     overview: "## Preference",
     content: "User asked for no tools during this session only",
   };
   const evaluateParams = {
     candidate,
     candidateVector: [0.1, 0.2, 0.3],
-    conversationText: "please do not use any tools for the rest of this session",
+    conversationText: "please reply only in haiku for the rest of this session",
     scopeFilter: ["global"],
   };
 

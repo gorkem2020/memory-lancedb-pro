@@ -126,7 +126,7 @@ function reflectionItem(text, { category = "patterns", heading = "Agent model de
 
 describe("reflection mapped rows: uniform dedup -> merge pipeline", () => {
   it("merges a duplicate mapped row into its existing target instead of storing it beside it", async () => {
-    const store = makeStore({ neighbors: [neighborRow("row-1", "Prefer short answers when the user asks for brevity.")] });
+    const store = makeStore({ neighbors: [neighborRow("row-1", "Prefer bulleted answers when the user asks for outlines.")] });
     const llm = makeLlm({
       onDedupBatch: () => ({
         results: [{ index: 1, decision: "merge", match_index: 1, reason: "adds detail" }],
@@ -183,7 +183,7 @@ describe("reflection mapped rows: uniform dedup -> merge pipeline", () => {
   it("decides a whole burst with exactly one batched dedup call and drops skip verdicts", async () => {
     const store = makeStore({
       neighbors: [
-        neighborRow("row-1", "Prefer short answers when the user asks for brevity."),
+        neighborRow("row-1", "Prefer bulleted answers when the user asks for outlines."),
         neighborRow("row-2", "Always honor a session-scoped no-tools constraint."),
       ],
     });

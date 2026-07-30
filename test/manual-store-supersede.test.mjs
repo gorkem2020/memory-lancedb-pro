@@ -10,7 +10,7 @@
  * LLM on this lane):
  *   1. near-identical neighbor (similarity > 0.98) — previously a reject;
  *   2. fact-key collision with an active neighbor at any similarity — the
- *      contradiction/update shape ("favorite drink: tea" vs the cola row);
+ *      contradiction/update shape ("favorite drink: tea" vs the fizzwick row);
  *   3. the existing 0.95-0.98 same-category versioned band (unchanged).
  * Anything else creates alongside: a wrong supersede destroys a real fact,
  * a duplicate is fixable noise, so the gray zone stays on the safe side.
@@ -160,12 +160,12 @@ describe("manual memory_store always-store supersede semantics", () => {
   it("supersedes instead of rejecting when a near-identical memory exists (knob on)", async () => {
     const { context, storedEntries, patchCalls } = makeContext({
       manualStoreSupersede: true,
-      neighbors: [neighborRow({ text: "favorite drink: Coca-Cola", score: 0.99, factKey: "preferences:favorite drink" })],
+      neighbors: [neighborRow({ text: "favorite drink: Fizzwick", score: 0.99, factKey: "preferences:favorite drink" })],
     });
     const tools = createToolSet(context);
     const store = tools.get("memory_store");
 
-    const input = "favorite drink: Coca-Cola Zero";
+    const input = "favorite drink: Fizzwick Zero";
     const res = await store.execute(null, { text: input, category: "preference" });
 
     assert.equal(res.details.action, "superseded", "a near-identical manual store must land as a supersede, never a reject");
@@ -180,7 +180,7 @@ describe("manual memory_store always-store supersede semantics", () => {
   it("supersedes on a fact-key collision even at low vector similarity (contradiction shape, knob on)", async () => {
     const { context, storedEntries, patchCalls } = makeContext({
       manualStoreSupersede: true,
-      neighbors: [neighborRow({ text: "favorite drink: Coca-Cola", score: 0.8, factKey: "preferences:favorite drink" })],
+      neighbors: [neighborRow({ text: "favorite drink: Fizzwick", score: 0.8, factKey: "preferences:favorite drink" })],
     });
     const tools = createToolSet(context);
     const store = tools.get("memory_store");
@@ -215,12 +215,12 @@ describe("manual memory_store always-store supersede semantics", () => {
   it("force still bypasses the supersede path entirely (knob on)", async () => {
     const { context, storedEntries, patchCalls } = makeContext({
       manualStoreSupersede: true,
-      neighbors: [neighborRow({ text: "favorite drink: Coca-Cola", score: 0.99, factKey: "preferences:favorite drink" })],
+      neighbors: [neighborRow({ text: "favorite drink: Fizzwick", score: 0.99, factKey: "preferences:favorite drink" })],
     });
     const tools = createToolSet(context);
     const store = tools.get("memory_store");
 
-    const res = await store.execute(null, { text: "favorite drink: Coca-Cola", category: "preference", force: true });
+    const res = await store.execute(null, { text: "favorite drink: Fizzwick", category: "preference", force: true });
 
     assert.equal(res.details.action, "created", "force stores alongside without touching the old row");
     assert.equal(storedEntries.length, 1);
@@ -229,12 +229,12 @@ describe("manual memory_store always-store supersede semantics", () => {
 
   it("keeps the upstream duplicate reject when the knob is off (compat default)", async () => {
     const { context, storedEntries, patchCalls } = makeContext({
-      neighbors: [neighborRow({ text: "favorite drink: Coca-Cola", score: 0.99, factKey: "preferences:favorite drink" })],
+      neighbors: [neighborRow({ text: "favorite drink: Fizzwick", score: 0.99, factKey: "preferences:favorite drink" })],
     });
     const tools = createToolSet(context);
     const store = tools.get("memory_store");
 
-    const res = await store.execute(null, { text: "favorite drink: Coca-Cola", category: "preference" });
+    const res = await store.execute(null, { text: "favorite drink: Fizzwick", category: "preference" });
 
     assert.equal(res.details.action, "duplicate", "knob off must preserve the upstream duplicate check exactly");
     assert.equal(storedEntries.length, 0);
@@ -242,7 +242,7 @@ describe("manual memory_store always-store supersede semantics", () => {
   });
 
   it("supersedes a same-key row the vector top-K cannot see (ranked behind three closer unrelated neighbors)", async () => {
-    const staleKeyRow = neighborRow({ id: "old-key", text: "favorite drink: Coca-Cola", score: 0.5, factKey: "preferences:favorite drink" });
+    const staleKeyRow = neighborRow({ id: "old-key", text: "favorite drink: Fizzwick", score: 0.5, factKey: "preferences:favorite drink" });
     const { context, storedEntries, patchCalls } = makeContext({
       manualStoreSupersede: true,
       neighbors: [
@@ -266,7 +266,7 @@ describe("manual memory_store always-store supersede semantics", () => {
   it("supersedes a same-key row that falls below the vector similarity floor", async () => {
     const { context, storedEntries, patchCalls } = makeContext({
       manualStoreSupersede: true,
-      neighbors: [neighborRow({ id: "old-faint", text: "favorite drink: Coca-Cola", score: 0.05, factKey: "preferences:favorite drink" })],
+      neighbors: [neighborRow({ id: "old-faint", text: "favorite drink: Fizzwick", score: 0.05, factKey: "preferences:favorite drink" })],
     });
     const tools = createToolSet(context);
     const store = tools.get("memory_store");
@@ -283,7 +283,7 @@ describe("manual memory_store always-store supersede semantics", () => {
     const { context, storedEntries, patchCalls } = makeContext({
       manualStoreSupersede: true,
       neighbors: [
-        neighborRow({ id: "old-a", text: "favorite drink: Coca-Cola", score: 0.6, factKey: "preferences:favorite drink" }),
+        neighborRow({ id: "old-a", text: "favorite drink: Fizzwick", score: 0.6, factKey: "preferences:favorite drink" }),
         neighborRow({ id: "old-b", text: "favorite drink: ayran", score: 0.55, factKey: "preferences:favorite drink" }),
       ],
     });
@@ -321,12 +321,12 @@ describe("manual memory_store always-store supersede semantics", () => {
   it("keeps the existing 0.95-0.98 same-category band superseding with the knob on (no regression)", async () => {
     const { context, storedEntries, patchCalls } = makeContext({
       manualStoreSupersede: true,
-      neighbors: [neighborRow({ text: "favorite drink is Coca-Cola for sure", score: 0.96 })],
+      neighbors: [neighborRow({ text: "favorite drink is Fizzwick for sure", score: 0.96 })],
     });
     const tools = createToolSet(context);
     const store = tools.get("memory_store");
 
-    const input = "favorite drink: Coca-Cola Zero";
+    const input = "favorite drink: Fizzwick Zero";
     const res = await store.execute(null, { text: input, category: "preference" });
 
     assert.equal(res.details.action, "superseded");
@@ -339,7 +339,7 @@ describe("manual memory_store always-store supersede semantics", () => {
     const { context, storedEntries } = makeContext({
       manualStoreSupersede: true,
       neighbors: [
-        neighborRow({ id: "old-a", text: "favorite drink: Coca-Cola", score: 0.6, factKey: "preferences:favorite drink" }),
+        neighborRow({ id: "old-a", text: "favorite drink: Fizzwick", score: 0.6, factKey: "preferences:favorite drink" }),
         neighborRow({ id: "old-b", text: "favorite drink: ayran", score: 0.55, factKey: "preferences:favorite drink" }),
       ],
       patchBehavior: async (target) => (target.id === "old-b" ? null : { ...target }),
@@ -361,7 +361,7 @@ describe("manual memory_store always-store supersede semantics", () => {
   it("reports a thrown patch as a failure and keeps supersededId null when nothing is confirmed", async () => {
     const { context, storedEntries } = makeContext({
       manualStoreSupersede: true,
-      neighbors: [neighborRow({ text: "favorite drink: Coca-Cola", score: 0.99, factKey: "preferences:favorite drink" })],
+      neighbors: [neighborRow({ text: "favorite drink: Fizzwick", score: 0.99, factKey: "preferences:favorite drink" })],
       patchBehavior: async () => {
         throw new Error("synthetic patch failure");
       },
