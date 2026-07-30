@@ -3259,15 +3259,6 @@ const memoryLanceDBProPlugin = {
                         else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
                             newTexts = eligibleTexts.slice(previousSeenCount);
                         }
-                        else if (previousSeenCount === 0 && eligibleTexts.length > minMessages) {
-                            // issue #417 item 5: a genuinely unknown watermark (first-ever
-                            // run, or persisted state lost) meeting a history-carrying
-                            // payload must not ingest the entire transcript in one call.
-                            // Cap to the most recent batch and forfeit the rest by marking
-                            // it seen below, rather than queueing it for a later turn.
-                            newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
-                            watermarkAdvanceOverride = eligibleTexts.length;
-                        }
                         else if (previousSeenCount > 0 && eligibleTexts.length === previousSeenCount) {
                             // A repeated agent_end can redeliver the identical snapshot (no
                             // transcript growth); re-feeding the whole history through
@@ -3283,8 +3274,16 @@ const memoryLanceDBProPlugin = {
                                     recentForIdentity.slice(-identityDepth).join("\u0000");
                             if (identicalSnapshot) {
                                 newTexts = [];
-                                newlyObservedCount = 0;
                             }
+                        }
+                        else if (previousSeenCount === 0 && eligibleTexts.length > minMessages) {
+                            // issue #417 item 5: a genuinely unknown watermark (first-ever
+                            // run, or persisted state lost) meeting a history-carrying
+                            // payload must not ingest the entire transcript in one call.
+                            // Cap to the most recent batch and forfeit the rest by marking
+                            // it seen below, rather than queueing it for a later turn.
+                            newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
+                            watermarkAdvanceOverride = eligibleTexts.length;
                         }
                         // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
                         const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newTexts.length);
@@ -3445,7 +3444,7 @@ const memoryLanceDBProPlugin = {
                                     // rejection audits or support evidence, and charges the
                                     // process-wide limiter again. Only barren runs (no candidates
                                     // at all) stay retryable.
-                                    if (stats.settledOutcomes === true && !admittedOnlyByExplicitRemember) {
+                                    if (stats.settledOutcomes === true) {
                                         api.logger.info(`memory-lancedb-pro: smart extraction settled with no persisted rows for agent ${agentId} ` +
                                             `(rejected=${stats.rejected ?? 0}, skipped=${stats.skipped}, supported=${stats.supported ?? 0}, ` +
                                             `superseded=${stats.superseded ?? 0}); consuming texts without retry`);
@@ -4444,7 +4443,7 @@ const memoryLanceDBProPlugin = {
                         attachAudit: smartExtractor?.shouldPersistAdmissionAudit() ?? false,
                         rows: gateEligible.map(({ mapped, vector }) => ({
                             text: mapped.text,
-                            category: mapped.category,
+                            mappedKind: mapped.mappedKind,
                             heading: mapped.heading,
                             vector,
                         })),

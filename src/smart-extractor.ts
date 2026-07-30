@@ -1409,7 +1409,7 @@ export class SmartExtractor {
       const verdict = await this.llm.completeJson<{
         conversation_register?: string;
         results?: Array<{ index?: number; grounding?: string; reason?: string }>;
-      }>(rejudgePrompt, "grounding-rejudge");
+      }>(rejudgePrompt.user, "grounding-rejudge", rejudgePrompt.system);
       const verdictResults =
         verdict && Array.isArray(verdict.results) ? verdict.results : null;
       if (!verdictResults) {

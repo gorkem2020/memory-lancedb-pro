@@ -68,6 +68,8 @@ describe("MemoryStore list/stats projection fallback", () => {
 
     assert.deepEqual(await store.stats(), {
       totalCount: 1,
+      // deploy pin 2026-07-30: manual-supersede family stats carry liveCount
+      liveCount: 1,
       scopeCounts: { global: 1 },
       categoryCounts: { fact: 1 },
     });
@@ -89,6 +91,8 @@ describe("MemoryStore list/stats projection fallback", () => {
 
     assert.deepEqual(await store.stats(), {
       totalCount: 0,
+      // deploy pin 2026-07-30: manual-supersede family stats carry liveCount
+      liveCount: 0,
       scopeCounts: {},
       categoryCounts: {},
     });

@@ -8,7 +8,7 @@
 import { buildExtractionPrompt, buildDedupPrompt, buildGroundingRejudgePrompt, buildMergePrompt, buildBatchDedupPrompt, buildBatchMergePrompt, } from "./extraction-prompts.js";
 import { formatExistingMemoryEntry } from "./prompt-blocks.js";
 import { formatConversationTranscript, trimTranscriptToTagBoundary, } from "./auto-capture-cleanup.js";
-import { ALWAYS_MERGE_CATEGORIES, DURABLE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
+import { ALWAYS_MERGE_CATEGORIES, DURABLE_CATEGORIES, FICTION_JUDGED_CATEGORIES, REGISTER_STRICTNESS, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
 import { isUserMdExclusiveMemory, } from "./workspace-boundary.js";
@@ -176,6 +176,41 @@ export function resolveExtractionPolicy(scope, policy) {
         }
     }
     return "full";
+}
+/**
+ * Reads a rejudge verdict's item index, accepting the strictly-integral
+ * numeric string an LLM may emit for a field the prompt shows unquoted.
+ * Anything else yields NaN and fails the verdict's validation.
+ */
+function normalizeVerdictIndex(value) {
+    if (typeof value === "number")
+        return value;
+    if (typeof value === "string" && /^\d+$/.test(value.trim()))
+        return Number(value.trim());
+    return Number.NaN;
+}
+/**
+ * Reads a rejudge verdict's grounding as its enum token, tolerating trailing
+ * punctuation and a parenthetical qualifier ("real.", "constructed (in-story)")
+ * while refusing anything that does not START with the token, so a negated or
+ * unrecognized value ("not real", "maybe") still invalidates the verdict.
+ */
+function normalizeVerdictGrounding(value) {
+    if (typeof value !== "string")
+        return null;
+    const match = /^(real|constructed)\b/.exec(value.toLowerCase().trim());
+    return match ? match[1] : null;
+}
+/**
+ * Reads a batch register as its enum token on the same terms, so a decorated
+ * value ("fiction (roleplay)") keeps its scrutiny level instead of falling
+ * through to the laxer default. Returns "" when no token leads the value.
+ */
+function normalizeRegisterToken(value) {
+    if (typeof value !== "string")
+        return "";
+    const match = /^(real|fiction|mixed)\b/.exec(value.toLowerCase().trim());
+    return match ? match[1] : "";
 }
 // ============================================================================
 // Constants
@@ -812,9 +847,10 @@ export class SmartExtractor {
         // items, so the register deterministically overrides per-item grounding
         // wobble below. Missing/unrecognized values fail toward scrutiny
         // ("mixed"), never toward open.
-        const rawRegister = typeof result.conversation_register === "string"
-            ? result.conversation_register.toLowerCase().trim()
-            : "";
+        // Read with token boundaries: exact equality let a decorated value such as
+        // "fiction (roleplay)" fall through to "mixed", which relaxed the strictest
+        // gate rather than tightening it.
+        const rawRegister = normalizeRegisterToken(result.conversation_register);
         let conversationRegister = rawRegister === "real" || rawRegister === "fiction" ? rawRegister : "mixed";
         // Grounding rejudge: a scoped second pass, fired at most once per
         // extraction, only when the register verdict and the per-item tags are
@@ -824,7 +860,18 @@ export class SmartExtractor {
         // the retired batch-wide contradiction wipe; on judge failure the batch
         // fails closed (suspect durables demoted below, never stored-as-real).
         const rawItems = result.memories.filter((m) => !!m && typeof m === "object");
-        const isRawConstructed = (m) => typeof m.grounding === "string" && m.grounding.toLowerCase().trim() === "constructed";
+        // Verdicts are held HERE, never written back into the LLM response. The
+        // response object graph belongs to the client and may outlive the call
+        // (any caching or fixture-returning client shares it across invocations),
+        // so mutating it leaks one extraction's verdict into the next.
+        const rawItemIndex = new Map();
+        rawItems.forEach((m, i) => rawItemIndex.set(m, i));
+        const judgedGrounding = new Array(rawItems.length);
+        // First-pass tags are read on the same terms as the rejudge verdict: exact
+        // equality let "constructed (in-story)" read as real and persist. Values
+        // carrying no recognizable token at all ("unsure", a number) keep the
+        // documented legacy-payload contract and fail open to real.
+        const isRawConstructed = (m) => typeof m.grounding === "string" && normalizeVerdictGrounding(m.grounding) === "constructed";
         const rawConstructedCount = rawItems.filter(isRawConstructed).length;
         const rawRealCount = rawItems.length - rawConstructedCount;
         const hasRealTaggedDurable = rawItems.some((m) => {
@@ -833,14 +880,44 @@ export class SmartExtractor {
             const cat = normalizeCategory(m.category ?? "");
             return !!cat && DURABLE_CATEGORIES.has(cat);
         });
-        // The cells are defined on the register the model ASSERTED — a missing or
-        // unrecognized register is no assertion, so legacy payloads keep the
-        // deterministic legacy path below instead of burning a judge call.
+        // Judge-gated categories are not durable, so a contradiction cell keyed on
+        // durables alone never fired for them: a constructed sibling beside a
+        // real-tagged in-story event persisted the event with no adjudication at
+        // all. They now arm the contradiction cells too, and the persistence gate
+        // below requires a positive verdict for them wherever such a cell fired.
+        const hasRealTaggedJudgeGated = rawItems.some((m) => {
+            if (isRawConstructed(m))
+                return false;
+            const cat = normalizeCategory(m.category ?? "");
+            return !!cat && FICTION_JUDGED_CATEGORIES.has(cat);
+        });
+        // Most cells are defined on the register the model ASSERTED — a missing or
+        // unrecognized register is no assertion, so legacy payloads stay on the
+        // deterministic path. The one exception is the constructed-sibling shape:
+        // there the deterministic path is the batch-wide durable wipe, which
+        // deletes independently-supported real facts alongside the suspect ones —
+        // exactly the over-drop the per-item rejudge exists to replace. Attempting
+        // the judge there strictly dominates: it can only rescue rows, and a
+        // failed or malformed verdict still falls through to the same wipe.
         const registerAsserted = rawRegister === "real" || rawRegister === "fiction" || rawRegister === "mixed";
         let rejudgeCell = null;
-        if (registerAsserted && rawItems.length > 0) {
-            if (conversationRegister === "real" && rawRealCount === 0) {
+        if (rawItems.length > 0) {
+            if (!registerAsserted) {
+                if (rawConstructedCount > 0 && (hasRealTaggedDurable || hasRealTaggedJudgeGated)) {
+                    rejudgeCell = "unasserted-constructed-sibling-durables";
+                }
+            }
+            else if (conversationRegister === "real" && rawRealCount === 0) {
                 rejudgeCell = "real-zero-real";
+            }
+            else if (conversationRegister === "real" &&
+                rawConstructedCount > 0 &&
+                (hasRealTaggedDurable || hasRealTaggedJudgeGated)) {
+                // An asserted-real batch that also carries a constructed tag contradicts
+                // itself: the register claims ordinary conversation while an item is
+                // marked true only inside a fiction. A durable that can persist beside
+                // that sibling gets adjudicated rather than trusted on the assertion.
+                rejudgeCell = "real-constructed-sibling-durables";
             }
             else if (conversationRegister === "mixed" && rawConstructedCount === 0) {
                 rejudgeCell = "mixed-zero-constructed";
@@ -850,10 +927,23 @@ export class SmartExtractor {
             }
             else if (conversationRegister !== "real" &&
                 rawConstructedCount > 0 &&
-                hasRealTaggedDurable) {
+                (hasRealTaggedDurable ||
+                    (conversationRegister === "fiction" && hasRealTaggedJudgeGated))) {
+                // NOTE: a real-tagged judge-gated candidate arms this cell only under
+                // fiction, deliberately. An asserted "mixed" register means both kinds
+                // of content are present, so a constructed sibling there is coherent
+                // rather than contradictory, and the suite pins that a coherent mixed
+                // batch must not spend a rejudge call. That leaves a real-tagged
+                // in-story event unadjudicated under "mixed"; widening it is a cost
+                // decision (one extra call per mixed batch carrying an event) raised
+                // with the reviewer rather than taken here.
                 rejudgeCell = "constructed-sibling-durables";
             }
         }
+        // Item indices the grounding judge positively confirmed as "real". Only a
+        // confirmed item may pass the fiction-register gate for judge-gated
+        // categories below: absence of a verdict is never confirmation.
+        const judgeConfirmedReal = new Set();
         let rejudgeFailedClosed = false;
         if (rejudgeCell) {
             this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge fired cell=${rejudgeCell} register=${conversationRegister} candidates=${rawItems.length}`);
@@ -868,25 +958,60 @@ export class SmartExtractor {
             const verdictResults = verdict && Array.isArray(verdict.results) ? verdict.results : null;
             if (!verdictResults) {
                 rejudgeFailedClosed = true;
-                this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge failed (null or malformed verdict) — failing closed, real-tagged durables will be demoted`);
+                // Logged at info: this path discards every durable in the batch, and a
+                // silent judge (a transient gateway failure looks identical to an
+                // unusable answer here) should be visible when it does that.
+                this.log(`memory-lancedb-pro: smart-extractor: grounding-rejudge returned no usable verdict — failing closed, real-tagged durables will be demoted`);
             }
             else {
+                // The ENTIRE response is validated before any of it is applied:
+                // exactly one row per candidate, unique integral in-range indices, one
+                // usable grounding each. A response failing any of those is applied in
+                // NO part, so every item stays unadjudicated, the register cannot be
+                // relaxed, and the quarantine below still sees untrusted first-pass
+                // tags. Applying rows as they arrived let a duplicate index overwrite
+                // an earlier verdict while still counting toward coverage.
+                // Rows are NORMALIZED before the gate judges them, so ordinary value
+                // variance (an index the model quoted, a grounding it decorated) does
+                // not turn a semantically complete verdict into a rejected one. With
+                // whole-response rejection, pedantry about representation would
+                // discard every confirmation and rescue in the response.
+                const staged = new Map();
+                let verdictWellFormed = verdictResults.length === rawItems.length;
+                if (verdictWellFormed) {
+                    for (const r of verdictResults) {
+                        const index = normalizeVerdictIndex(r?.index);
+                        const g = normalizeVerdictGrounding(r?.grounding);
+                        if (!Number.isInteger(index) ||
+                            index < 1 ||
+                            index > rawItems.length ||
+                            g === null ||
+                            staged.has(index - 1)) {
+                            verdictWellFormed = false;
+                            break;
+                        }
+                        staged.set(index - 1, g);
+                    }
+                }
                 let retagged = 0;
                 const adjudicated = new Set();
-                for (const r of verdictResults) {
-                    if (!r || typeof r.index !== "number")
-                        continue;
-                    const item = rawItems[r.index - 1];
-                    if (!item)
-                        continue;
-                    const g = typeof r.grounding === "string" ? r.grounding.toLowerCase().trim() : "";
-                    if (g !== "real" && g !== "constructed")
-                        continue;
-                    if ((isRawConstructed(item) ? "constructed" : "real") !== g)
-                        retagged++;
-                    item.grounding = g;
-                    adjudicated.add(r.index - 1);
+                if (verdictWellFormed) {
+                    for (const [itemIndex, g] of staged) {
+                        if ((isRawConstructed(rawItems[itemIndex]) ? "constructed" : "real") !== g) {
+                            retagged++;
+                        }
+                        judgedGrounding[itemIndex] = g;
+                        adjudicated.add(itemIndex);
+                        if (g === "real")
+                            judgeConfirmedReal.add(itemIndex);
+                        else
+                            judgeConfirmedReal.delete(itemIndex);
+                    }
                 }
+                else {
+                    this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge verdict malformed (${verdictResults.length} row(s) for ${rawItems.length} candidate(s), or a duplicate/out-of-range index or invalid grounding) — applying none and failing closed on the asserted register`);
+                }
+                const coverageComplete = verdictWellFormed && adjudicated.size === rawItems.length;
                 const verdictRegister = typeof verdict.conversation_register === "string"
                     ? verdict.conversation_register.toLowerCase().trim()
                     : "";
@@ -894,7 +1019,15 @@ export class SmartExtractor {
                 if (verdictRegister === "real" ||
                     verdictRegister === "fiction" ||
                     verdictRegister === "mixed") {
-                    conversationRegister = verdictRegister;
+                    // On incomplete coverage the asserted register stands, except that a
+                    // STRICTER verdict register is always honoured: refusing to relax is
+                    // the fail-closed property, refusing to tighten would be the reverse.
+                    if (coverageComplete || REGISTER_STRICTNESS[verdictRegister] > REGISTER_STRICTNESS[conversationRegister]) {
+                        conversationRegister = verdictRegister;
+                    }
+                    else {
+                        this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge verdict coverage incomplete (${adjudicated.size}/${rawItems.length}) — refusing register relax ${conversationRegister}->${verdictRegister}`);
+                    }
                 }
                 // Coverage check: the judge is instructed to adjudicate every index.
                 // An index it omitted (or answered with an unusable grounding) keeps
@@ -902,8 +1035,12 @@ export class SmartExtractor {
                 // count as a clean bill. Per-item fail-closed: in a non-real register,
                 // an unadjudicated real-tagged durable is quarantined to "constructed"
                 // rather than stored on a tag the judge never confirmed.
+                // The asserted-real constructed-sibling cell quarantines as well: its
+                // premise is that a real register is not trustworthy when the model
+                // also tagged part of the same batch constructed.
                 let uncoveredDemoted = 0;
-                if (conversationRegister !== "real") {
+                if (conversationRegister !== "real" ||
+                    rejudgeCell === "real-constructed-sibling-durables") {
                     for (let i = 0; i < rawItems.length; i++) {
                         if (adjudicated.has(i))
                             continue;
@@ -913,7 +1050,7 @@ export class SmartExtractor {
                         const cat = normalizeCategory(item.category ?? "");
                         if (!cat || !DURABLE_CATEGORIES.has(cat))
                             continue;
-                        item.grounding = "constructed";
+                        judgedGrounding[i] = "constructed";
                         uncoveredDemoted++;
                     }
                 }
@@ -923,6 +1060,12 @@ export class SmartExtractor {
                 this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge verdict register=${registerBefore}->${conversationRegister} retagged=${retagged}/${rawItems.length}`);
             }
         }
+        // A constructed sibling makes the batch's own self-tagging untrustworthy,
+        // so judge-gated candidates need a positive verdict in these cells too,
+        // not only in a fiction register.
+        const constructedSiblingCellFired = rejudgeCell === "real-constructed-sibling-durables" ||
+            rejudgeCell === "unasserted-constructed-sibling-durables" ||
+            rejudgeCell === "constructed-sibling-durables";
         // Validate and normalize candidates
         const candidates = [];
         let invalidCategoryCount = 0;
@@ -971,14 +1114,38 @@ export class SmartExtractor {
             // session (e.g. that it happened); "constructed" is a claim true only
             // WITHIN the fiction. A constructed-tagged candidate is never stored,
             // in any category or register — there is no per-extraction cap anymore.
-            const rawGrounding = typeof raw.grounding === "string" ? raw.grounding.toLowerCase().trim() : "";
-            const grounding = rawGrounding === "constructed" ? "constructed" : "real";
+            // A grounding-judge verdict, when one exists for this item, is final and
+            // supersedes the self-tag; it is held out-of-band rather than written
+            // back into the response object.
+            const rawItemPosition = rawItemIndex.get(raw);
+            const grounding = (rawItemPosition === undefined ? undefined : judgedGrounding[rawItemPosition]) ??
+                // Same token-boundary read as the cell predicate and the rejudge
+                // verdict: exact equality here let "constructed (in-story)" persist as
+                // a real memory. A value with no recognizable token still fails open.
+                (normalizeVerdictGrounding(raw.grounding) === "constructed" ? "constructed" : "real");
             // Register enforcement: an in-fiction batch can never produce durable
             // memories, whatever the per-item self-tags claim (the per-item tags
             // are exactly the wobble the batch register exists to override).
             if (conversationRegister === "fiction" && DURABLE_CATEGORIES.has(category)) {
                 fictionRegisterDroppedCount++;
                 this.debugLog(`memory-lancedb-pro: smart-extractor: dropping durable candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
+                continue;
+            }
+            // Judge-gated categories: an event may be an assertion ABOUT a fiction
+            // session ("we played for three hours", legitimately real) or an event
+            // from WITHIN it ("boarded the train", constructed). The per-item
+            // self-tag cannot be trusted to tell those apart wherever the batch is
+            // internally contradictory, so the candidate survives only on a positive
+            // grounding-judge confirmation. No verdict, an omitted index, or a failed
+            // judge all fail closed here. The gate covers a fiction register AND any
+            // constructed-sibling cell: a constructed tag beside a real-tagged
+            // in-story event is the same untrustworthy self-tagging, whatever
+            // register the batch claimed.
+            if ((conversationRegister === "fiction" || constructedSiblingCellFired) &&
+                FICTION_JUDGED_CATEGORIES.has(category) &&
+                !(rawItemPosition !== undefined && judgeConfirmedReal.has(rawItemPosition))) {
+                fictionRegisterDroppedCount++;
+                this.debugLog(`memory-lancedb-pro: smart-extractor: dropping unconfirmed judge-gated candidate (register=${conversationRegister}, cell=${rejudgeCell ?? "none"}) category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
                 continue;
             }
             // Grounding enforcement: a constructed assertion is true only within
@@ -997,7 +1164,13 @@ export class SmartExtractor {
         // quarantine — demote surviving real-tagged durables — remains for two
         // shapes only: the rejudge itself failed, or a legacy payload asserted no
         // register at all while tagging constructed siblings.
-        const legacyContradiction = !registerAsserted && conversationRegister !== "real" && rawConstructedCount > 0;
+        // Only the shapes the judge was never asked about land here; the
+        // unasserted constructed-sibling shape now goes to the judge first and
+        // falls back through rejudgeFailedClosed when that judge cannot answer.
+        const legacyContradiction = !registerAsserted &&
+            !rejudgeCell &&
+            conversationRegister !== "real" &&
+            rawConstructedCount > 0;
         let contradictionDemotedCount = 0;
         if (rejudgeFailedClosed || legacyContradiction) {
             for (let i = candidates.length - 1; i >= 0; i--) {

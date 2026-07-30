@@ -379,7 +379,7 @@ describe("SmartExtractor batch embedding paths", () => {
   // --------------------------------------------------------------------------
   // Test 7: Profile candidates are excluded from batch pre-computation
   // --------------------------------------------------------------------------
-  it("excludes profile-category candidates from batch pre-computation (Step 2)", async () => {
+  it("routes profile candidates through batch pre-computation too (batched-utility deploy contract)", async () => {
     // Track all embedBatch calls to distinguish Step 1b (dedup) from Step 2 (pre-compute)
     const allBatchCalls = [];
     const embedder = {
@@ -414,13 +414,15 @@ describe("SmartExtractor batch embedding paths", () => {
       call.some((t) => t.includes("用户基本画像") || t.includes("画像信息")),
     );
 
-    // Step 1b dedup MAY include profile abstract (that's expected).
-    // But Step 2 pre-compute MUST exclude it.
-    // With a single profile candidate, we expect at most 1 call that includes
-    // profile text (the Step 1b dedup call). If there are more, that's a bug.
+    // DEPLOY PIN (batched-utility family, 2026-07-30): Step 2 pre-computes
+    // vectors for EVERY processable candidate, profile included, because the
+    // batched utility/admission call consumes the precomputed vector. So one
+    // profile candidate legitimately appears in Step 1b dedup AND Step 2
+    // pre-compute. Master's exclusion form returns with the PR-side
+    // reconciliation of the admission family.
     assert.ok(
-      profileTexts.length <= 1,
-      `Only Step 1b dedup may include profile text, but got ${profileTexts.length} calls with profile text`,
+      profileTexts.length >= 1 && profileTexts.length <= 2,
+      `Expected profile text in dedup and (family form) pre-compute, got ${profileTexts.length} calls`,
     );
   });
 });

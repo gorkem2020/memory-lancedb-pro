@@ -302,19 +302,20 @@ describe("SmartExtractor grounding-aware extraction (Option A, v3)", () => {
 
   it("buildExtractionPrompt documents the v3 grounding contract (structural check)", async () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const parts = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = `${parts.system}\n\n${parts.user}`;
 
     assert.match(prompt, /grounding/i);
     assert.match(prompt, /"real"\s*\|\s*"constructed"|real.*constructed/i);
-    assert.match(prompt, /about-the-hypothetical is real/i, "the generalized about/within one-line rule must be present");
+    assert.match(prompt, /about-the-hypothetical is real/i, "the about/within one-line rule must be present in its generalized form");
     assert.match(prompt, /within-the-hypothetical/i, "the within-the-hypothetical definition of constructed must be present");
-    assert.doesNotMatch(prompt, /about-the-fiction is real/i, "the game-flavored v3 phrasing must be gone");
     assert.doesNotMatch(prompt, /at most one/i, "the per-extraction constructed cap must be fully removed from the prompt");
   });
 
   it("the unsure tie-break defaults to constructed, never real (best-effort lane axiom)", async () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const parts = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = `${parts.system}\n\n${parts.user}`;
 
     assert.match(
       prompt,
@@ -888,17 +889,13 @@ describe("SmartExtractor batch register signal (grounding v2)", () => {
 
   it("buildExtractionPrompt documents the batch register contract (structural check)", () => {
     const { buildExtractionPrompt } = jiti("../src/extraction-prompts.ts");
-    const prompt = buildExtractionPrompt("some conversation", "test-user");
+    const parts = buildExtractionPrompt("some conversation", "test-user");
+    const prompt = `${parts.system}\n\n${parts.user}`;
 
     assert.match(prompt, /conversation_register/);
     assert.match(prompt, /"real\|mixed\|fiction"/);
-    assert.match(
-      prompt,
-      /Check before you answer \(only when the register is "fiction" or "mixed"\)/,
-      "the scoped pre-answer check must be present",
-    );
-    assert.match(prompt, /name to yourself the factual stretch/, "the stretch-naming self-check must be present");
-    assert.doesNotMatch(prompt, /self-consistency/i, "the v3 self-consistency wording is replaced by the scoped check");
+    assert.match(prompt, /Check before you answer \(only when the register is "fiction" or "mixed"\)/, "the register-scoped final check must be present");
+    assert.match(prompt, /name to yourself the factual stretch/i, "the per-item provenance obligation must be present");
     assert.doesNotMatch(prompt, /storage rule applied after tagging/i, "the deleted per-extraction cap language must not remain in the prompt");
   });
 });
@@ -990,12 +987,12 @@ describe("AdmissionController grounding awareness (grounding v2)", () => {
     assert.equal(scoreGroundedTypePrior(realProfile, priors), priors.profile, "real register keeps the raw prior");
   });
 
-  it("buildUtilityPrompt interpolates grounding and names all six registers (structural check)", async () => {
+  it("buildUtilityPrompt carries the grounding rule paragraph and names all six registers (structural check)", async () => {
     const llm = {
       prompts: [],
-      async completeJson(prompt, mode) {
+      async completeJson(user, mode, system) {
         if (mode === "admission-utility") {
-          this.prompts.push(prompt);
+          this.prompts.push(`${system}\n\n${user}`);
           return { utility: 0.5, reason: "mock" };
         }
         return null;

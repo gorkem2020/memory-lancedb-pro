@@ -4492,7 +4492,7 @@ const memoryLanceDBProPlugin = {
                 // rejection audits or support evidence, and charges the
                 // process-wide limiter again. Only barren runs (no candidates
                 // at all) stay retryable.
-                if (stats.settledOutcomes === true && !admittedOnlyByExplicitRemember) {
+                if (stats.settledOutcomes === true) {
                   api.logger.info(
                     `memory-lancedb-pro: smart extraction settled with no persisted rows for agent ${agentId} ` +
                     `(rejected=${stats.rejected ?? 0}, skipped=${stats.skipped}, supported=${stats.supported ?? 0}, ` +
