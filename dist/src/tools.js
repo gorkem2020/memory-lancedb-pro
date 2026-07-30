@@ -212,6 +212,45 @@ function serializeFactEntry(entry, atMs) {
     };
 }
 const FACT_QUERY_PAGE_SIZE = 500;
+/**
+ * Complete, scope-aware lookup of ACTIVE rows holding a fact key. The vector
+ * top-K is the wrong tool for key collisions: a same-key row ranked behind
+ * closer unrelated neighbors, or below the similarity floor, is exactly the
+ * stale value a manual update must supersede. Paginates the full scope the
+ * same way the temporal-fact query path does.
+ */
+async function findActiveFactKeyEntries(store, scopeFilter, factKey) {
+    const matches = [];
+    const seenIds = new Set();
+    const now = Date.now();
+    for (let offset = 0;; offset += FACT_QUERY_PAGE_SIZE) {
+        const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset);
+        if (page.length === 0)
+            break;
+        let newRows = 0;
+        for (const entry of page) {
+            if (seenIds.has(entry.id))
+                continue;
+            seenIds.add(entry.id);
+            newRows += 1;
+            // Exact scope match: list() masks legacy NULL scopes as "global" and
+            // store-level filters have passed legacy rows through before; a
+            // supersede scan must never treat a row outside the requested scopes
+            // as a collision target.
+            if (!scopeFilter.includes(entry.scope))
+                continue;
+            const meta = parseSmartMetadata(entry.metadata, entry);
+            if (!isMemoryActiveAt(meta, now) || isMemoryExpired(meta, now))
+                continue;
+            const entryKey = meta.fact_key ?? deriveFactKey(meta.memory_category, entry.text);
+            if (entryKey === factKey)
+                matches.push(entry);
+        }
+        if (page.length < FACT_QUERY_PAGE_SIZE || newRows === 0)
+            break;
+    }
+    return matches;
+}
 function compareFactQueryCandidates(a, b) {
     if (a.fact.activeAt !== b.fact.activeAt)
         return a.fact.activeAt ? -1 : 1;
@@ -322,8 +361,10 @@ function formatIgnoredScopeNotice(resolvedScopes) {
         : "(none)";
     return `Ignored inaccessible scope "${resolvedScopes.ignoredScope}" and searched accessible scopes instead: ${scopes}.`;
 }
-async function resolveMemoryId(context, memoryRef, scopeFilter) {
-    const trimmed = memoryRef.trim();
+export async function resolveMemoryId(context, memoryRef, scopeFilter) {
+    // Agents copy ids out of injected context, which truncates them and often
+    // appends an ellipsis ("407dec9c..."); strip that before classifying.
+    const trimmed = memoryRef.trim().replace(/[.…]+$/u, "");
     if (!trimmed) {
         return {
             ok: false,
@@ -331,9 +372,35 @@ async function resolveMemoryId(context, memoryRef, scopeFilter) {
             details: { error: "empty_memory_ref" },
         };
     }
-    const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(trimmed);
-    if (uuidLike) {
+    const isFullUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+    if (isFullUuid) {
         return { ok: true, id: trimmed };
+    }
+    // Documented contract: "full UUID or 8+ char prefix". A hex-shaped ref
+    // that is not a complete UUID resolves as an id prefix within accessible
+    // scopes — unique match wins, multiple matches list candidates, and zero
+    // matches is an honest not-found (never a scan-match or a semantic guess).
+    const isIdPrefix = /^[0-9a-f][0-9a-f-]{7,35}$/i.test(trimmed);
+    if (isIdPrefix) {
+        const matches = await context.store.findByIdPrefix(trimmed, scopeFilter);
+        if (matches.length === 1) {
+            return { ok: true, id: matches[0].id };
+        }
+        if (matches.length > 1) {
+            const list = matches
+                .map((entry) => `- [${entry.id.slice(0, 8)}] ${entry.text.slice(0, 60)}${entry.text.length > 60 ? "..." : ""}`)
+                .join("\n");
+            return {
+                ok: false,
+                message: `Id prefix "${trimmed}" matches multiple memories. Use a longer prefix or the full id:\n${list}`,
+                details: { error: "ambiguous_id_prefix", prefix: trimmed },
+            };
+        }
+        return {
+            ok: false,
+            message: `Memory ${trimmed} not found or access denied.`,
+            details: { error: "not_found", id: trimmed },
+        };
     }
     const results = await retrieveWithRetry(context.retriever, {
         query: trimmed,
@@ -964,17 +1031,74 @@ export function registerMemoryStoreTool(api, context) {
                     // Align with TEMPORAL_VERSIONED_CATEGORIES at the smart-category
                     // layer so legacy storage categories like "fact" don't cross-match
                     // unrelated profile/case memories.
-                    let existing = [];
-                    try {
-                        existing = await runtimeContext.store.vectorSearch(vector, 3, 0.1, [
-                            targetScope,
-                        ], { excludeInactive: true });
-                    }
-                    catch (err) {
-                        console.warn(`memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`);
-                    }
-                    const duplicateCandidate = existing[0]?.score > 0.98 ? existing[0] : undefined;
-                    if (duplicateCandidate && !force) {
+                    const manualSupersede = runtimeContext.manualStoreSupersede === true;
+                    const newFactKey = deriveFactKey(memoryCategory, stripped);
+                    // One discovery routine serves both passes: the ADVISORY pass below
+                    // decides whether to enter the supersede path at all, and the store's
+                    // atomic commit re-runs it under the write lock so the target set
+                    // that actually commits reflects concurrent writers' work.
+                    const runSupersedeDiscovery = async () => {
+                        // Check for duplicates / supersede candidates using raw vector
+                        // similarity (bypasses importance/recency weighting).
+                        // Fail-open by design: dedup must never block a legitimate write.
+                        // excludeInactive: superseded historical records must not block
+                        // new writes.
+                        let neighbors = [];
+                        try {
+                            neighbors = await runtimeContext.store.vectorSearch(vector, 3, 0.1, [
+                                targetScope,
+                            ], { excludeInactive: true });
+                        }
+                        catch (err) {
+                            console.warn(`memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`);
+                        }
+                        const duplicateCandidate = neighbors[0]?.score > 0.98 ? neighbors[0] : undefined;
+                        // Key collisions resolve through a COMPLETE scope lookup, never the
+                        // vector top-K: a same-key row ranked behind closer unrelated
+                        // neighbors, or below the similarity floor, is exactly the stale
+                        // value this path exists to supersede. Fail-open like the duplicate
+                        // pre-check: a lookup error stores alongside instead of blocking.
+                        let activeFactKeyEntries = [];
+                        if (manualSupersede && !force && newFactKey) {
+                            try {
+                                activeFactKeyEntries = await findActiveFactKeyEntries(runtimeContext.store, [targetScope], newFactKey);
+                            }
+                            catch (err) {
+                                console.warn(`memory-lancedb-pro: fact-key lookup failed, continue store: ${String(err)}`);
+                            }
+                        }
+                        const manualPriorityTargets = [];
+                        if (manualSupersede && !force) {
+                            if (duplicateCandidate) {
+                                manualPriorityTargets.push(duplicateCandidate);
+                            }
+                            for (const entry of activeFactKeyEntries) {
+                                if (!manualPriorityTargets.some((target) => target.entry.id === entry.id)) {
+                                    manualPriorityTargets.push({ entry });
+                                }
+                            }
+                        }
+                        // Auto-supersede band: similar memory (0.95-0.98), same
+                        // storage-layer category, eligible category.
+                        const bandCandidate = neighbors.find((r) => r.score > 0.95 &&
+                            r.score <= 0.98 &&
+                            TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
+                            matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata));
+                        const targets = manualPriorityTargets.length > 0
+                            ? manualPriorityTargets
+                            : bandCandidate
+                                ? [bandCandidate]
+                                : [];
+                        return {
+                            neighbors,
+                            duplicateCandidate,
+                            manual: manualPriorityTargets.length > 0,
+                            targets,
+                        };
+                    };
+                    const discovery = await runSupersedeDiscovery();
+                    const duplicateCandidate = discovery.duplicateCandidate;
+                    if (duplicateCandidate && !force && !manualSupersede) {
                         return {
                             content: [
                                 {
@@ -991,84 +1115,131 @@ export function registerMemoryStoreTool(api, context) {
                             },
                         };
                     }
-                    // Auto-supersede: if a similar memory exists (0.95-0.98 similarity),
-                    // same storage-layer category, and category is eligible, mark the old
-                    // one as superseded and store the new one with a supersedes link.
-                    const supersedeCandidate = existing.find((r) => r.score > 0.95 &&
-                        r.score <= 0.98 &&
-                        TEMPORAL_VERSIONED_CATEGORIES.has(memoryCategory) &&
-                        matchesMemoryCategoryFilter(r.entry.category, memoryCategory, r.entry.metadata));
-                    if (supersedeCandidate) {
-                        const oldEntry = supersedeCandidate.entry;
-                        const oldMeta = parseSmartMetadata(oldEntry.metadata, oldEntry);
-                        const now = Date.now();
-                        const factKey = oldMeta.fact_key ?? deriveFactKey(oldMeta.memory_category, text);
-                        // Store new memory with supersedes link, preserving canonical fields
-                        // from the old entry (aligns with memory_update supersede path).
-                        const newMeta = buildSmartMetadata({ text, category: storageCategory, importance: safeImportance }, {
-                            l0_abstract: text,
-                            l1_overview: oldMeta.l1_overview || `- ${text}`,
-                            l2_content: text,
-                            memory_category: oldMeta.memory_category,
-                            tier: oldMeta.tier,
-                            source: "manual",
-                            state: "confirmed",
-                            memory_layer: deriveManualMemoryLayer(oldMeta.memory_category),
-                            last_confirmed_use_at: now,
-                            bad_recall_count: 0,
-                            suppressed_until_turn: 0,
-                            valid_from: now,
-                            fact_key: factKey,
-                            supersedes: oldEntry.id,
-                            relations: appendRelation([], {
-                                type: "supersedes",
-                                targetId: oldEntry.id,
-                            }),
-                        });
-                        const newEntry = await runtimeContext.store.store({
-                            text,
-                            vector,
-                            importance: safeImportance,
-                            category: storageCategory,
-                            scope: targetScope,
-                            metadata: stringifySmartMetadata(newMeta),
-                        });
-                        // Invalidate old record
-                        try {
-                            await runtimeContext.store.patchMetadata(oldEntry.id, {
-                                fact_key: factKey,
-                                invalidated_at: now,
-                                superseded_by: newEntry.id,
-                                relations: appendRelation(oldMeta.relations, {
+                    // Manual-priority supersede (manualStoreSupersede): a manual store
+                    // always takes priority — its text lands verbatim, and a similar
+                    // existing row yields to it. Targets, in order: the near-identical
+                    // neighbor the duplicate check used to reject, then an active
+                    // neighbor holding the same fact key at any similarity (the
+                    // update/contradiction shape, e.g. a new value for a versioned
+                    // fact). Anything else falls through to the versioned-band check,
+                    // and past that stores alongside: a wrong supersede destroys a real
+                    // fact, while a duplicate is fixable noise.
+                    if (discovery.targets.length > 0) {
+                        // Canonical identity comes from the REQUESTED store, never from a
+                        // near-duplicate donor: the new row's category and fact key are the
+                        // requested ones, and overview/tier inherit only from a
+                        // category-verified target (the band shape). Temporal expiry is
+                        // preserved exactly like the plain-store path.
+                        const buildSupersedeMetadata = (targets, manualPriority) => {
+                            const now = Date.now();
+                            const verified = targets
+                                .map((target) => ({ target, meta: parseSmartMetadata(target.metadata, target) }))
+                                .find(({ target }) => matchesMemoryCategoryFilter(target.category, memoryCategory, target.metadata));
+                            const factKey = newFactKey ?? verified?.meta.fact_key ?? undefined;
+                            const primary = targets[0];
+                            return stringifySmartMetadata(buildSmartMetadata({ text, category: storageCategory, importance: safeImportance }, {
+                                l0_abstract: text,
+                                // A manual-priority supersede replaces the fact's VALUE, so
+                                // the old row's overview is stale by definition; the band
+                                // case keeps the richer overview of its category-verified
+                                // target as before.
+                                l1_overview: manualPriority ? `- ${text}` : verified?.meta.l1_overview || `- ${text}`,
+                                l2_content: text,
+                                memory_category: memoryCategory,
+                                tier: verified?.meta.tier,
+                                source: "manual",
+                                state: "confirmed",
+                                memory_layer: deriveManualMemoryLayer(memoryCategory),
+                                last_confirmed_use_at: now,
+                                bad_recall_count: 0,
+                                suppressed_until_turn: 0,
+                                valid_from: now,
+                                memory_temporal_type: temporalType,
+                                valid_until: validUntil,
+                                ...(factKey ? { fact_key: factKey } : {}),
+                                ...(primary ? { supersedes: primary.id } : {}),
+                                relations: targets.reduce((relations, target) => appendRelation(relations, {
+                                    type: "supersedes",
+                                    targetId: target.id,
+                                }), []),
+                            }));
+                        };
+                        const buildInvalidationPatch = (target, newEntryId) => {
+                            const targetMeta = parseSmartMetadata(target.metadata, target);
+                            const sameCategory = matchesMemoryCategoryFilter(target.category, memoryCategory, target.metadata);
+                            return {
+                                // Backfill a missing fact key only on a category-verified
+                                // target: stamping the new key onto a foreign-category
+                                // near-duplicate would misfile it.
+                                ...(!targetMeta.fact_key && sameCategory && newFactKey ? { fact_key: newFactKey } : {}),
+                                invalidated_at: Date.now(),
+                                superseded_by: newEntryId,
+                                relations: appendRelation(targetMeta.relations, {
                                     type: "superseded_by",
-                                    targetId: newEntry.id,
+                                    targetId: newEntryId,
                                 }),
-                            }, [targetScope]);
+                            };
+                        };
+                        // Commit atomically at the store layer: recheck, insert, and
+                        // invalidate run under one write lock, so concurrent same-key
+                        // writers converge on a single active row instead of leaving two
+                        // replacements standing.
+                        let lastDiscovery = discovery;
+                        const committed = await runtimeContext.store.storeSuperseding({
+                            entry: {
+                                text,
+                                vector,
+                                importance: safeImportance,
+                                category: storageCategory,
+                                scope: targetScope,
+                                metadata: "{}",
+                            },
+                            scopeFilter: [targetScope],
+                            discoverTargets: async () => {
+                                lastDiscovery = await runSupersedeDiscovery();
+                                return lastDiscovery.targets.map((target) => target.entry);
+                            },
+                            finalizeEntryMetadata: (targets) => buildSupersedeMetadata(targets, lastDiscovery.manual),
+                            buildTargetPatch: buildInvalidationPatch,
+                        });
+                        const newEntry = committed.entry;
+                        const { supersededIds, invalidationFailures } = committed;
+                        for (const failure of invalidationFailures) {
+                            // The new record is already stored; surface the unconfirmed
+                            // invalidation instead of silently reporting it as superseded.
+                            console.warn(`memory-pro: failed to invalidate superseded record ${failure.id.slice(0, 8)}: ${failure.reason}`);
                         }
-                        catch (patchErr) {
-                            // New record is already the source of truth; log but don't fail
-                            console.warn(`memory-pro: failed to patch superseded record ${oldEntry.id.slice(0, 8)}: ${patchErr}`);
-                        }
+                        context.manualEchoLedger?.record(agentId, text);
                         // Dual-write to Markdown mirror if enabled
                         if (context.mdMirror) {
                             await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: newEntry.timestamp }, { source: "memory_store", agentId });
                         }
+                        const supersededLabel = supersededIds.length > 1
+                            ? `${supersededIds.length} memories (${supersededIds.map((id) => id.slice(0, 8)).join(", ")})`
+                            : supersededIds.length === 1
+                                ? `memory ${supersededIds[0].slice(0, 8)}...`
+                                : "no memories";
+                        const failureSuffix = invalidationFailures.length > 0
+                            ? ` (${invalidationFailures.length} invalidation(s) failed; those rows may still be active)`
+                            : "";
                         return {
                             content: [
                                 {
                                     type: "text",
-                                    text: `Superseded memory ${oldEntry.id.slice(0, 8)}... → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"`,
+                                    text: `Superseded ${supersededLabel} → new version ${newEntry.id.slice(0, 8)}...: "${text.slice(0, 80)}${text.length > 80 ? "..." : ""}"${failureSuffix}`,
                                 },
                             ],
                             details: {
                                 action: "superseded",
                                 id: newEntry.id,
-                                supersededId: oldEntry.id,
+                                supersededId: supersededIds[0] ?? null,
+                                supersededIds,
+                                ...(invalidationFailures.length > 0 ? { invalidationFailures } : {}),
                                 scope: newEntry.scope,
                                 category: memoryCategory,
                                 rawCategory: newEntry.category,
                                 importance: newEntry.importance,
-                                similarity: supersedeCandidate.score,
+                                similarity: lastDiscovery.targets[0]?.score,
                             },
                         };
                     }
@@ -1097,6 +1268,7 @@ export function registerMemoryStoreTool(api, context) {
                             valid_until: validUntil,
                         })),
                     });
+                    context.manualEchoLedger?.record(agentId, text);
                     // Dual-write to Markdown mirror if enabled
                     if (context.mdMirror) {
                         await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: entry.timestamp }, { source: "memory_store", agentId });
@@ -1178,14 +1350,21 @@ export function registerMemoryForgetTool(api, context) {
                         }
                     }
                     if (memoryId) {
-                        const deleted = await context.store.delete(memoryId, scopeFilter);
+                        const resolved = await resolveMemoryId(context, memoryId, scopeFilter);
+                        if (resolved.ok === false) {
+                            return {
+                                content: [{ type: "text", text: resolved.message }],
+                                details: resolved.details ?? { error: "not_found", id: memoryId },
+                            };
+                        }
+                        const deleted = await context.store.delete(resolved.id, scopeFilter);
                         if (deleted) {
                             context.onMemoriesDeleted?.({ scopeFilter });
                             return {
                                 content: [
-                                    { type: "text", text: `Memory ${memoryId} forgotten.` },
+                                    { type: "text", text: `Memory ${resolved.id} forgotten.` },
                                 ],
-                                details: { action: "deleted", id: memoryId },
+                                details: { action: "deleted", id: resolved.id },
                             };
                         }
                         else {
@@ -1193,10 +1372,10 @@ export function registerMemoryForgetTool(api, context) {
                                 content: [
                                     {
                                         type: "text",
-                                        text: `Memory ${memoryId} not found or access denied.`,
+                                        text: `Memory ${resolved.id} not found or access denied.`,
                                     },
                                 ],
-                                details: { error: "not_found", id: memoryId },
+                                details: { error: "not_found", id: resolved.id },
                             };
                         }
                     }
@@ -1310,48 +1489,18 @@ export function registerMemoryUpdateTool(api, context) {
                     // Determine accessible scopes
                     const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
                     const scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
-                    // Resolve memoryId: if it doesn't look like a UUID, try search
-                    let resolvedId = memoryId;
-                    const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(memoryId);
-                    if (!uuidLike) {
-                        // Treat as search query
-                        const results = await retrieveWithRetry(context.retriever, {
-                            query: memoryId,
-                            limit: 3,
-                            scopeFilter,
-                        }, () => context.store.count());
-                        if (results.length === 0) {
-                            return {
-                                content: [
-                                    {
-                                        type: "text",
-                                        text: `No memory found matching "${memoryId}".`,
-                                    },
-                                ],
-                                details: { error: "not_found", query: memoryId },
-                            };
-                        }
-                        if (results.length === 1 || results[0].score > 0.85) {
-                            resolvedId = results[0].entry.id;
-                        }
-                        else {
-                            const list = results
-                                .map((r) => `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`)
-                                .join("\n");
-                            return {
-                                content: [
-                                    {
-                                        type: "text",
-                                        text: `Multiple matches. Specify memoryId:\n${list}`,
-                                    },
-                                ],
-                                details: {
-                                    action: "candidates",
-                                    candidates: sanitizeMemoryForSerialization(results),
-                                },
-                            };
-                        }
+                    // Resolve memoryId through the shared resolver: full UUID passes
+                    // through, an 8+ char id prefix resolves against accessible rows
+                    // (the tool's documented contract), anything else falls back to
+                    // semantic search.
+                    const resolution = await resolveMemoryId(context, memoryId, scopeFilter);
+                    if (resolution.ok === false) {
+                        return {
+                            content: [{ type: "text", text: resolution.message }],
+                            details: resolution.details ?? { error: "not_found", id: memoryId },
+                        };
                     }
+                    const resolvedId = resolution.id;
                     // If text changed, re-embed; reject noise
                     let newVector;
                     if (text) {
@@ -1500,6 +1649,7 @@ export function registerMemoryUpdateTool(api, context) {
                             details: { error: "not_found", id: resolvedId },
                         };
                     }
+                    runtimeContext.manualEchoLedger?.record(agentId, updated.text);
                     return {
                         content: [
                             {
@@ -1736,9 +1886,10 @@ export function registerMemoryListTool(api, context) {
                 offset: Type.Optional(Type.Number({
                     description: "Number of memories to skip (default: 0)",
                 })),
+                includeInvalidated: Type.Optional(Type.Boolean({ description: "Include invalidated/superseded rows (default false)." })),
             }),
             async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
-                const { limit = 10, scope, category, offset = 0, } = params;
+                const { limit = 10, scope, category, offset = 0, includeInvalidated = false, } = params;
                 try {
                     const safeLimit = clampInt(limit, 1, 50);
                     const safeOffset = clampInt(offset, 0, 1000);
@@ -1746,7 +1897,7 @@ export function registerMemoryListTool(api, context) {
                     const resolvedScopes = resolveReadableToolScopeFilter(context.scopeManager, agentId, scope);
                     const { scopeFilter } = resolvedScopes;
                     const ignoredScopeNotice = formatIgnoredScopeNotice(resolvedScopes);
-                    const entries = await context.store.list(scopeFilter, category, safeLimit, safeOffset);
+                    const entries = await context.store.list(scopeFilter, category, safeLimit, safeOffset, { excludeInactive: !includeInvalidated });
                     if (entries.length === 0) {
                         return {
                             content: [{ type: "text", text: [ignoredScopeNotice, "No memories found."].filter(Boolean).join("\n") }],
@@ -2154,9 +2305,10 @@ export function registerMemoryCompactTool(api, context) {
                 scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
                 dryRun: Type.Optional(Type.Boolean({ description: "Preview compaction only (default true)." })),
                 limit: Type.Optional(Type.Number({ description: "Max entries to scan (default 200)." })),
+                includeInvalidated: Type.Optional(Type.Boolean({ description: "Include invalidated/superseded rows in the scan (default false)." })),
             }),
             async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
-                const { scope, dryRun = true, limit = 200 } = params;
+                const { scope, dryRun = true, limit = 200, includeInvalidated = false } = params;
                 const safeLimit = clampInt(limit, 20, 1000);
                 const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
                 let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
@@ -2169,7 +2321,7 @@ export function registerMemoryCompactTool(api, context) {
                     }
                     scopeFilter = [scope];
                 }
-                const entries = await runtimeContext.store.list(scopeFilter, undefined, safeLimit, 0);
+                const entries = await runtimeContext.store.list(scopeFilter, undefined, safeLimit, 0, { excludeInactive: !includeInvalidated });
                 const canonicalByKey = new Map();
                 const duplicates = [];
                 for (const entry of entries) {

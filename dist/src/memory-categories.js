@@ -71,23 +71,6 @@ export const DURABLE_CATEGORIES = new Set([
     "cases",
     "patterns",
 ]);
-/**
- * Judge-gated categories: not durable, but ambiguous enough inside a
- * fiction-register batch that the per-item self-tag cannot be trusted.
- * An event may be an assertion ABOUT a fiction session ("we played for three
- * hours") or one from WITHIN it ("boarded the train to the capital"); both
- * arrive tagged grounding="real" when the model mis-registers the second.
- * In a fiction batch these survive only on positive grounding-judge
- * confirmation, so a missing, partial, or failed verdict fails closed.
- * Durable categories are dropped outright and never reach this gate.
- */
-export const FICTION_JUDGED_CATEGORIES = new Set(["events"]);
-/** Register strictness ordering; a rejudge verdict may tighten, never relax, on partial coverage. */
-export const REGISTER_STRICTNESS = {
-    real: 0,
-    mixed: 1,
-    fiction: 2,
-};
 /** Validate and normalize a category string. */
 export function normalizeCategory(raw) {
     const lower = raw.toLowerCase().trim();
@@ -176,4 +159,17 @@ function extractMetadataMemoryCategory(rawMetadata) {
     catch {
         return null;
     }
+}
+/**
+ * Clamp the batchChunkSize knob (JR-less public form: per-call chunk bound
+ * for every batched pipeline stage). Non-numeric or non-positive input falls
+ * back to the historical hardcoded 10; the ceiling guards prompt size.
+ */
+export const DEFAULT_BATCH_CHUNK_SIZE = 10;
+export const MAX_BATCH_CHUNK_SIZE = 50;
+export function clampBatchChunkSize(raw) {
+    const n = typeof raw === "number" ? raw : Number(raw);
+    if (!Number.isFinite(n) || n <= 0)
+        return DEFAULT_BATCH_CHUNK_SIZE;
+    return Math.min(MAX_BATCH_CHUNK_SIZE, Math.max(1, Math.floor(n)));
 }

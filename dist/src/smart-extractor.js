@@ -5,9 +5,10 @@
  * Pipeline: conversation → LLM extract → candidates → dedup → persist
  *
  */
-import { buildExtractionPrompt, buildDedupPrompt, buildGroundingRejudgePrompt, buildMergePrompt, } from "./extraction-prompts.js";
-import { AdmissionController, } from "./admission-control.js";
-import { ALWAYS_MERGE_CATEGORIES, DURABLE_CATEGORIES, FICTION_JUDGED_CATEGORIES, REGISTER_STRICTNESS, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
+import { buildExtractionPrompt, buildDedupPrompt, buildGroundingRejudgePrompt, buildMergePrompt, buildBatchDedupPrompt, buildBatchMergePrompt, } from "./extraction-prompts.js";
+import { formatExistingMemoryEntry } from "./prompt-blocks.js";
+import { formatConversationTranscript, trimTranscriptToTagBoundary, } from "./auto-capture-cleanup.js";
+import { ALWAYS_MERGE_CATEGORIES, DURABLE_CATEGORIES, getStorageCategoryForMemoryCategory, MERGE_SUPPORTED_CATEGORIES, TEMPORAL_VERSIONED_CATEGORIES, normalizeCategory, } from "./memory-categories.js";
 import { isMetaFrustrationNoise, isNoise } from "./noise-filter.js";
 import { appendRelation, buildSmartMetadata, deriveFactKey, parseSmartMetadata, stringifySmartMetadata, parseSupportInfo, updateSupportStats, } from "./smart-metadata.js";
 import { isUserMdExclusiveMemory, } from "./workspace-boundary.js";
@@ -176,47 +177,16 @@ export function resolveExtractionPolicy(scope, policy) {
     }
     return "full";
 }
-/**
- * Reads a rejudge verdict's item index, accepting the strictly-integral
- * numeric string an LLM may emit for a field the prompt shows unquoted.
- * Anything else yields NaN and fails the verdict's validation.
- */
-function normalizeVerdictIndex(value) {
-    if (typeof value === "number")
-        return value;
-    if (typeof value === "string" && /^\d+$/.test(value.trim()))
-        return Number(value.trim());
-    return Number.NaN;
-}
-/**
- * Reads a rejudge verdict's grounding as its enum token, tolerating trailing
- * punctuation and a parenthetical qualifier ("real.", "constructed (in-story)")
- * while refusing anything that does not START with the token, so a negated or
- * unrecognized value ("not real", "maybe") still invalidates the verdict.
- */
-function normalizeVerdictGrounding(value) {
-    if (typeof value !== "string")
-        return null;
-    const match = /^(real|constructed)\b/.exec(value.toLowerCase().trim());
-    return match ? match[1] : null;
-}
-/**
- * Reads a batch register as its enum token on the same terms, so a decorated
- * value ("fiction (roleplay)") keeps its scrutiny level instead of falling
- * through to the laxer default. Returns "" when no token leads the value.
- */
-function normalizeRegisterToken(value) {
-    if (typeof value !== "string")
-        return "";
-    const match = /^(real|fiction|mixed)\b/.exec(value.toLowerCase().trim());
-    return match ? match[1] : "";
-}
 // ============================================================================
 // Constants
 // ============================================================================
 const SIMILARITY_THRESHOLD = 0.7;
 const MAX_SIMILAR_FOR_PROMPT = 3;
 const MAX_MEMORIES_PER_EXTRACTION = 5;
+/** Max candidates decided in one batched dedup LLM call; larger batches are chunked. */
+const DEDUP_BATCH_MAX_SIZE = 10;
+/** Max merge jobs written in one batched merge LLM call; larger batches are chunked. */
+const MERGE_BATCH_MAX_SIZE = 10;
 const VALID_DECISIONS = new Set([
     "create",
     "merge",
@@ -226,6 +196,16 @@ const VALID_DECISIONS = new Set([
     "contradict",
     "supersede",
 ]);
+/**
+ * Formats one existing-memory candidate for the dedup prompt's numbered
+ * list. Continuation lines of a multi-line overview are indented to match
+ * the "Overview: " label so its markdown stays nested under this item
+ * instead of landing flush-left and visually escaping the list.
+ */
+export function formatExistingMemoryForDedupPrompt(index, category, abstract, overview, score) {
+    const indentedOverview = overview.replace(/\n/g, "\n   ");
+    return `${index}. [${category}] ${abstract}\n   Overview: ${indentedOverview}\n   Score: ${score.toFixed(3)}`;
+}
 export class SmartExtractor {
     store;
     embedder;
@@ -249,10 +229,7 @@ export class SmartExtractor {
                 config.admissionControl.auditMetadata !== false;
         this.onAdmissionRejected = config.onAdmissionRejected;
         this.onPersisted = config.onPersisted;
-        this.admissionController =
-            config.admissionControl?.enabled === true
-                ? new AdmissionController(this.store, this.llm, config.admissionControl, this.debugLog)
-                : null;
+        this.admissionController = config.admissionController ?? null;
     }
     /**
      * Expose the admission controller so sibling write paths (reflection
@@ -309,16 +286,36 @@ export class SmartExtractor {
             return stats;
         }
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText, policyMode);
-        const candidates = extraction.candidates;
+        const extraction = await this.extractCandidates(conversationText, options.assistantContextTexts, options.conversationTurns, policyMode, options.contextWindowActive, options.captureAssistantActive);
+        let candidates = extraction.candidates;
+        // Echo guard: candidates near-identical to a recent manual
+        // memory_store/memory_update text are echoes of a row that already
+        // exists verbatim — drop them before any judge/dedup/merge spend.
+        const echoLedger = this.config.manualEchoLedger;
+        if (echoLedger && candidates.length > 0) {
+            const kept = [];
+            for (const candidate of candidates) {
+                if (echoLedger.match(agentId, candidate.content)) {
+                    this.log(`memory-pro: smart-extractor: manual-echo guard dropped candidate (near-identical to a recent manual store) category=${candidate.category} abstract=${JSON.stringify(candidate.abstract.slice(0, 120))}`);
+                }
+                else {
+                    kept.push(candidate);
+                }
+            }
+            candidates = kept;
+        }
         if (candidates.length === 0) {
             this.log("memory-pro: smart-extractor: no memories extracted");
-            if (extraction.status === "ok" && !extraction.groundingOrPolicyDropped) {
+            if (extraction.status === "ok" && extraction.rawCandidateCount === 0) {
                 // LLM genuinely returned zero candidates → strongest noise signal → feedback to noise bank
                 this.learnAsNoise(conversationText);
             }
             else if (extraction.status === "ok") {
-                this.debugLog("memory-pro: smart-extractor: skipping noise-bank learning (batch emptied by grounding/register/policy drops, not a genuine zero-extraction)");
+                // The model DID emit candidates; validation dropped or demoted them
+                // all. That is a policy verdict about those candidates, not evidence
+                // the conversation is noise — learning it as noise would pre-filter
+                // similar real content away from future extractions.
+                this.log(`memory-pro: smart-extractor: skipping noise-bank learning (validation emptied the batch, raw=${extraction.rawCandidateCount})`);
             }
             else {
                 this.debugLog(`memory-pro: smart-extractor: skipping noise-bank learning (status=${extraction.status})`);
@@ -364,23 +361,22 @@ export class SmartExtractor {
             }
             processableCandidates.push({ index: i, candidate: c });
         }
-        // Pre-compute vectors for processable non-profile candidates in a single batch API call
-        // to reduce embedding round-trips from N to 1.
+        // Pre-compute vectors for every processable candidate (profile included:
+        // its always-merge path consumes the vector too) in a single batch API
+        // call to reduce embedding round-trips from N to 1.
         const precomputedVectors = new Map();
-        const nonProfileToEmbed = [];
+        const candidatesToEmbed = [];
         for (const { index, candidate } of processableCandidates) {
-            if (!ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
-                nonProfileToEmbed.push({ index, text: `${candidate.abstract} ${candidate.content}` });
-            }
+            candidatesToEmbed.push({ index, text: `${candidate.abstract} ${candidate.content}` });
         }
-        if (nonProfileToEmbed.length > 0) {
+        if (candidatesToEmbed.length > 0) {
             try {
-                const batchTexts = nonProfileToEmbed.map((e) => e.text);
+                const batchTexts = candidatesToEmbed.map((e) => e.text);
                 const batchVectors = await this.embedder.embedBatch(batchTexts);
-                for (let j = 0; j < nonProfileToEmbed.length; j++) {
+                for (let j = 0; j < candidatesToEmbed.length; j++) {
                     const vec = batchVectors[j];
                     if (vec && vec.length > 0) {
-                        precomputedVectors.set(nonProfileToEmbed[j].index, vec);
+                        precomputedVectors.set(candidatesToEmbed[j].index, vec);
                     }
                 }
             }
@@ -388,16 +384,115 @@ export class SmartExtractor {
                 this.log(`memory-pro: smart-extractor: batch pre-embed failed, will embed individually: ${String(err)}`);
             }
         }
+        // When utilityMode is "batch", score admission utility for every
+        // candidate in this extraction up front, with one LLM call per chunk of
+        // up to 10 candidates, instead of one call per candidate inside the
+        // sequential processCandidate loop below. Profile candidates ride the
+        // same batched call (one-call-per-stage topology): handleProfileMerge
+        // consumes the precomputed verdict instead of issuing its own singular
+        // call, falling back to the in-merge evaluation only when no precomputed
+        // verdict exists (standalone mode, or a failed batch).
+        const precomputedAdmissions = new Map();
+        if (this.admissionController && this.config.admissionControl?.utilityMode === "batch") {
+            const batchable = processableCandidates;
+            if (batchable.length > 0) {
+                const batchItems = batchable.map(({ index, candidate }) => ({
+                    candidate,
+                    candidateVector: precomputedVectors.get(index) ?? [],
+                    conversationText,
+                    scopeFilter: scopeFilter ?? [targetScope],
+                }));
+                try {
+                    const evaluations = await this.admissionController.evaluateBatch(batchItems);
+                    batchable.forEach(({ index }, i) => {
+                        precomputedAdmissions.set(index, evaluations[i]);
+                    });
+                }
+                catch (err) {
+                    this.log(`memory-pro: smart-extractor: batch admission evaluation failed, falling back to per-candidate: ${String(err)}`);
+                }
+            }
+        }
+        // Hoist non-batch admission evaluation ahead of the loop so the admitted
+        // set is known before the batched dedup call below — the per-candidate
+        // call count is unchanged, only the timing moves. Batch mode already
+        // populated precomputedAdmissions above. A failed pre-evaluation leaves
+        // the entry unset so processCandidate's inline evaluation still runs.
+        if (this.admissionController && this.config.admissionControl?.utilityMode !== "batch") {
+            for (const { index, candidate } of processableCandidates) {
+                if (ALWAYS_MERGE_CATEGORIES.has(candidate.category))
+                    continue;
+                const vector = precomputedVectors.get(index);
+                if (!vector || vector.length === 0)
+                    continue;
+                try {
+                    precomputedAdmissions.set(index, await this.admissionController.evaluate({
+                        candidate,
+                        candidateVector: vector,
+                        conversationText,
+                        scopeFilter: scopeFilter ?? [targetScope],
+                    }));
+                }
+                catch (err) {
+                    this.log(`memory-pro: smart-extractor: admission pre-evaluation failed, deferring to inline evaluation: ${String(err)}`);
+                }
+            }
+        }
+        // Batched dedup decider: run the free vector pre-filter per admitted
+        // non-profile candidate, then decide every candidate that needs an LLM
+        // verdict in ONE dedup call (chunked past DEDUP_BATCH_MAX_SIZE). Zero
+        // admitted candidates → zero dedup calls. Candidates without a
+        // precomputed vector or admission verdict keep the inline single-call
+        // path inside processCandidate as their degraded fallback.
+        const precomputedDedups = new Map();
+        {
+            const dedupLlmItems = [];
+            for (const { index, candidate } of processableCandidates) {
+                if (ALWAYS_MERGE_CATEGORIES.has(candidate.category))
+                    continue;
+                const vector = precomputedVectors.get(index);
+                if (!vector || vector.length === 0)
+                    continue;
+                if (this.admissionController) {
+                    const admission = precomputedAdmissions.get(index);
+                    if (!admission || admission.decision === "reject")
+                        continue;
+                }
+                try {
+                    const prefilter = await this.dedupPrefilter(candidate, vector, scopeFilter);
+                    if (prefilter.shortCircuit) {
+                        precomputedDedups.set(index, prefilter.shortCircuit);
+                    }
+                    else {
+                        dedupLlmItems.push({ index, candidate, topSimilar: prefilter.topSimilar });
+                    }
+                }
+                catch (err) {
+                    this.log(`memory-pro: smart-extractor: dedup pre-filter failed, deferring to inline dedup: ${String(err)}`);
+                }
+            }
+            if (dedupLlmItems.length > 0) {
+                const verdicts = await this.llmDedupDecisionBatch(dedupLlmItems);
+                dedupLlmItems.forEach((item, i) => {
+                    precomputedDedups.set(item.index, verdicts[i]);
+                });
+            }
+        }
         const createEntries = [];
         const pendingSupersedeInvalidations = [];
+        const pendingMerges = [];
         for (const { index, candidate } of processableCandidates) {
             try {
-                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries, pendingSupersedeInvalidations, agentId);
+                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVectors.get(index), createEntries, pendingSupersedeInvalidations, agentId, precomputedAdmissions.get(index), precomputedDedups.get(index), pendingMerges);
             }
             catch (err) {
                 this.log(`memory-pro: smart-extractor: failed to process candidate [${candidate.category}]: ${String(err)}`);
             }
         }
+        // Batched merge writer: every merge queued above (dedup verdicts and
+        // profile merges alike) is written with ONE merge-memory call, chunked
+        // past MERGE_BATCH_MAX_SIZE. Zero queued merges → zero writer calls.
+        await this.flushPendingMerges(pendingMerges, stats);
         if (createEntries.length > 0) {
             const createdEntries = await this.bulkStoreAndValidate(createEntries);
             if (createdEntries) {
@@ -416,6 +511,88 @@ export class SmartExtractor {
             }
         }
         return stats;
+    }
+    /**
+     * Uniform-pipeline entry for candidates whose extraction AND admission
+     * already happened in another lane (the reflection writer's mapped rows:
+     * distilled by the reflection model, gated by gateMappedReflectionEntries).
+     * From here on they take exactly the extraction candidates' path --
+     * batched dedup decider, verdict handling, batched merge writer, bulk
+     * create -- so a duplicate mapped row MERGES into its target instead of
+     * landing beside it.
+     *
+     * Each item supplies its own store-entry builder: a CREATE-shaped verdict
+     * persists the caller's entry (reflection metadata intact), while
+     * merge/supersede/support/contextualize/contradict operate on existing
+     * rows through the shared machinery. Callers own persistence
+     * notifications for created rows (the returned entries), keeping their
+     * lane-specific journal labels.
+     */
+    async persistGatedCandidates(items, options) {
+        const stats = { created: 0, merged: 0, skipped: 0, boundarySkipped: 0 };
+        const sessionKey = options.sessionKey ?? "reflection";
+        const targetScope = options.targetScope;
+        const scopeFilter = options.scopeFilter ?? [targetScope];
+        const conversationText = options.conversationText ?? "";
+        const llm = options.llmOverride ?? this.llm;
+        for (const item of items) {
+            this.externalEntryBuilders.set(item.candidate, item.buildEntry);
+        }
+        // Admission already ran in the caller's gate; this synthetic evaluation
+        // only tells processCandidate not to score again. The caller's audit
+        // lives inside its own entry metadata, so nothing here is persisted.
+        const preGated = {
+            decision: "pass_to_dedup",
+            audit: { decision: "pass_to_dedup", reason: "pre-gated by reflection admission" },
+        };
+        const precomputedDedups = new Map();
+        const dedupLlmItems = [];
+        for (let i = 0; i < items.length; i++) {
+            const { candidate, vector } = items[i];
+            try {
+                const prefilter = await this.dedupPrefilter(candidate, vector, scopeFilter);
+                if (prefilter.shortCircuit) {
+                    precomputedDedups.set(i, prefilter.shortCircuit);
+                }
+                else {
+                    dedupLlmItems.push({ index: i, candidate, topSimilar: prefilter.topSimilar });
+                }
+            }
+            catch (err) {
+                this.log(`memory-pro: smart-extractor: gated-candidate dedup pre-filter failed, deferring to inline dedup: ${String(err)}`);
+            }
+        }
+        if (dedupLlmItems.length > 0) {
+            const verdicts = await this.llmDedupDecisionBatch(dedupLlmItems, llm);
+            dedupLlmItems.forEach((item, i) => {
+                precomputedDedups.set(item.index, verdicts[i]);
+            });
+        }
+        const createEntries = [];
+        const pendingSupersedeInvalidations = [];
+        const pendingMerges = [];
+        for (let i = 0; i < items.length; i++) {
+            const { candidate, vector } = items[i];
+            try {
+                await this.processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, vector, createEntries, pendingSupersedeInvalidations, options.agentId, preGated, precomputedDedups.get(i), pendingMerges);
+            }
+            catch (err) {
+                this.log(`memory-pro: smart-extractor: failed to process gated candidate [${candidate.category}]: ${String(err)}`);
+            }
+        }
+        await this.flushPendingMerges(pendingMerges, stats, llm);
+        let createdEntries = [];
+        if (createEntries.length > 0) {
+            const stored = await this.bulkStoreAndValidate(createEntries);
+            if (stored) {
+                createdEntries = stored;
+                await this.applyPendingSupersedeInvalidations(stored, pendingSupersedeInvalidations);
+            }
+            else if (pendingSupersedeInvalidations.length > 0) {
+                this.log("memory-pro: smart-extractor: gated-candidate supersede invalidation skipped because bulkStore() did not return created entries");
+            }
+        }
+        return { stats, createdEntries };
     }
     // --------------------------------------------------------------------------
     // Embedding Noise Pre-Filter
@@ -580,20 +757,39 @@ export class SmartExtractor {
     // Step 1: LLM Extraction
     // --------------------------------------------------------------------------
     /**
-     * Call LLM to extract candidate memories from conversation text.
+     * Call LLM to extract candidate memories from conversation text. Assembles
+     * the single interleaved conversation-turns transcript: `conversationTurns`
+     * (oldest-first, real per-message roles) when the caller has them, else a
+     * fallback of one user turn from `conversationText` followed by
+     * `assistantContextTexts` as trailing assistant turns. Assistant turns are
+     * context only -- the extractor must never source a candidate from one
+     * directly (enforced by prompt instruction, not a deterministic gate).
      */
-    async extractCandidates(conversationText, policyMode = "full") {
+    async extractCandidates(conversationText, assistantContextTexts, conversationTurns, policyMode = "full", contextWindowActive, captureAssistantActive) {
         const maxChars = this.config.extractMaxChars ?? 8000;
-        const truncated = conversationText.length > maxChars
-            ? conversationText.slice(-maxChars)
-            : conversationText;
+        const user = this.config.user ?? "User";
         // Strip platform envelope metadata injected by OpenClaw channels
         // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
         // These pollute extraction if treated as conversation content.
-        const cleaned = stripEnvelopeMetadata(truncated);
-        const user = this.config.user ?? "User";
-        const prompt = buildExtractionPrompt(cleaned, user);
-        const result = await this.llm.completeJson(prompt, "extract-candidates");
+        const turns = conversationTurns
+            ? conversationTurns.map((turn) => ({ ...turn, text: stripEnvelopeMetadata(turn.text) }))
+            : [
+                ...(conversationText
+                    ? [{ role: "user", text: stripEnvelopeMetadata(conversationText) }]
+                    : []),
+                ...(assistantContextTexts ?? []).map((text) => ({ role: "assistant", text })),
+            ];
+        const windowActive = contextWindowActive ?? this.config.contextWindowEnabled === true;
+        const assistantEligibleActive = captureAssistantActive ?? this.config.captureAssistantEligible === true;
+        const rawTranscript = formatConversationTranscript(turns, user, {
+            assistantContextOnly: windowActive && !assistantEligibleActive,
+        });
+        const transcript = trimTranscriptToTagBoundary(rawTranscript, maxChars);
+        const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
+            assistantEligible: assistantEligibleActive,
+            contextWindow: windowActive,
+        });
+        const result = await this.llm.completeJson(userPrompt, "extract-candidates", system);
         if (!result) {
             this.debugLog("memory-lancedb-pro: smart-extractor: extract-candidates returned null");
             return { status: "llm_failure", candidates: [] };
@@ -608,10 +804,9 @@ export class SmartExtractor {
         // items, so the register deterministically overrides per-item grounding
         // wobble below. Missing/unrecognized values fail toward scrutiny
         // ("mixed"), never toward open.
-        // Read with token boundaries: exact equality let a decorated value such as
-        // "fiction (roleplay)" fall through to "mixed", which relaxed the strictest
-        // gate rather than tightening it.
-        const rawRegister = normalizeRegisterToken(result.conversation_register);
+        const rawRegister = typeof result.conversation_register === "string"
+            ? result.conversation_register.toLowerCase().trim()
+            : "";
         let conversationRegister = rawRegister === "real" || rawRegister === "fiction" ? rawRegister : "mixed";
         // Grounding rejudge: a scoped second pass, fired at most once per
         // extraction, only when the register verdict and the per-item tags are
@@ -621,18 +816,7 @@ export class SmartExtractor {
         // the retired batch-wide contradiction wipe; on judge failure the batch
         // fails closed (suspect durables demoted below, never stored-as-real).
         const rawItems = result.memories.filter((m) => !!m && typeof m === "object");
-        // Verdicts are held HERE, never written back into the LLM response. The
-        // response object graph belongs to the client and may outlive the call
-        // (any caching or fixture-returning client shares it across invocations),
-        // so mutating it leaks one extraction's verdict into the next.
-        const rawItemIndex = new Map();
-        rawItems.forEach((m, i) => rawItemIndex.set(m, i));
-        const judgedGrounding = new Array(rawItems.length);
-        // First-pass tags are read on the same terms as the rejudge verdict: exact
-        // equality let "constructed (in-story)" read as real and persist. Values
-        // carrying no recognizable token at all ("unsure", a number) keep the
-        // documented legacy-payload contract and fail open to real.
-        const isRawConstructed = (m) => typeof m.grounding === "string" && normalizeVerdictGrounding(m.grounding) === "constructed";
+        const isRawConstructed = (m) => typeof m.grounding === "string" && m.grounding.toLowerCase().trim() === "constructed";
         const rawConstructedCount = rawItems.filter(isRawConstructed).length;
         const rawRealCount = rawItems.length - rawConstructedCount;
         const hasRealTaggedDurable = rawItems.some((m) => {
@@ -641,44 +825,14 @@ export class SmartExtractor {
             const cat = normalizeCategory(m.category ?? "");
             return !!cat && DURABLE_CATEGORIES.has(cat);
         });
-        // Judge-gated categories are not durable, so a contradiction cell keyed on
-        // durables alone never fired for them: a constructed sibling beside a
-        // real-tagged in-story event persisted the event with no adjudication at
-        // all. They now arm the contradiction cells too, and the persistence gate
-        // below requires a positive verdict for them wherever such a cell fired.
-        const hasRealTaggedJudgeGated = rawItems.some((m) => {
-            if (isRawConstructed(m))
-                return false;
-            const cat = normalizeCategory(m.category ?? "");
-            return !!cat && FICTION_JUDGED_CATEGORIES.has(cat);
-        });
-        // Most cells are defined on the register the model ASSERTED — a missing or
-        // unrecognized register is no assertion, so legacy payloads stay on the
-        // deterministic path. The one exception is the constructed-sibling shape:
-        // there the deterministic path is the batch-wide durable wipe, which
-        // deletes independently-supported real facts alongside the suspect ones —
-        // exactly the over-drop the per-item rejudge exists to replace. Attempting
-        // the judge there strictly dominates: it can only rescue rows, and a
-        // failed or malformed verdict still falls through to the same wipe.
+        // The cells are defined on the register the model ASSERTED — a missing or
+        // unrecognized register is no assertion, so legacy payloads keep the
+        // deterministic legacy path below instead of burning a judge call.
         const registerAsserted = rawRegister === "real" || rawRegister === "fiction" || rawRegister === "mixed";
         let rejudgeCell = null;
-        if (rawItems.length > 0) {
-            if (!registerAsserted) {
-                if (rawConstructedCount > 0 && (hasRealTaggedDurable || hasRealTaggedJudgeGated)) {
-                    rejudgeCell = "unasserted-constructed-sibling-durables";
-                }
-            }
-            else if (conversationRegister === "real" && rawRealCount === 0) {
+        if (registerAsserted && rawItems.length > 0) {
+            if (conversationRegister === "real" && rawRealCount === 0) {
                 rejudgeCell = "real-zero-real";
-            }
-            else if (conversationRegister === "real" &&
-                rawConstructedCount > 0 &&
-                (hasRealTaggedDurable || hasRealTaggedJudgeGated)) {
-                // An asserted-real batch that also carries a constructed tag contradicts
-                // itself: the register claims ordinary conversation while an item is
-                // marked true only inside a fiction. A durable that can persist beside
-                // that sibling gets adjudicated rather than trusted on the assertion.
-                rejudgeCell = "real-constructed-sibling-durables";
             }
             else if (conversationRegister === "mixed" && rawConstructedCount === 0) {
                 rejudgeCell = "mixed-zero-constructed";
@@ -688,91 +842,43 @@ export class SmartExtractor {
             }
             else if (conversationRegister !== "real" &&
                 rawConstructedCount > 0 &&
-                (hasRealTaggedDurable ||
-                    (conversationRegister === "fiction" && hasRealTaggedJudgeGated))) {
-                // NOTE: a real-tagged judge-gated candidate arms this cell only under
-                // fiction, deliberately. An asserted "mixed" register means both kinds
-                // of content are present, so a constructed sibling there is coherent
-                // rather than contradictory, and the suite pins that a coherent mixed
-                // batch must not spend a rejudge call. That leaves a real-tagged
-                // in-story event unadjudicated under "mixed"; widening it is a cost
-                // decision (one extra call per mixed batch carrying an event) raised
-                // with the reviewer rather than taken here.
+                hasRealTaggedDurable) {
                 rejudgeCell = "constructed-sibling-durables";
             }
         }
-        // Item indices the grounding judge positively confirmed as "real". Only a
-        // confirmed item may pass the fiction-register gate for judge-gated
-        // categories below: absence of a verdict is never confirmation.
-        const judgeConfirmedReal = new Set();
         let rejudgeFailedClosed = false;
         if (rejudgeCell) {
             this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge fired cell=${rejudgeCell} register=${conversationRegister} candidates=${rawItems.length}`);
-            const rejudgePrompt = buildGroundingRejudgePrompt(cleaned, conversationRegister, rawItems.map((m, i) => ({
+            const rejudgePrompt = buildGroundingRejudgePrompt(transcript, conversationRegister, rawItems.map((m, i) => ({
                 index: i + 1,
                 category: String(m.category ?? ""),
                 abstract: String(m.abstract ?? "").trim().slice(0, 200),
                 content: String(m.content ?? "").trim().slice(0, 400),
                 grounding: isRawConstructed(m) ? "constructed" : "real",
             })));
-            const verdict = await this.llm.completeJson(rejudgePrompt, "grounding-rejudge");
+            const verdict = await this.llm.completeJson(rejudgePrompt.user, "grounding-rejudge", rejudgePrompt.system);
             const verdictResults = verdict && Array.isArray(verdict.results) ? verdict.results : null;
             if (!verdictResults) {
                 rejudgeFailedClosed = true;
-                // Logged at info: this path discards every durable in the batch, and a
-                // silent judge (a transient gateway failure looks identical to an
-                // unusable answer here) should be visible when it does that.
-                this.log(`memory-lancedb-pro: smart-extractor: grounding-rejudge returned no usable verdict — failing closed, real-tagged durables will be demoted`);
+                this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge failed (null or malformed verdict) — failing closed, real-tagged durables will be demoted`);
             }
             else {
-                // The ENTIRE response is validated before any of it is applied:
-                // exactly one row per candidate, unique integral in-range indices, one
-                // usable grounding each. A response failing any of those is applied in
-                // NO part, so every item stays unadjudicated, the register cannot be
-                // relaxed, and the quarantine below still sees untrusted first-pass
-                // tags. Applying rows as they arrived let a duplicate index overwrite
-                // an earlier verdict while still counting toward coverage.
-                // Rows are NORMALIZED before the gate judges them, so ordinary value
-                // variance (an index the model quoted, a grounding it decorated) does
-                // not turn a semantically complete verdict into a rejected one. With
-                // whole-response rejection, pedantry about representation would
-                // discard every confirmation and rescue in the response.
-                const staged = new Map();
-                let verdictWellFormed = verdictResults.length === rawItems.length;
-                if (verdictWellFormed) {
-                    for (const r of verdictResults) {
-                        const index = normalizeVerdictIndex(r?.index);
-                        const g = normalizeVerdictGrounding(r?.grounding);
-                        if (!Number.isInteger(index) ||
-                            index < 1 ||
-                            index > rawItems.length ||
-                            g === null ||
-                            staged.has(index - 1)) {
-                            verdictWellFormed = false;
-                            break;
-                        }
-                        staged.set(index - 1, g);
-                    }
-                }
                 let retagged = 0;
                 const adjudicated = new Set();
-                if (verdictWellFormed) {
-                    for (const [itemIndex, g] of staged) {
-                        if ((isRawConstructed(rawItems[itemIndex]) ? "constructed" : "real") !== g) {
-                            retagged++;
-                        }
-                        judgedGrounding[itemIndex] = g;
-                        adjudicated.add(itemIndex);
-                        if (g === "real")
-                            judgeConfirmedReal.add(itemIndex);
-                        else
-                            judgeConfirmedReal.delete(itemIndex);
-                    }
+                for (const r of verdictResults) {
+                    if (!r || typeof r.index !== "number")
+                        continue;
+                    const item = rawItems[r.index - 1];
+                    if (!item)
+                        continue;
+                    const g = typeof r.grounding === "string" ? r.grounding.toLowerCase().trim() : "";
+                    if (g !== "real" && g !== "constructed")
+                        continue;
+                    if ((isRawConstructed(item) ? "constructed" : "real") !== g)
+                        retagged++;
+                    item.grounding = g;
+                    adjudicated.add(r.index - 1);
                 }
-                else {
-                    this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge verdict malformed (${verdictResults.length} row(s) for ${rawItems.length} candidate(s), or a duplicate/out-of-range index or invalid grounding) — applying none and failing closed on the asserted register`);
-                }
-                const coverageComplete = verdictWellFormed && adjudicated.size === rawItems.length;
                 const verdictRegister = typeof verdict.conversation_register === "string"
                     ? verdict.conversation_register.toLowerCase().trim()
                     : "";
@@ -780,15 +886,7 @@ export class SmartExtractor {
                 if (verdictRegister === "real" ||
                     verdictRegister === "fiction" ||
                     verdictRegister === "mixed") {
-                    // On incomplete coverage the asserted register stands, except that a
-                    // STRICTER verdict register is always honoured: refusing to relax is
-                    // the fail-closed property, refusing to tighten would be the reverse.
-                    if (coverageComplete || REGISTER_STRICTNESS[verdictRegister] > REGISTER_STRICTNESS[conversationRegister]) {
-                        conversationRegister = verdictRegister;
-                    }
-                    else {
-                        this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge verdict coverage incomplete (${adjudicated.size}/${rawItems.length}) — refusing register relax ${conversationRegister}->${verdictRegister}`);
-                    }
+                    conversationRegister = verdictRegister;
                 }
                 // Coverage check: the judge is instructed to adjudicate every index.
                 // An index it omitted (or answered with an unusable grounding) keeps
@@ -796,12 +894,8 @@ export class SmartExtractor {
                 // count as a clean bill. Per-item fail-closed: in a non-real register,
                 // an unadjudicated real-tagged durable is quarantined to "constructed"
                 // rather than stored on a tag the judge never confirmed.
-                // The asserted-real constructed-sibling cell quarantines as well: its
-                // premise is that a real register is not trustworthy when the model
-                // also tagged part of the same batch constructed.
                 let uncoveredDemoted = 0;
-                if (conversationRegister !== "real" ||
-                    rejudgeCell === "real-constructed-sibling-durables") {
+                if (conversationRegister !== "real") {
                     for (let i = 0; i < rawItems.length; i++) {
                         if (adjudicated.has(i))
                             continue;
@@ -811,7 +905,7 @@ export class SmartExtractor {
                         const cat = normalizeCategory(item.category ?? "");
                         if (!cat || !DURABLE_CATEGORIES.has(cat))
                             continue;
-                        judgedGrounding[i] = "constructed";
+                        item.grounding = "constructed";
                         uncoveredDemoted++;
                     }
                 }
@@ -821,12 +915,6 @@ export class SmartExtractor {
                 this.debugLog(`memory-lancedb-pro: smart-extractor: grounding-rejudge verdict register=${registerBefore}->${conversationRegister} retagged=${retagged}/${rawItems.length}`);
             }
         }
-        // A constructed sibling makes the batch's own self-tagging untrustworthy,
-        // so judge-gated candidates need a positive verdict in these cells too,
-        // not only in a fiction register.
-        const constructedSiblingCellFired = rejudgeCell === "real-constructed-sibling-durables" ||
-            rejudgeCell === "unasserted-constructed-sibling-durables" ||
-            rejudgeCell === "constructed-sibling-durables";
         // Validate and normalize candidates
         const candidates = [];
         let invalidCategoryCount = 0;
@@ -875,38 +963,14 @@ export class SmartExtractor {
             // session (e.g. that it happened); "constructed" is a claim true only
             // WITHIN the fiction. A constructed-tagged candidate is never stored,
             // in any category or register — there is no per-extraction cap anymore.
-            // A grounding-judge verdict, when one exists for this item, is final and
-            // supersedes the self-tag; it is held out-of-band rather than written
-            // back into the response object.
-            const rawItemPosition = rawItemIndex.get(raw);
-            const grounding = (rawItemPosition === undefined ? undefined : judgedGrounding[rawItemPosition]) ??
-                // Same token-boundary read as the cell predicate and the rejudge
-                // verdict: exact equality here let "constructed (in-story)" persist as
-                // a real memory. A value with no recognizable token still fails open.
-                (normalizeVerdictGrounding(raw.grounding) === "constructed" ? "constructed" : "real");
+            const rawGrounding = typeof raw.grounding === "string" ? raw.grounding.toLowerCase().trim() : "";
+            const grounding = rawGrounding === "constructed" ? "constructed" : "real";
             // Register enforcement: an in-fiction batch can never produce durable
             // memories, whatever the per-item self-tags claim (the per-item tags
             // are exactly the wobble the batch register exists to override).
             if (conversationRegister === "fiction" && DURABLE_CATEGORIES.has(category)) {
                 fictionRegisterDroppedCount++;
                 this.debugLog(`memory-lancedb-pro: smart-extractor: dropping durable candidate from fiction-register batch category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
-                continue;
-            }
-            // Judge-gated categories: an event may be an assertion ABOUT a fiction
-            // session ("we played for three hours", legitimately real) or an event
-            // from WITHIN it ("boarded the train", constructed). The per-item
-            // self-tag cannot be trusted to tell those apart wherever the batch is
-            // internally contradictory, so the candidate survives only on a positive
-            // grounding-judge confirmation. No verdict, an omitted index, or a failed
-            // judge all fail closed here. The gate covers a fiction register AND any
-            // constructed-sibling cell: a constructed tag beside a real-tagged
-            // in-story event is the same untrustworthy self-tagging, whatever
-            // register the batch claimed.
-            if ((conversationRegister === "fiction" || constructedSiblingCellFired) &&
-                FICTION_JUDGED_CATEGORIES.has(category) &&
-                !(rawItemPosition !== undefined && judgeConfirmedReal.has(rawItemPosition))) {
-                fictionRegisterDroppedCount++;
-                this.debugLog(`memory-lancedb-pro: smart-extractor: dropping unconfirmed judge-gated candidate (register=${conversationRegister}, cell=${rejudgeCell ?? "none"}) category=${category} grounding=${grounding} abstract=${JSON.stringify(abstract.slice(0, 120))}`);
                 continue;
             }
             // Grounding enforcement: a constructed assertion is true only within
@@ -925,13 +989,7 @@ export class SmartExtractor {
         // quarantine — demote surviving real-tagged durables — remains for two
         // shapes only: the rejudge itself failed, or a legacy payload asserted no
         // register at all while tagging constructed siblings.
-        // Only the shapes the judge was never asked about land here; the
-        // unasserted constructed-sibling shape now goes to the judge first and
-        // falls back through rejudgeFailedClosed when that judge cannot answer.
-        const legacyContradiction = !registerAsserted &&
-            !rejudgeCell &&
-            conversationRegister !== "real" &&
-            rawConstructedCount > 0;
+        const legacyContradiction = !registerAsserted && conversationRegister !== "real" && rawConstructedCount > 0;
         let contradictionDemotedCount = 0;
         if (rejudgeFailedClosed || legacyContradiction) {
             for (let i = candidates.length - 1; i >= 0; i--) {
@@ -943,21 +1001,14 @@ export class SmartExtractor {
                 }
             }
         }
+        if (contradictionDemotedCount > 0) {
+            // At the standard log level so a fully-demoted batch is distinguishable
+            // from "model found nothing" without debug logging (mirrors the
+            // admission-rejection lines).
+            this.log(`memory-lancedb-pro: smart-extractor: batch contradiction demoted ${contradictionDemotedCount} real-tagged durable candidate(s) (register=${conversationRegister}, constructed siblings present)`);
+        }
         this.debugLog(`memory-lancedb-pro: smart-extractor: validation summary register=${conversationRegister}, accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}, policyDropped=${policyDroppedCount}, constructedDropped=${constructedDroppedCount}, fictionRegisterDropped=${fictionRegisterDroppedCount}, contradictionDemoted=${contradictionDemotedCount}`);
-        return {
-            status: "ok",
-            candidates,
-            // A batch emptied by grounding, register, or policy drops is NOT a
-            // "the LLM found nothing here" signal — the LLM found plenty and the
-            // filters excluded it — so the caller must not train the noise bank
-            // on it. Quality drops (short/noise abstracts) keep the existing
-            // noise-learning contract.
-            groundingOrPolicyDropped: policyDroppedCount +
-                fictionRegisterDroppedCount +
-                constructedDroppedCount +
-                contradictionDemotedCount >
-                0,
-        };
+        return { status: "ok", candidates, rawCandidateCount: result.memories.length };
     }
     // --------------------------------------------------------------------------
     // Step 2: Dedup + Persist
@@ -968,20 +1019,32 @@ export class SmartExtractor {
      * @param precomputedVector - Optional pre-embedded vector for the candidate.
      *   When provided (from batch pre-embedding), skips the per-candidate embed
      *   call to reduce API round-trips.
+     * @param precomputedAdmission - Optional pre-scored admission evaluation
+     *   (from batch utility mode). When provided, skips the per-candidate
+     *   admissionController.evaluate() call below.
+     * @param precomputedDedup - Optional pre-decided dedup verdict (from the
+     *   batched dedup decider). When provided, skips the per-candidate
+     *   deduplicate() call below.
+     * @param pendingMerges - Optional deferred-merge queue. When provided,
+     *   merge verdicts are queued for the single batched merge-writer call
+     *   instead of issuing one merge-memory call inline.
      */
-    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries, pendingSupersedeInvalidations, agentId) {
+    async processCandidate(candidate, conversationText, sessionKey, stats, targetScope, scopeFilter, precomputedVector, createEntries, pendingSupersedeInvalidations, agentId, precomputedAdmission, precomputedDedup, pendingMerges) {
         // Profile always merges (skip dedup — admission control still applies)
         if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
-            const profileResult = await this.handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, undefined, createEntries, agentId);
+            const profileResult = await this.handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, undefined, createEntries, agentId, pendingMerges, precomputedVector, precomputedAdmission);
             if (profileResult === "rejected") {
                 stats.rejected = (stats.rejected ?? 0) + 1;
             }
             else if (profileResult === "created") {
                 stats.created++;
             }
-            else {
+            else if (profileResult === "merged") {
                 stats.merged++;
             }
+            // "llm-failed": nothing was persisted (handleMerge already logged
+            // it) — don't count it as either a merge or a create.
+            // "queued": accounted when the batched merge writer flushes.
             return;
         }
         // Use pre-computed vector if available (batch embed optimization),
@@ -993,23 +1056,27 @@ export class SmartExtractor {
             stats.created++;
             return;
         }
-        // Admission control gate (before dedup)
-        const admission = this.admissionController
-            ? await this.admissionController.evaluate({
-                candidate,
-                candidateVector: vector,
-                conversationText,
-                scopeFilter: scopeFilter ?? [targetScope],
-            })
-            : undefined;
+        // Admission control gate (before dedup). Reuse the batch-mode evaluation
+        // computed up front for this candidate when available, instead of
+        // issuing another per-candidate call.
+        const admission = precomputedAdmission ??
+            (this.admissionController
+                ? await this.admissionController.evaluate({
+                    candidate,
+                    candidateVector: vector,
+                    conversationText,
+                    scopeFilter: scopeFilter ?? [targetScope],
+                })
+                : undefined);
         if (admission?.decision === "reject") {
             stats.rejected = (stats.rejected ?? 0) + 1;
             this.log(`memory-pro: smart-extractor: admission rejected [${candidate.category}] ${candidate.abstract.slice(0, 60)} — ${admission.audit.reason}`);
             await this.recordRejectedAdmission(candidate, conversationText, sessionKey, targetScope, scopeFilter ?? [targetScope], admission.audit);
             return;
         }
-        // Dedup pipeline
-        const dedupResult = await this.deduplicate(candidate, vector, scopeFilter);
+        // Dedup pipeline — reuse the batched verdict computed up front when
+        // available, instead of issuing another per-candidate call.
+        const dedupResult = precomputedDedup ?? await this.deduplicate(candidate, vector, scopeFilter);
         switch (dedupResult.decision) {
             case "create":
                 createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
@@ -1018,8 +1085,18 @@ export class SmartExtractor {
             case "merge":
                 if (dedupResult.matchId &&
                     MERGE_SUPPORTED_CATEGORIES.has(candidate.category)) {
-                    await this.handleMerge(candidate, dedupResult.matchId, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
-                    stats.merged++;
+                    const mergeOutcome = pendingMerges
+                        ? await this.queueMergeJob(pendingMerges, candidate, dedupResult.matchId, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId)
+                        : await this.handleMerge(candidate, dedupResult.matchId, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
+                    if (mergeOutcome === "merged") {
+                        stats.merged++;
+                    }
+                    else if (mergeOutcome === "created") {
+                        stats.created++;
+                    }
+                    // "llm-failed": nothing was persisted (handleMerge already logged
+                    // it) — don't count it as either a merge or a create.
+                    // "queued": accounted when the batched merge writer flushes.
                 }
                 else {
                     // Category doesn't support merge → create instead
@@ -1090,12 +1167,30 @@ export class SmartExtractor {
      * Two-stage dedup: vector similarity search → LLM decision.
      */
     async deduplicate(candidate, candidateVector, scopeFilter) {
+        const prefilter = await this.dedupPrefilter(candidate, candidateVector, scopeFilter);
+        if (prefilter.shortCircuit) {
+            return prefilter.shortCircuit;
+        }
+        // Stage 2: LLM decision
+        return this.llmDedupDecision(candidate, prefilter.topSimilar);
+    }
+    /**
+     * The free (non-LLM) stages of dedup: vector similarity search plus the
+     * preference-slot guard. Returns either a short-circuit verdict (no LLM
+     * needed) or the similar rows the LLM decision should consider. Shared by
+     * the inline single-call path and the batched decider so the two can
+     * never diverge.
+     */
+    async dedupPrefilter(candidate, candidateVector, scopeFilter) {
         // Stage 1: Vector pre-filter — find similar active memories.
         // excludeInactive ensures the store over-fetches to fill N active slots,
         // preventing superseded history from crowding out the current fact.
         const activeSimilar = await this.store.vectorSearch(candidateVector, 5, SIMILARITY_THRESHOLD, scopeFilter, { excludeInactive: true });
         if (activeSimilar.length === 0) {
-            return { decision: "create", reason: "No similar memories found" };
+            return {
+                shortCircuit: { decision: "create", reason: "No similar memories found" },
+                topSimilar: [],
+            };
         }
         // Stage 1.5: Preference slot guard — same brand but different item
         // should always be stored as a new memory, not merged/skipped.
@@ -1113,16 +1208,18 @@ export class SmartExtractor {
                     return existingSlot.brand === candidateSlot.brand && existingSlot.item !== candidateSlot.item;
                 });
                 if (allDifferentItem) {
-                    return { decision: "create", reason: "Same brand but different item-level preference (preference-slot guard)" };
+                    return {
+                        shortCircuit: { decision: "create", reason: "Same brand but different item-level preference (preference-slot guard)" },
+                        topSimilar: [],
+                    };
                 }
             }
         }
-        // Stage 2: LLM decision
-        return this.llmDedupDecision(candidate, activeSimilar);
+        return { topSimilar: activeSimilar };
     }
-    async llmDedupDecision(candidate, similar) {
-        const topSimilar = similar.slice(0, MAX_SIMILAR_FOR_PROMPT);
-        const existingFormatted = topSimilar
+    /** Renders one candidate's similar rows the way both dedup prompts embed them. */
+    formatExistingMemoriesForDedup(topSimilar) {
+        return topSimilar
             .map((r, i) => {
             // Extract L0 abstract from metadata if available, fallback to text
             let metaObj = {};
@@ -1131,52 +1228,106 @@ export class SmartExtractor {
             }
             catch { }
             const abstract = metaObj.l0_abstract || r.entry.text;
-            const overview = metaObj.l1_overview || "";
-            return `${i + 1}. [${metaObj.memory_category || r.entry.category}] ${abstract}\n   Overview: ${overview}\n   Score: ${r.score.toFixed(3)}`;
+            return formatExistingMemoryEntry(i + 1, metaObj.memory_category || r.entry.category, abstract, r.score);
         })
             .join("\n");
-        const prompt = buildDedupPrompt(candidate.abstract, candidate.overview, candidate.content, existingFormatted);
+    }
+    /**
+     * Batched dedup decider: one dedup-decision LLM call per chunk of up to
+     * DEDUP_BATCH_MAX_SIZE candidates, each candidate carrying its own
+     * retrieved-neighbor context. Never throws and never fans back out into
+     * per-candidate calls: a response entry that is missing or malformed
+     * degrades ONLY that candidate to the same CREATE default the single-call
+     * path uses for an unparseable response, and a chunk whose call itself
+     * fails degrades every candidate in that chunk to the same CREATE default
+     * the single-call path uses for a thrown call.
+     */
+    async llmDedupDecisionBatch(items, llm = this.llm) {
+        const out = new Array(items.length);
+        for (let chunkStart = 0; chunkStart < items.length; chunkStart += this.batchChunkSize()) {
+            const chunk = items.slice(chunkStart, chunkStart + this.batchChunkSize());
+            const sliced = chunk.map((item) => item.topSimilar.slice(0, MAX_SIMILAR_FOR_PROMPT));
+            const { system, user } = buildBatchDedupPrompt(chunk.map((item, i) => ({
+                candidate: item.candidate,
+                existingMemories: this.formatExistingMemoriesForDedup(sliced[i]),
+            })));
+            try {
+                const response = await llm.completeJson(user, "dedup-decision-batch", system);
+                const byIndex = new Map();
+                for (const entry of response && Array.isArray(response.results) ? response.results : []) {
+                    if (!entry || typeof entry.index !== "number")
+                        continue;
+                    byIndex.set(entry.index, entry);
+                }
+                chunk.forEach((_, i) => {
+                    out[chunkStart + i] = this.interpretDedupVerdict(byIndex.get(i + 1) ?? null, sliced[i]);
+                });
+            }
+            catch (err) {
+                this.log(`memory-pro: smart-extractor: dedup LLM failed: ${String(err)}`);
+                chunk.forEach((_, i) => {
+                    out[chunkStart + i] = { decision: "create", reason: `LLM failed: ${String(err)}` };
+                });
+            }
+        }
+        return out;
+    }
+    async llmDedupDecision(candidate, similar) {
+        const topSimilar = similar.slice(0, MAX_SIMILAR_FOR_PROMPT);
+        const existingFormatted = this.formatExistingMemoriesForDedup(topSimilar);
+        const { system, user: userPrompt } = buildDedupPrompt(candidate, existingFormatted);
         try {
-            const data = await this.llm.completeJson(prompt, "dedup-decision");
-            if (!data) {
-                this.log("memory-pro: smart-extractor: dedup LLM returned unparseable response, defaulting to CREATE");
-                return { decision: "create", reason: "LLM response unparseable" };
-            }
-            const decision = (data.decision?.toLowerCase() ??
-                "create");
-            if (!VALID_DECISIONS.has(decision)) {
-                return {
-                    decision: "create",
-                    reason: `Unknown decision: ${data.decision}`,
-                };
-            }
-            // Resolve merge target from LLM's match_index (1-based)
-            const idx = data.match_index;
-            const hasValidIndex = typeof idx === "number" && idx >= 1 && idx <= topSimilar.length;
-            const matchEntry = hasValidIndex
-                ? topSimilar[idx - 1]
-                : topSimilar[0];
-            // For destructive decisions (supersede), missing match_index is
-            // unsafe — we could invalidate the wrong memory. Degrade to create.
-            const destructiveDecisions = new Set(["supersede", "contradict"]);
-            if (destructiveDecisions.has(decision) && !hasValidIndex) {
-                this.log(`memory-pro: smart-extractor: ${decision} decision has missing/invalid match_index (${idx}), degrading to create`);
-                return {
-                    decision: "create",
-                    reason: `${decision} degraded: missing match_index`,
-                };
-            }
-            return {
-                decision,
-                reason: data.reason ?? "",
-                matchId: ["merge", "support", "contextualize", "contradict", "supersede"].includes(decision) ? matchEntry?.entry.id : undefined,
-                contextLabel: typeof data.context_label === "string" ? data.context_label : undefined,
-            };
+            const data = await this.llm.completeJson(userPrompt, "dedup-decision", system);
+            return this.interpretDedupVerdict(data ?? null, topSimilar);
         }
         catch (err) {
             this.log(`memory-pro: smart-extractor: dedup LLM failed: ${String(err)}`);
             return { decision: "create", reason: `LLM failed: ${String(err)}` };
         }
+    }
+    /**
+     * Maps one raw dedup verdict (from either the single-call or the batched
+     * prompt) to a DedupResult, applying the exact validation the single-call
+     * path always applied: unparseable → CREATE, unknown decision → CREATE,
+     * destructive decisions without a valid match_index degrade to CREATE.
+     * Shared so the batched decider's per-item semantics can never drift from
+     * the single-call path's.
+     */
+    interpretDedupVerdict(data, topSimilar) {
+        if (!data) {
+            this.log("memory-pro: smart-extractor: dedup LLM returned unparseable response, defaulting to CREATE");
+            return { decision: "create", reason: "LLM response unparseable" };
+        }
+        const decision = (data.decision?.toLowerCase() ??
+            "create");
+        if (!VALID_DECISIONS.has(decision)) {
+            return {
+                decision: "create",
+                reason: `Unknown decision: ${data.decision}`,
+            };
+        }
+        // Resolve merge target from LLM's match_index (1-based)
+        const idx = data.match_index;
+        const hasValidIndex = typeof idx === "number" && idx >= 1 && idx <= topSimilar.length;
+        const matchEntry = hasValidIndex
+            ? topSimilar[idx - 1]
+            : topSimilar[0];
+        // For destructive decisions (supersede), missing match_index is
+        // unsafe — we could invalidate the wrong memory. Degrade to create.
+        const destructiveDecisions = new Set(["supersede", "contradict"]);
+        if (destructiveDecisions.has(decision) && !hasValidIndex) {
+            this.log(`memory-pro: smart-extractor: ${decision} decision has missing/invalid match_index (${idx}), degrading to create`);
+            return {
+                decision: "create",
+                reason: `${decision} degraded: missing match_index`,
+            };
+        }
+        return {
+            decision,
+            reason: data.reason ?? "",
+            matchId: ["merge", "support", "contextualize", "contradict", "supersede"].includes(decision) ? matchEntry?.entry.id : undefined,
+            contextLabel: typeof data.context_label === "string" ? data.context_label : undefined,
+        };
     }
     // --------------------------------------------------------------------------
     // Merge Logic
@@ -1184,12 +1335,26 @@ export class SmartExtractor {
     /**
      * Profile always-merge: read existing profile, merge with LLM, upsert.
      */
-    async handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, admissionAudit, createEntries, agentId) {
+    async handleProfileMerge(candidate, conversationText, sessionKey, targetScope, scopeFilter, admissionAudit, createEntries, agentId, pendingMerges, precomputedVector, precomputedAdmission) {
         // Find existing profile memory by category
         const embeddingText = `${candidate.abstract} ${candidate.content}`;
-        const vector = await this.embedder.embed(embeddingText);
-        // Run admission control for profile candidates (they skip the main dedup path)
-        if (!admissionAudit && this.admissionController && vector && vector.length > 0) {
+        const vector = precomputedVector && precomputedVector.length > 0
+            ? precomputedVector
+            : await this.embedder.embed(embeddingText);
+        // Run admission control for profile candidates (they skip the main dedup
+        // path). A precomputed verdict from the batched hoist wins: profile rides
+        // the same one-call-per-stage batch as every other candidate, and this
+        // in-merge evaluation is the fallback for standalone mode or a failed
+        // batch call.
+        if (!admissionAudit && precomputedAdmission) {
+            if (precomputedAdmission.decision === "reject") {
+                this.log(`memory-pro: smart-extractor: admission rejected profile [${candidate.abstract.slice(0, 60)}] — ${precomputedAdmission.audit.reason}`);
+                await this.recordRejectedAdmission(candidate, conversationText, sessionKey, targetScope, scopeFilter ?? [targetScope], precomputedAdmission.audit);
+                return "rejected";
+            }
+            admissionAudit = precomputedAdmission.audit;
+        }
+        else if (!admissionAudit && this.admissionController && vector && vector.length > 0) {
             const profileAdmission = await this.admissionController.evaluate({
                 candidate,
                 candidateVector: vector,
@@ -1215,8 +1380,11 @@ export class SmartExtractor {
             }
         });
         if (profileMatch) {
-            await this.handleMerge(candidate, profileMatch.entry.id, targetScope, scopeFilter, undefined, admissionAudit, createEntries, agentId);
-            return "merged";
+            if (pendingMerges) {
+                return this.queueMergeJob(pendingMerges, candidate, profileMatch.entry.id, targetScope, scopeFilter, undefined, admissionAudit, createEntries, agentId);
+            }
+            const mergeOutcome = await this.handleMerge(candidate, profileMatch.entry.id, targetScope, scopeFilter, undefined, admissionAudit, createEntries, agentId);
+            return mergeOutcome;
         }
         else {
             // No existing profile — create new
@@ -1227,33 +1395,174 @@ export class SmartExtractor {
     /**
      * Merge a candidate into an existing memory using LLM.
      */
+    /**
+     * Attempts to merge `candidate` into the existing memory at `matchId`.
+     * Returns which outcome actually happened so the caller can account for
+     * it truthfully:
+     * - "merged": store.update() persisted the merged content.
+     * - "created": the existing row couldn't be read, so the candidate was
+     *   queued as a new entry instead — a create, not a merge.
+     * - "llm-failed": the merge-memory completion came back null/unparseable;
+     *   nothing was persisted and the existing row is untouched.
+     */
     async handleMerge(candidate, matchId, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries, agentId) {
-        let existingAbstract = "";
-        let existingOverview = "";
-        let existingContent = "";
+        const target = await this.readMergeTarget(candidate, matchId, targetScope, scopeFilter, createEntries);
+        if (!target) {
+            return "created";
+        }
+        // Call LLM to merge
+        const { system, user: userPrompt } = buildMergePrompt({ abstract: target.abstract, overview: target.overview, content: target.content }, candidate);
+        const merged = await this.llm.completeJson(userPrompt, "merge-memory", system);
+        if (!merged) {
+            this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
+            return "llm-failed";
+        }
+        await this.applyMergedContent(matchId, candidate.category, merged, targetScope, scopeFilter, [contextLabel], admissionAudit, agentId);
+        return "merged";
+    }
+    /**
+     * Reads the three-level content of a merge target. On a failed read the
+     * candidate is queued as a NEW entry instead (a create, not a merge —
+     * exactly the fallback the inline merge path always used) and null is
+     * returned so the caller can account for it as "created".
+     */
+    async readMergeTarget(candidate, matchId, targetScope, scopeFilter, createEntries) {
         try {
             const existing = await this.store.getById(matchId, scopeFilter);
+            let abstract = "";
+            let overview = "";
+            let content = "";
             if (existing) {
                 const meta = parseSmartMetadata(existing.metadata, existing);
-                existingAbstract = meta.l0_abstract || existing.text;
-                existingOverview = meta.l1_overview || "";
-                existingContent = meta.l2_content || existing.text;
+                abstract = meta.l0_abstract || existing.text;
+                overview = meta.l1_overview || "";
+                content = meta.l2_content || existing.text;
             }
+            return { abstract, overview, content };
         }
         catch {
             // Fallback: store as new
             this.log(`memory-pro: smart-extractor: could not read existing memory ${matchId}, storing as new`);
             const vector = await this.embedder.embed(`${candidate.abstract} ${candidate.content}`);
             createEntries?.push(this.buildStoreEntry(candidate, vector || [], "merge-fallback", targetScope));
+            return null;
+        }
+    }
+    /**
+     * Queues one candidate's merge for the batched merge writer. Candidates
+     * merging into a target that already has a queued job are grouped into
+     * that job (one write per target, so a later batched write can never
+     * clobber an earlier one with stale content). Returns "created" when the
+     * target could not be read and the candidate fell back to a new entry.
+     */
+    async queueMergeJob(pendingMerges, candidate, matchId, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries, agentId) {
+        const addition = { candidate, contextLabel, admissionAudit };
+        const existingJob = pendingMerges.find((job) => job.matchId === matchId);
+        if (existingJob) {
+            existingJob.additions.push(addition);
+            return "queued";
+        }
+        const target = await this.readMergeTarget(candidate, matchId, targetScope, scopeFilter, createEntries);
+        if (!target) {
+            return "created";
+        }
+        pendingMerges.push({
+            matchId,
+            category: candidate.category,
+            existing: target,
+            additions: [addition],
+            targetScope,
+            scopeFilter,
+            agentId,
+        });
+        return "queued";
+    }
+    /**
+     * Batched merge writer: generates merged content for every queued job
+     * with one merge-memory LLM call per chunk of up to MERGE_BATCH_MAX_SIZE
+     * jobs, then applies each job's content. A response entry that is missing
+     * or malformed degrades ONLY that job, exactly like the single-call
+     * merge-memory failure path: nothing is persisted for it, the target row
+     * stays untouched, and it never counts as merged. A chunk whose call
+     * itself fails degrades every job in that chunk the same way. Never
+     * throws, never fans back out into per-job LLM calls.
+     */
+    async flushPendingMerges(pendingMerges, stats, llm = this.llm) {
+        if (pendingMerges.length === 0) {
             return;
         }
-        // Call LLM to merge
-        const prompt = buildMergePrompt(existingAbstract, existingOverview, existingContent, candidate.abstract, candidate.overview, candidate.content, candidate.category);
-        const merged = await this.llm.completeJson(prompt, "merge-memory");
-        if (!merged) {
-            this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
-            return;
+        const contents = await this.llmMergeContentBatch(pendingMerges, llm);
+        for (let i = 0; i < pendingMerges.length; i++) {
+            const job = pendingMerges[i];
+            const merged = contents[i];
+            if (!merged) {
+                this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
+                continue;
+            }
+            try {
+                await this.applyMergedContent(job.matchId, job.category, merged, job.targetScope, job.scopeFilter, job.additions.map((a) => a.contextLabel), job.additions[0]?.admissionAudit, job.agentId);
+                stats.merged += job.additions.length;
+            }
+            catch (err) {
+                this.log(`memory-pro: smart-extractor: failed to apply merged content for ${job.matchId.slice(0, 8)}: ${String(err)}`);
+            }
         }
+    }
+    /**
+     * One merge-memory LLM call per chunk of jobs. Returns one merged-content
+     * record (or null) per job, in input order; validation requires all three
+     * levels as strings with a non-empty abstract, so a malformed entry can
+     * never write garbage over an existing row.
+     */
+    async llmMergeContentBatch(jobs, llm = this.llm) {
+        const out = new Array(jobs.length).fill(null);
+        for (let chunkStart = 0; chunkStart < jobs.length; chunkStart += this.batchChunkSize()) {
+            const chunk = jobs.slice(chunkStart, chunkStart + this.batchChunkSize());
+            const { system, user } = buildBatchMergePrompt(chunk.map((job) => ({
+                category: job.category,
+                existing: job.existing,
+                additions: job.additions.map((a) => ({
+                    abstract: a.candidate.abstract,
+                    overview: a.candidate.overview,
+                    content: a.candidate.content,
+                })),
+            })));
+            try {
+                const response = await llm.completeJson(user, "merge-memory-batch", system);
+                const byIndex = new Map();
+                for (const entry of response && Array.isArray(response.results) ? response.results : []) {
+                    if (!entry || typeof entry.index !== "number")
+                        continue;
+                    byIndex.set(entry.index, entry);
+                }
+                chunk.forEach((_, i) => {
+                    const entry = byIndex.get(i + 1);
+                    if (entry &&
+                        typeof entry.abstract === "string" &&
+                        entry.abstract.trim().length > 0 &&
+                        typeof entry.overview === "string" &&
+                        typeof entry.content === "string") {
+                        out[chunkStart + i] = {
+                            abstract: entry.abstract,
+                            overview: entry.overview,
+                            content: entry.content,
+                        };
+                    }
+                });
+            }
+            catch (err) {
+                this.log(`memory-pro: smart-extractor: merge LLM failed: ${String(err)}`);
+            }
+        }
+        return out;
+    }
+    /**
+     * Applies already-generated merged content to the target row: re-embed,
+     * store.update, persistence notification, then the best-effort support
+     * stats update once per merged-in candidate. Shared by the inline
+     * single-call merge path and the batched merge writer.
+     */
+    async applyMergedContent(matchId, category, merged, targetScope, scopeFilter, contextLabels, admissionAudit, agentId) {
         // Re-embed the merged content
         const mergedText = `${merged.abstract} ${merged.content}`;
         const newVector = await this.embedder.embed(mergedText);
@@ -1263,7 +1572,7 @@ export class SmartExtractor {
             l0_abstract: merged.abstract,
             l1_overview: merged.overview,
             l2_content: merged.content,
-            memory_category: candidate.category,
+            memory_category: category,
             tier: "working",
             confidence: 0.8,
         }), admissionAudit));
@@ -1274,25 +1583,27 @@ export class SmartExtractor {
         }, scopeFilter);
         await this.notifyPersisted({
             text: merged.abstract,
-            category: this.mapToStoreCategory(candidate.category),
+            category: this.mapToStoreCategory(category),
             scope: targetScope,
             timestamp: Date.now(),
         }, "smart-extraction", agentId);
-        // Update support stats on the merged memory
-        try {
-            const updatedEntry = await this.store.getById(matchId, scopeFilter);
-            if (updatedEntry) {
-                const meta = parseSmartMetadata(updatedEntry.metadata, updatedEntry);
-                const supportInfo = parseSupportInfo(meta.support_info);
-                const updated = updateSupportStats(supportInfo, contextLabel, "support");
-                const finalMetadata = stringifySmartMetadata({ ...meta, support_info: updated });
-                await this.store.update(matchId, { metadata: finalMetadata }, scopeFilter);
+        for (const contextLabel of contextLabels) {
+            // Update support stats on the merged memory
+            try {
+                const updatedEntry = await this.store.getById(matchId, scopeFilter);
+                if (updatedEntry) {
+                    const meta = parseSmartMetadata(updatedEntry.metadata, updatedEntry);
+                    const supportInfo = parseSupportInfo(meta.support_info);
+                    const updated = updateSupportStats(supportInfo, contextLabel, "support");
+                    const finalMetadata = stringifySmartMetadata({ ...meta, support_info: updated });
+                    await this.store.update(matchId, { metadata: finalMetadata }, scopeFilter);
+                }
             }
+            catch {
+                // Non-critical: merge succeeded, support stats update is best-effort
+            }
+            this.log(`memory-pro: smart-extractor: merged [${category}]${contextLabel ? ` [${contextLabel}]` : ""} into ${matchId.slice(0, 8)}`);
         }
-        catch {
-            // Non-critical: merge succeeded, support stats update is best-effort
-        }
-        this.log(`memory-pro: smart-extractor: merged [${candidate.category}]${contextLabel ? ` [${contextLabel}]` : ""} into ${matchId.slice(0, 8)}`);
     }
     /**
      * Handle SUPERSEDE: preserve the old record as historical but mark it as no
@@ -1503,7 +1814,27 @@ export class SmartExtractor {
      * Build a memory entry from candidate data (without writing).
      * Used by batch creation to reduce lock acquisitions.
      */
+    /**
+     * Entry-shape overrides for candidates persisted on behalf of another
+     * lane (persistGatedCandidates): the reflection writer supplies its own
+     * store entry (reflection metadata, decay model, importance) while the
+     * dedup/merge pipeline stays byte-identical to extraction's. Keyed by
+     * candidate object identity, so extraction's own candidates can never
+     * collide with an external lane's builders.
+     */
+    externalEntryBuilders = new WeakMap();
+    /** Per-call chunk bound for the batched dedup decider and merge writer. */
+    batchChunkSize() {
+        const raw = this.config.batchChunkSize;
+        return typeof raw === "number" && Number.isFinite(raw) && raw >= 1
+            ? Math.min(50, Math.floor(raw))
+            : DEDUP_BATCH_MAX_SIZE;
+    }
     buildStoreEntry(candidate, vector, sessionKey, targetScope, admissionAudit) {
+        const external = this.externalEntryBuilders.get(candidate);
+        if (external) {
+            return external(vector);
+        }
         const storeCategory = this.mapToStoreCategory(candidate.category);
         const classifyText = candidate.content || candidate.abstract;
         const metadata = stringifySmartMetadata(buildSmartMetadata({

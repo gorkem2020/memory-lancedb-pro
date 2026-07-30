@@ -1,0 +1,210 @@
+/**
+ * Distiller prompt slot-placement tests (fleet-only branch).
+ *
+ * The reflection distiller's prompt is split across the two model slots:
+ * system = identity + every static block (task, headings contract, hard
+ * rules, section/governance rules, notes, output template), delivered to the
+ * embedded runner via systemPromptOverride (fleet core); user = ONLY the
+ * dynamically generated content (tool error signals + the tagged INPUT
+ * transcript, unfenced -- a fence would break on any code block inside the
+ * conversation).
+ *
+ * The CLI fallback runner cannot set a system prompt (openclaw agent
+ * --message carries a single user message), so it keeps the combined
+ * single-slot form, fail-safe.
+ *
+ * Fixtures are entirely synthetic; no real fleet data.
+ *
+ * Run: node --test test/reflection-prompt-split.test.mjs
+ */
+
+import { describe, it, after } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, chmodSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import jitiFactory from "jiti";
+
+const testDir = path.dirname(fileURLToPath(import.meta.url));
+const pluginSdkStubPath = path.resolve(testDir, "helpers", "openclaw-plugin-sdk-stub.mjs");
+const jiti = jitiFactory(import.meta.url, {
+  interopDefault: true,
+  alias: {
+    "openclaw/plugin-sdk": pluginSdkStubPath,
+  },
+});
+
+const {
+  generateReflectionText,
+  buildReflectionPromptParts,
+} = jiti("../index.ts");
+
+// Every static block of the distiller prompt, by its opening sentinel. These
+// must ALL live in the system slot and NONE may leak into the user slot.
+const STATIC_SENTINELS = [
+  "You are a memory reflection distiller agent.",
+  "Use these headings exactly once, in this exact order, with exact spelling:",
+  "Hard rules:",
+  "Section rules:",
+  "Governance section rules:",
+  "Notes:",
+  "OUTPUT TEMPLATE (copy this structure exactly):",
+  "- This run showed ...",
+];
+
+const CONVERSATION =
+  "<user_message>\nhello there\n</user_message>\n<assistant_message>\nhi, noted\n</assistant_message>";
+
+// loadEmbeddedPiRunner caches the first Layer-1 runner it resolves
+// module-wide, so every test in this file shares ONE fake api and swaps
+// behavior via this dispatcher (same pattern as raw-run-distiller-hooks).
+let currentRunnerImpl = async () => ({ payloads: [{ text: "noop" }] });
+const fakeApi = {
+  runtime: {
+    agent: {
+      runEmbeddedPiAgent: (params) => currentRunnerImpl(params),
+    },
+  },
+};
+
+const baseParams = {
+  conversation: CONVERSATION,
+  maxInputChars: 1000,
+  cfg: {},
+  agentId: "agent-one",
+  workspaceDir: "/tmp",
+  timeoutMs: 2000,
+  thinkLevel: "off",
+  api: fakeApi,
+};
+
+describe("buildReflectionPromptParts slot placement", () => {
+  it("puts the identity opener and every static block in system, none of them in user", () => {
+    const parts = buildReflectionPromptParts(CONVERSATION, 1000, []);
+    assert.ok(
+      parts.system.startsWith("You are a memory reflection distiller agent."),
+      "system must open with the distiller identity line",
+    );
+    for (const sentinel of STATIC_SENTINELS) {
+      assert.ok(parts.system.includes(sentinel), `system must contain static block sentinel: ${sentinel}`);
+      assert.ok(!parts.user.includes(sentinel), `user must NOT contain static block sentinel: ${sentinel}`);
+    }
+  });
+
+  it("user carries ONLY the dynamic content: tool error signals then the tagged INPUT transcript", () => {
+    const parts = buildReflectionPromptParts(CONVERSATION, 1000, []);
+    assert.ok(parts.user.startsWith("Recent tool error signals:"), "user must open with the tool-error block");
+    assert.ok(parts.user.includes("- (none)"), "empty signals render the placeholder");
+    assert.ok(parts.user.includes(`INPUT:\n${CONVERSATION}`), "user must carry the tagged transcript unfenced");
+    assert.ok(!parts.user.includes("```"), "no code fence may wrap the transcript");
+    assert.ok(!parts.user.includes("## Context (session background)"), "the headings contract must not leak into user");
+    assert.ok(!parts.system.includes(CONVERSATION), "the transcript must not leak into system");
+  });
+
+  it("renders tool error signals dynamically in user, leaving system untouched", () => {
+    const signals = [{ toolName: "exec", summary: "exit 1 on build", signatureHash: "abcdef1234567890" }];
+    const withSignals = buildReflectionPromptParts(CONVERSATION, 1000, signals);
+    const without = buildReflectionPromptParts(CONVERSATION, 1000, []);
+    assert.ok(withSignals.user.includes("1. [exec] exit 1 on build (sig:abcdef12)"));
+    assert.equal(withSignals.system, without.system, "signals are dynamic content; system must be static");
+  });
+
+  it("keeps the prompt text verbatim: system + blank line + user reproduces the single-slot form", () => {
+    const parts = buildReflectionPromptParts(CONVERSATION, 1000, []);
+    const combined = `${parts.system}\n\n${parts.user}`;
+    assert.ok(
+      combined.includes("- This run showed ...\n\nRecent tool error signals:"),
+      "the static tail must flow into the dynamic block exactly as the legacy single-slot prompt did",
+    );
+    assert.ok(combined.endsWith("</assistant_message>"), "the combined form ends with the transcript's closing tag");
+  });
+
+  it("documents the tag grammar in system", () => {
+    const parts = buildReflectionPromptParts(CONVERSATION, 1000, []);
+    assert.ok(parts.system.includes("The INPUT transcript is a sequence of tagged blocks in chronological order:"));
+    assert.ok(parts.system.includes("- <user_message>...</user_message> wraps ONE message written by the human user."));
+    assert.ok(parts.system.includes("- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant."));
+  });
+
+  it("clips the conversation to maxInputChars from the tail, in user only", () => {
+    const long = "x".repeat(50) + "TAIL-MARKER";
+    const parts = buildReflectionPromptParts(long, 20, []);
+    assert.ok(parts.user.includes("TAIL-MARKER"));
+    assert.ok(!parts.user.includes("x".repeat(30)), "only the last maxInputChars survive");
+  });
+
+  it("snaps an over-limit clip to the next whole tagged block, never a headless half message", () => {
+    const transcript =
+      `<user_message>\n${"a".repeat(120)}\n</user_message>\n<assistant_message>\nkeep this tail reply\n</assistant_message>`;
+    const parts = buildReflectionPromptParts(transcript, 70, []);
+    assert.ok(parts.user.includes("INPUT:\n<assistant_message>"), "the clipped transcript must open at a block boundary");
+    assert.ok(!parts.user.includes("aaaa"), "the sliced-away user block must not bleed in headless");
+  });
+});
+
+describe("embedded distiller run uses split slots", () => {
+  it("passes user-only prompt and the static block via systemPromptOverride", async () => {
+    let seenParams = null;
+    currentRunnerImpl = async (params) => {
+      seenParams = params;
+      return { payloads: [{ text: "reflection text" }] };
+    };
+
+    const result = await generateReflectionText(baseParams);
+    assert.equal(result.runner, "embedded");
+    assert.ok(seenParams, "the embedded runner must have been invoked");
+
+    const parts = buildReflectionPromptParts(CONVERSATION, baseParams.maxInputChars, []);
+    assert.equal(seenParams.prompt, parts.user, "the runner prompt slot must carry ONLY the dynamic content");
+    assert.equal(
+      seenParams.systemPromptOverride,
+      parts.system,
+      "the static distiller block must ride the system slot via systemPromptOverride",
+    );
+    assert.equal(seenParams.modelRun, true, "raw-run semantics must survive the slot split");
+    assert.equal(seenParams.promptMode, "minimal");
+  });
+});
+
+describe("CLI fallback keeps the single-slot combined form (cannot set a system prompt)", () => {
+  const stubDir = mkdtempSync(path.join(tmpdir(), "reflection-cli-stub-"));
+  const dumpPath = path.join(stubDir, "argv.dump");
+  const stubPath = path.join(stubDir, "fake-openclaw.sh");
+  writeFileSync(
+    stubPath,
+    `#!/bin/sh\nprintf '%s\\0' "$@" > "${dumpPath}"\necho '{"payloads":[{"text":"cli reflection text"}]}'\n`,
+    "utf-8",
+  );
+  chmodSync(stubPath, 0o755);
+
+  after(() => rmSync(stubDir, { recursive: true, force: true }));
+
+  it("sends system + user as one --message payload", async () => {
+    currentRunnerImpl = async () => {
+      throw new Error("forced embedded failure");
+    };
+    const originalCliBin = process.env.OPENCLAW_CLI_BIN;
+    process.env.OPENCLAW_CLI_BIN = stubPath;
+    try {
+      const result = await generateReflectionText(baseParams);
+      assert.equal(result.runner, "cli");
+      assert.equal(result.text, "cli reflection text");
+    } finally {
+      if (originalCliBin === undefined) delete process.env.OPENCLAW_CLI_BIN;
+      else process.env.OPENCLAW_CLI_BIN = originalCliBin;
+    }
+
+    assert.ok(existsSync(dumpPath), "the CLI stub must have captured argv");
+    const argv = readFileSync(dumpPath, "utf-8").split("\0");
+    const messageIdx = argv.indexOf("--message");
+    assert.ok(messageIdx > 0, "--message flag expected in CLI argv");
+    const message = argv[messageIdx + 1];
+    const parts = buildReflectionPromptParts(CONVERSATION, baseParams.maxInputChars, []);
+    assert.equal(
+      message,
+      `${parts.system}\n\n${parts.user}`,
+      "the CLI fallback has no system slot, so it must carry the combined single-slot prompt",
+    );
+  });
+});

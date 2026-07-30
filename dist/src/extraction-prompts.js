@@ -1,21 +1,71 @@
 /**
  * Prompt templates for intelligent memory extraction.
- * - buildExtractionPrompt: 6-category L0/L1/L2 extraction with conversational grounding
- * - buildGroundingRejudgePrompt: scoped second pass reconciling register vs per-item tags
+ * Three mandatory prompts:
+ * - buildExtractionPrompt: 6-category L0/L1/L2 extraction with few-shot
  * - buildDedupPrompt: CREATE/MERGE/SKIP dedup decision
  * - buildMergePrompt: Memory merge with three-level structure
+ * Batched variants (one LLM call per pipeline stage):
+ * - buildBatchDedupPrompt: one dedup decision per numbered candidate
+ * - buildBatchMergePrompt: one merged record per numbered merge job
+ * Consolidate prompts (post-hoc reconciliation of already-stored memories):
+ * - buildConsolidatePrompt / buildConsolidateBatchPrompt: merge/supersede/
+ *   contradict/skip decider, single-cluster and multi-cluster variants
+ * - buildConsolidateBatchMergePrompt: one merged record per numbered
+ *   consolidate merge job
+ *
+ * Each builder returns a {system, user} pair: instructions, criteria,
+ * identity, and the output-format contract live in `system`; the per-call
+ * conversation excerpt / candidate rows / neighbor rows live in `user`.
+ * Static content shared across builders (category taxonomy, identity
+ * openers, the candidate/job markdown formatter) is single-sourced in
+ * ./prompt-blocks.ts and composed below -- copied prompt text between
+ * builders is a defect.
  */
-export function buildExtractionPrompt(conversationText, user) {
-    return `Analyze the following session context and extract memories worth long-term preservation.
-
-User: ${user}
-
-Target Output Language: auto (detect from recent messages)
-
-Read the conversation below in chronological order, top to bottom, and understand it as a whole before extracting anything. Interpret every message through your understanding of the full conversation, not in isolation.
-
-## Recent Conversation
-${conversationText}
+import { CATEGORY_TAXONOMY, CONSOLIDATE_DECIDER_IDENTITY, CONSOLIDATE_MERGE_WRITER_IDENTITY, DEDUP_JUDGE_IDENTITY, EXTRACTION_AGENT_IDENTITY, MERGE_WRITER_IDENTITY, formatCandidateBlock, formatExistingMemoriesSection, formatMemoryFieldLines, jsonShape, } from "./prompt-blocks.js";
+export function buildExtractionPrompt(conversationText, user, options = {}) {
+    // Transcript modes, driven by captureAssistant x autoCaptureContextTurns:
+    // - assistantEligible (captureAssistant=true): assistant blocks appear AND are
+    //   valid grounding sources, with attribution rules.
+    // - contextWindow (autoCaptureContextTurns > 0): already-processed turns ride
+    //   along under context_only_user_turn / context_only_assistant_turn tags —
+    //   context only, never sources. With captureAssistant=false every assistant
+    //   turn is context (self messages are never sources).
+    // - neither: assistant lines are excluded from the transcript entirely, so
+    //   the prompt does not describe assistant blocks at all.
+    const assistantEligible = options.assistantEligible === true;
+    const contextWindow = options.contextWindow === true;
+    const assistantContext = !assistantEligible && contextWindow;
+    const contextUserBullet = contextWindow
+        ? `
+- <context_only_user_turn>...</context_only_user_turn> wraps a user message that was ALREADY processed by a previous extraction run. Context only — do not extract it again; a fact that appears only in a context block must not be stored. You may use it, if needed, to understand the conversation's flow and what the user means.`
+        : "";
+    const userGroundingSuffix = assistantEligible ? "" : " Memories may be extracted only from here.";
+    const assistantFormatBullet = assistantEligible
+        ? `
+- <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.`
+        : assistantContext
+            ? `
+- <context_only_assistant_turn>...</context_only_assistant_turn> wraps ONE message written by the AI assistant. Context only — you may use it, if needed, to resolve what the user meant (pronouns, follow-ups, corrections); it is never a source of memories.`
+            : "";
+    const contextAssistantEligibleBullet = contextWindow && assistantEligible
+        ? `
+- <context_only_assistant_turn>...</context_only_assistant_turn> wraps an assistant message that was ALREADY processed by a previous extraction run. Context only.`
+        : "";
+    const assistantBlocksRule = assistantEligible
+        ? `
+- <assistant_message> blocks: also valid sources — but only for concrete facts the user did not correct. Skip the assistant's greetings, guesses, and self-description.
+- Attribute every memory to whoever actually said it. When both said it, use the <user_message> version.${contextWindow ? `
+- <context_only_user_turn> and <context_only_assistant_turn> blocks: already processed in previous runs — NEVER extract memories from them again.` : ""}`
+        : "";
+    // Operator adoption 2026-07-24: the Transcript format section lives in the USER
+    // prompt, directly above the conversation it describes — a deliberate exception
+    // to the system-static/user-dynamic split. Comprehension adjacency measurably
+    // improved register accuracy on the A/B bench, and a constant user prefix is
+    // caching-neutral.
+    const transcriptFormatSection = `## Transcript format
+The conversation is written as tagged blocks. Inside the Recent Conversation section, the blocks appear in chronological order. The block types are:${contextUserBullet}
+- <user_message>...</user_message> wraps ONE${contextWindow ? " NEW" : ""} message written by the human user.${userGroundingSuffix}${assistantFormatBullet}${contextAssistantEligibleBullet}`;
+    const system = `${EXTRACTION_AGENT_IDENTITY} Analyze session context and extract memories worth long-term preservation.
 
 # Memory Extraction Criteria
 
@@ -35,7 +85,7 @@ ${conversationText}
 - Degraded or incomplete references: If the user mentions something vaguely ("that thing I said"), do NOT invent details or create a hollow memory
 - Raw conversation carryover: quoted or attributed transcript blocks, especially 3+ lines of speaker text, are not memories by themselves. Distill a concrete profile detail, preference, entity state, event, case, or pattern from them, or skip.
 - System/runtime artifacts: content containing "System:", compaction notices, model-switch/session-reset traces, tool-call transcripts, raw JSON blobs, or similar internal execution traces must be rejected unless a clean user fact can be extracted.
-- Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.
+- Fragment blobs: mixed filename shards, code snippets, metadata fields, or partial sentences that look like unprocessed context fragments should be skipped rather than preserved.${assistantBlocksRule}
 - Atomic memory shape: each stored memory must read like one durable fact, preference, decision, entity state, event, case, or reusable pattern. If a candidate reads like an excerpt, log, or raw transcript, compress it into one atomic statement, or skip it.
 - Length/distillation gate: if a candidate is longer than about 200 characters and reads like raw conversation instead of a distilled insight, rewrite it as a single factual statement before storing; if that is not possible, skip it.
 
@@ -152,17 +202,33 @@ Notes:
 - Maximum 5 memories per extraction
 - Preferences should be aggregated by topic
 - Always set the top-level "conversation_register" field, and tag every memory's "grounding" field, per the Conversational Grounding rules above`;
+    // "User: User" with the default generic identity confused live agents;
+    // the name line only appears when a real name is configured.
+    const userNameLine = user && user !== "User" ? `User: ${user}\n\n` : "";
+    const readingOrder = `Read the conversation in chronological order, top to bottom, and understand it as a whole before extracting anything. ${assistantEligible
+        ? "Extraction draws from the <user_message> and <assistant_message> blocks — but interpret each one through your understanding of the full conversation, not in isolation."
+        : "Extraction still draws only from the <user_message> blocks — but interpret each one through your understanding of the full conversation, not in isolation."} As you read, notice which stretches describe the real world and which step into a supposed, imagined, or made-up frame.`;
+    const userMessage = `${userNameLine}Target Output Language: auto (detect from recent messages)
+
+${assistantEligible
+        ? "Extract memory candidates from <user_message> and <assistant_message> blocks, attributed to their true speaker."
+        : "Extract memory candidates ONLY from <user_message> blocks."}
+
+${transcriptFormatSection}
+
+${readingOrder}
+
+## Recent Conversation
+${conversationText}`;
+    return { system, user: userMessage };
 }
-export function buildDedupPrompt(candidateAbstract, candidateOverview, candidateContent, existingMemories) {
-    return `Determine how to handle this candidate memory.
+export function buildDedupPrompt(candidate, existingMemories) {
+    const existingSection = formatExistingMemoriesSection(String(existingMemories ?? "")
+        .split("\n")
+        .filter((line) => line.length > 0));
+    const system = `${DEDUP_JUDGE_IDENTITY}
 
-**Candidate Memory**:
-Abstract: ${candidateAbstract}
-Overview: ${candidateOverview}
-Content: ${candidateContent}
-
-**Existing Similar Memories**:
-${existingMemories}
+${CATEGORY_TAXONOMY}
 
 Please decide:
 - SKIP: Candidate memory duplicates existing memories, no need to save. Also SKIP if the candidate contains LESS information than an existing memory on the same topic (information degradation — e.g., candidate says "programming language preference" but existing memory already says "programming language preference: Python, TypeScript")
@@ -175,61 +241,319 @@ Please decide:
 
 IMPORTANT:
 - "events" and "cases" categories are independent records — they do NOT support MERGE/SUPERSEDE/SUPPORT/CONTEXTUALIZE/CONTRADICT. For these categories, only use SKIP or CREATE.
+- Category labels NEVER decide the verdict by themselves. Outside the events/cases rule above, a candidate and an existing memory in DIFFERENT categories (profile, preferences, entities, patterns) can still describe the same fact — judge the CONTENT. If an existing memory in another category already covers the candidate with equal or more detail, SKIP; if the candidate replaces that fact's current truth, SUPERSEDE it.
 - If the candidate appears to be derived from a recall question (e.g., "Do you remember X?" / "你记得X吗？") and an existing memory already covers topic X with equal or more detail, you MUST choose SKIP.
 - A candidate with less information than an existing memory on the same topic should NEVER be CREATED or MERGED — always SKIP.
 - For "preferences" and "entities", use SUPERSEDE when the candidate replaces the current truth instead of adding detail or context. Example: existing "Preferred editor: VS Code", candidate "Preferred editor: Zed".
 - For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
 
-Return JSON format:
-{
+Return JSON only (the raw object, no markdown code fences):
+${jsonShape(`{
   "decision": "skip|create|merge|supersede|support|contextualize|contradict",
   "match_index": 1,
   "reason": "Decision reason",
   "context_label": "evening"
-}
+}`)}
 
 - If decision is "merge"/"supersede"/"support"/"contextualize"/"contradict", set "match_index" to the number of the existing memory (1-based).
 - Only include "context_label" for support/contextualize/contradict decisions.`;
+    const userMessage = `## Candidate
+
+${formatCandidateBlock(1, candidate)}
+
+${existingSection}`;
+    return { system, user: userMessage };
 }
-export function buildMergePrompt(existingAbstract, existingOverview, existingContent, newAbstract, newOverview, newContent, category) {
-    return `Merge the following memory into a single coherent record with all three levels.
+export function buildMergePrompt(existing, addition) {
+    const system = `${MERGE_WRITER_IDENTITY}
 
-** Category **: ${category}
+${CATEGORY_TAXONOMY}
 
-** Existing Memory:**
-    Abstract: ${existingAbstract}
-  Overview:
-${existingOverview}
-  Content:
-${existingContent}
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers / URIs / model names unchanged when they are proper nouns
 
-** New Information:**
-    Abstract: ${newAbstract}
-  Overview:
-${newOverview}
-  Content:
-${newContent}
+Return JSON only (the raw object, no markdown code fences):
+${jsonShape(`{
+  "abstract": "Merged one-line abstract",
+  "overview": "Merged structured Markdown overview",
+  "content": "Merged full content"
+}`)}`;
+    const userMessage = `## Merge job
 
-  Requirements:
-  - Remove duplicate information
-    - Keep the most up - to - date details
-      - Maintain a coherent narrative
-        - Keep code identifiers / URIs / model names unchanged when they are proper nouns
+### Existing memory
+${formatMemoryFieldLines(existing).join("\n")}
 
-Return JSON:
-  {
-    "abstract": "Merged one-line abstract",
-      "overview": "Merged structured Markdown overview",
-        "content": "Merged full content"
-  } `;
+### New information
+${formatMemoryFieldLines(addition).join("\n")}`;
+    return { system, user: userMessage };
+}
+/**
+ * Batched variant of buildDedupPrompt: one LLM call decides every numbered
+ * candidate independently. Verdict vocabulary, rules, and match_index
+ * semantics are identical to the single-candidate prompt — only the call
+ * topology changes.
+ */
+export function buildBatchDedupPrompt(items) {
+    const system = `${DEDUP_JUDGE_IDENTITY} Decide every candidate independently, using only that candidate's own "Existing similar memories" list — never another candidate's.
+
+${CATEGORY_TAXONOMY}
+
+For each candidate, decide:
+- SKIP: Candidate memory duplicates existing memories, no need to save. Also SKIP if the candidate contains LESS information than an existing memory on the same topic (information degradation — e.g., candidate says "programming language preference" but existing memory already says "programming language preference: Python, TypeScript")
+- CREATE: This is completely new information not covered by any existing memory, should be created
+- MERGE: Candidate memory adds genuinely NEW details to an existing memory and should be merged
+- SUPERSEDE: Candidate states that the same mutable fact has changed over time. Keep the old memory as historical but no longer current, and create a new current memory.
+- SUPPORT: Candidate reinforces/confirms an existing memory in a specific context (e.g. "still prefers tea in the evening")
+- CONTEXTUALIZE: Candidate adds a situational nuance to an existing memory (e.g. existing: "likes coffee", candidate: "prefers tea at night" — different context, same topic)
+- CONTRADICT: Candidate directly contradicts an existing memory in a specific context (e.g. existing: "runs on weekends", candidate: "stopped running on weekends")
+
+IMPORTANT:
+- "events" and "cases" categories are independent records — they do NOT support MERGE/SUPERSEDE/SUPPORT/CONTEXTUALIZE/CONTRADICT. For these categories, only use SKIP or CREATE.
+- Category labels NEVER decide the verdict by themselves. Outside the events/cases rule above, a candidate and an existing memory in DIFFERENT categories (profile, preferences, entities, patterns) can still describe the same fact — judge the CONTENT. If an existing memory in another category already covers the candidate with equal or more detail, SKIP; if the candidate replaces that fact's current truth, SUPERSEDE it.
+- If the candidate appears to be derived from a recall question (e.g., "Do you remember X?" / "你记得X吗？") and an existing memory already covers topic X with equal or more detail, you MUST choose SKIP.
+- A candidate with less information than an existing memory on the same topic should NEVER be CREATED or MERGED — always SKIP.
+- For "preferences" and "entities", use SUPERSEDE when the candidate replaces the current truth instead of adding detail or context. Example: existing "Preferred editor: VS Code", candidate "Preferred editor: Zed".
+- For SUPPORT/CONTEXTUALIZE/CONTRADICT, you MUST provide a context_label from this vocabulary: general, morning, evening, night, weekday, weekend, work, leisure, summer, winter, travel.
+- "match_index" always refers to the numbering of that candidate's OWN "Existing similar memories" list (1-based), never to another candidate's list and never to the candidate numbering itself.
+
+Return JSON only (the raw object, no markdown code fences), with exactly one entry per candidate, in this shape:
+${jsonShape(`{
+  "results": [
+    { "index": 1, "decision": "skip|create|merge|supersede|support|contextualize|contradict", "match_index": 1, "reason": "Decision reason", "context_label": "evening" }
+  ]
+}`)}
+
+- "index" is the candidate's number in the batch below.
+- If decision is "merge"/"supersede"/"support"/"contextualize"/"contradict", set "match_index" to the number of the matching existing memory (1-based) in that candidate's own list.
+- Only include "context_label" for support/contextualize/contradict decisions.`;
+    const blocks = items.map((item, i) => {
+        const candidateBlock = formatCandidateBlock(i + 1, item.candidate);
+        const existingSection = formatExistingMemoriesSection(String(item.existingMemories ?? "")
+            .split("\n")
+            .filter((line) => line.length > 0));
+        return existingSection ? `${candidateBlock}\n\n${existingSection}` : candidateBlock;
+    });
+    const user = `## Candidates
+
+${blocks.join("\n\n")}`;
+    return { system, user };
+}
+/**
+ * Batched variant of buildMergePrompt: one LLM call writes every numbered
+ * merge job. Each job carries its target ("Existing memory") and every
+ * candidate merging into it ("New information"); merge requirements are
+ * identical to the single-job prompt — only the call topology changes.
+ */
+export function buildBatchMergePrompt(jobs) {
+    const system = `${MERGE_WRITER_IDENTITY} For each job, merge every "New information" section into that job's "Existing memory"; never mix content across jobs.
+
+${CATEGORY_TAXONOMY}
+
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers / URIs / model names unchanged when they are proper nouns
+
+Return JSON only (the raw object, no markdown code fences), with exactly one entry per job, in this shape:
+${jsonShape(`{
+  "results": [
+    { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
+  ]
+}`)}
+
+- "index" is the job's number in the batch below.`;
+    const blocks = jobs.map((job, i) => {
+        const lines = [`### ${i + 1}. ${job.category}`, "", "#### Existing memory", ...formatMemoryFieldLines(job.existing)];
+        job.additions.forEach((addition, j) => {
+            const heading = job.additions.length > 1 ? `#### New information ${j + 1}` : "#### New information";
+            lines.push("", heading, ...formatMemoryFieldLines(addition));
+        });
+        return lines.join("\n");
+    });
+    const user = `## Merge jobs
+
+${blocks.join("\n\n")}`;
+    return { system, user };
+}
+export const CONSOLIDATE_MERGE_SYSTEM_PROMPT = `${CONSOLIDATE_MERGE_WRITER_IDENTITY} Merge two versions of the same memory into a single coherent record with all three levels (abstract, overview, content).
+
+${CATEGORY_TAXONOMY}
+
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
+
+Return JSON only (the raw object, no markdown code fences):
+${jsonShape(`{
+  "abstract": "Merged one-line abstract",
+  "overview": "Merged structured Markdown overview",
+  "content": "Merged full content"
+}`)}`;
+// mapped/manual/legacy rows without a real overview/content commonly fall
+// back to the raw abstract text in all three tiers (see
+// src/smart-metadata.ts's parseSmartMetadata: l2_content falls back to raw
+// text, l1_overview falls back to `- ${abstract}`). Printing that fact three
+// times per member wastes cluster-listing space for no signal.
+function hasThinTiers(m) {
+    const overviewIsDefault = m.overview === "" || m.overview === `- ${m.abstract}` || m.overview === m.abstract;
+    const contentIsDefault = m.content === m.abstract;
+    return overviewIsDefault && contentIsDefault;
+}
+/** Renders one member's provenance/timestamp fields, when present, as plain lines under its heading. */
+function formatMemberProvenanceLines(m) {
+    const lines = [];
+    if (m.source)
+        lines.push(`source: ${m.source}`);
+    if (m.timestamp !== undefined) {
+        lines.push(`timestamp: ${new Date(m.timestamp).toISOString()}`);
+        if (m.validFrom !== undefined && m.validFrom !== m.timestamp) {
+            lines.push(`valid_from: ${new Date(m.validFrom).toISOString()}`);
+        }
+    }
+    return lines;
+}
+/** Formats one cluster member as a markdown subsection: `### N. category` heading, provenance lines, then either a single `Fact:` line (thin tiers) or full Abstract/Overview/Content. */
+function formatMemberBlock(m) {
+    const lines = [`### ${m.index}. ${m.category}`, ...formatMemberProvenanceLines(m)];
+    if (hasThinTiers(m)) {
+        lines.push(`Fact: ${m.abstract}`);
+    }
+    else {
+        lines.push(...formatMemoryFieldLines(m));
+    }
+    return lines.join("\n");
+}
+const CONSOLIDATE_VERDICT_RULES = `Return exactly one verdict, scoped to whichever rows it actually applies to:
+- skip: none of the rows in this cluster need any action. Use this only when nothing here is a duplicate, reversal, or contradiction.
+- merge: two or more rows are duplicates or near-duplicates of the same fact. Pick the row with the best-quality, most complete text as the survivor and list only the true duplicates as absorbed.
+- supersede: one row is a newer fact or an explicit reversal that replaces one or more older rows describing the same fact (for example, a decision to stop doing something an older row describes). The survivor is the newer/reversal row; list only the rows it actually replaces as absorbed. Supersede is NOT destructive: absorbed rows are never deleted. They are kept as an auditable historical record and simply marked as no longer current, exactly like SUPERSEDE in ordinary dedup decisions ("the same mutable fact has changed over time; keep the old memory as historical but no longer current"). Use supersede whenever a row states that a fact from an older row has changed, even if that only applies to part of the cluster.
+- contradict: two or more rows conflict and it is not clear which one is correct. Flag this for human review. No destructive action.`;
+const CONSOLIDATE_APPEND_ONLY_RULE = `"events" and "cases" categories are append-only: they can never be superseded or contradicted (append-only means invalidation-protection, not merge-immunity). A merge must never mix an append-only row with a non-append-only row, or with a different append-only category. The one exception: near-identical duplicate rows within the SAME append-only category (for example two "events" rows describing the exact same occurrence, or two "cases" rows describing the exact same problem/solution) may still be merged like any other true duplicate. Outside that same-category duplicate case, leave append-only rows out of absorbed_indices, with one directional exception: an append-only row MAY serve as the supersede survivor_index when every absorbed row is non-append-only — the append-only row itself is never written, only the stale mutable rows get marked no longer current.
+
+Rows in DIFFERENT non-append-only categories (profile, preferences, entities, patterns) are fully actionable against each other — differing categories alone are never a reason to skip. Merge them when they state the same fact, choosing the more authoritative category's row as survivor (for identity facts like the user's name, profile over preferences); supersede when they conflict about the same fact, choosing the factually current row as survivor. Factual currency always decides supersede direction: never make a stale row the survivor for category reasons, and when the stale side is append-only (so it cannot be absorbed), use skip rather than a wrong-direction supersede`;
+const CONSOLIDATE_SOURCE_LEGEND = `Source legend: legacy = pre-smart-format rows, manual = operator memory_store saves, auto-capture = extraction lane, reflection* = mirror lanes; manual rows are operator-authored and strong survivor candidates.
+
+Each member below also shows its timestamp (and valid_from when it differs) — use these to judge supersede recency explicitly rather than inferring it from wording alone.`;
+export function buildConsolidatePrompt(members) {
+    const system = `${CONSOLIDATE_DECIDER_IDENTITY} You are given a cluster of existing memories that were flagged as likely related, either by embedding similarity or by sharing a topic key. Decide how to reconcile the ACTIONABLE rows in this cluster. You do NOT have to act on every row: survivor_index and absorbed_indices only need to cover the rows you are deciding about. Any row you leave out of both is simply left untouched — this is expected and correct whenever a cluster mixes actionable duplicates or reversals with unrelated or append-only rows.
+
+${CATEGORY_TAXONOMY}
+
+${CONSOLIDATE_VERDICT_RULES}
+
+${CONSOLIDATE_APPEND_ONLY_RULE} — that never blocks you from merging or superseding the OTHER, actionable rows in the same cluster.
+
+${CONSOLIDATE_SOURCE_LEGEND}
+
+Return JSON only (the raw object, no markdown code fences):
+${jsonShape(`{
+  "verdict": "skip|merge|supersede|contradict",
+  "survivor_index": 1,
+  "absorbed_indices": [2, 3],
+  "reason": "short explanation"
+}`)}
+
+Only include survivor_index and absorbed_indices for merge or supersede. survivor_index and every entry in absorbed_indices must be one of the row numbers shown below. absorbed_indices must never contain an append-only (events/cases) row — unless the verdict is merge and every row in survivor_index/absorbed_indices shares the exact same append-only category. An append-only row may appear as survivor_index only for that same-category duplicate merge, or for a supersede whose absorbed rows are all non-append-only.`;
+    const user = `## Cluster
+
+${members.map((m) => formatMemberBlock(m)).join("\n\n")}`;
+    return { system, user };
+}
+// Same decider semantics as buildConsolidatePrompt, but scoped to decide
+// N independent clusters in a single call: one LLM round-trip per
+// consolidate run instead of one per cluster. Each cluster is decided
+// independently -- a verdict for one cluster must never be influenced by
+// another cluster's rows -- and the response is a JSON array with one
+// verdict object per cluster, tagged by cluster_index so a malformed entry
+// for one cluster can be dropped without discarding the others' verdicts.
+export function buildConsolidateBatchPrompt(clusters) {
+    const system = `${CONSOLIDATE_DECIDER_IDENTITY} You are given multiple independent clusters of existing memories, each flagged as likely related within itself, either by embedding similarity or by sharing a topic key. Decide how to reconcile the ACTIONABLE rows in EACH cluster independently -- a decision about one cluster must never be influenced by another cluster's rows. You do NOT have to act on every row in a cluster: survivor_index and absorbed_indices only need to cover the rows you are deciding about within that cluster. Any row you leave out of both is simply left untouched -- this is expected and correct whenever a cluster mixes actionable duplicates or reversals with unrelated or append-only rows.
+
+${CATEGORY_TAXONOMY}
+
+Return exactly one verdict per cluster, scoped to whichever rows it actually applies to:
+- skip: none of the rows in this cluster need any action. Use this only when nothing here is a duplicate, reversal, or contradiction.
+- merge: two or more rows are duplicates or near-duplicates of the same fact. Pick the row with the best-quality, most complete text as the survivor and list only the true duplicates as absorbed.
+- supersede: one row is a newer fact or an explicit reversal that replaces one or more older rows describing the same fact (for example, a decision to stop doing something an older row describes). The survivor is the newer/reversal row; list only the rows it actually replaces as absorbed. Supersede is NOT destructive: absorbed rows are never deleted. They are kept as an auditable historical record and simply marked as no longer current, exactly like SUPERSEDE in ordinary dedup decisions ("the same mutable fact has changed over time; keep the old memory as historical but no longer current"). Use supersede whenever a row states that a fact from an older row has changed, even if that only applies to part of the cluster.
+- contradict: two or more rows conflict and it is not clear which one is correct. Flag this for human review. No destructive action.
+
+Decision criteria: apply these checks in order for the rows in each cluster.
+1. Do two or more rows say the same thing, with no row stating a newer fact, a change, or a reversal? -> merge.
+2. Does one row explicitly state a fact has changed, ended, or reversed relative to another row (wording like "no longer", "stopped", "switched to", or simply a materially later timestamp describing a different state of the same fact)? -> supersede.
+3. Do two or more rows assert mutually exclusive facts with no textual or temporal signal indicating which one is current? -> contradict.
+4. None of the above apply to any rows in this cluster? -> skip.
+When it is genuinely ambiguous whether a pair of rows should be merged or superseded, prefer supersede: it is the safer, fully-reversible choice, since a superseded row is retained as historical record rather than combined away into a single new record.
+
+${CONSOLIDATE_APPEND_ONLY_RULE} -- that never blocks you from merging or superseding the OTHER, actionable rows in the same cluster.
+
+${CONSOLIDATE_SOURCE_LEGEND}
+
+Return JSON only (the raw object, no markdown code fences):
+${jsonShape(`{
+  "verdicts": [
+    { "cluster_index": 1, "verdict": "skip|merge|supersede|contradict", "survivor_index": 1, "absorbed_indices": [2, 3], "reason": "short explanation" }
+  ]
+}`)}
+
+Include exactly one verdict object per cluster listed below, each tagged with the matching cluster_index. Only include survivor_index and absorbed_indices for merge or supersede. survivor_index and every entry in absorbed_indices are row numbers scoped to that cluster's own member list. absorbed_indices must never contain an append-only (events/cases) row -- unless the verdict is merge and every row in survivor_index/absorbed_indices shares the exact same append-only category. An append-only row may appear as survivor_index only for that same-category duplicate merge, or for a supersede whose absorbed rows are all non-append-only.`;
+    const user = clusters
+        .map((c) => `## Cluster ${c.clusterIndex}\n\n${c.members.map((m) => formatMemberBlock(m)).join("\n\n")}`)
+        .join("\n\n===\n\n");
+    return { system, user };
+}
+/**
+ * Batched variant of the consolidate merge writer prompt: one LLM call
+ * writes every numbered merge job. Each job carries its survivor ("Existing
+ * memory") and every absorbed member folding into it ("New information");
+ * merge requirements match CONSOLIDATE_MERGE_SYSTEM_PROMPT verbatim — only
+ * the call topology changes from one call per absorbed member to one call
+ * per batch of merge verdicts.
+ */
+export function buildConsolidateBatchMergePrompt(jobs) {
+    const system = `${CONSOLIDATE_MERGE_WRITER_IDENTITY} For each job, merge every "New information" section into that job's "Existing memory"; never mix content across jobs.
+
+${CATEGORY_TAXONOMY}
+
+Requirements:
+- Remove duplicate information
+- Keep the most up-to-date details
+- Maintain a coherent narrative
+- Keep code identifiers, URIs, and model names unchanged when they are proper nouns
+
+Return JSON only (the raw object, no markdown code fences), with exactly one entry per job, in this shape:
+${jsonShape(`{
+  "results": [
+    { "index": 1, "abstract": "Merged one-line abstract", "overview": "Merged structured Markdown overview", "content": "Merged full content" }
+  ]
+}`)}
+
+- "index" is the job's number in the batch below.`;
+    const blocks = jobs.map((job, i) => {
+        const lines = [`### ${i + 1}. ${job.category}`, "", "#### Existing memory", ...formatMemoryFieldLines(job.existing)];
+        job.additions.forEach((addition, j) => {
+            const heading = job.additions.length > 1 ? `#### New information ${j + 1}` : "#### New information";
+            lines.push("", heading, ...formatMemoryFieldLines(addition));
+        });
+        return lines.join("\n");
+    });
+    const user = `## Merge jobs
+
+${blocks.join("\n\n")}`;
+    return { system, user };
 }
 /**
  * Scoped second pass fired only when the extraction's register verdict and its
  * per-item grounding tags are incoherent (e.g. register says fiction exists but
  * no item is tagged constructed), or when real-tagged durables sit beside
- * constructed siblings. One call; its verdict is final. The doctrine leads;
- * the conversation, first-pass register, and candidate rows follow as data
- * sections (composed into one string — this build has no system/user split).
+ * constructed siblings. One call; its verdict is final. The doctrine lives in
+ * the system half; the conversation, first-pass register, and candidate rows
+ * ride the user half.
  */
 export function buildGroundingRejudgePrompt(conversationText, conversationRegister, candidates) {
     // The reviewer judges the conversation as one whole; the extractor's
@@ -280,5 +604,5 @@ ${reviewTranscript}
 
 ## Candidate memories
 ${candidateList}`;
-    return `${system}\n\n${user}`;
+    return { system, user };
 }
