@@ -532,6 +532,44 @@ describe("buildExtractionPrompt speaker teaching", () => {
     assert.ok(user.includes("Extract memory candidates ONLY from <user_message> blocks."));
   });
 
+  it("teaches the symmetric context tags when the context window is on (captureAssistant=false)", () => {
+    const { system, user } = buildExtractionPrompt(transcript, "User", { contextWindow: true });
+    assert.ok(
+      system.includes("<context_only_assistant_turn>...</context_only_assistant_turn> wraps ONE message written by the AI assistant. Context only"),
+      "format teaching must describe self replies as context_only_assistant_turn",
+    );
+    assert.ok(
+      system.includes("<context_only_user_turn>...</context_only_user_turn> wraps a user message that was ALREADY processed by a previous extraction run."),
+      "format teaching must describe processed user turns",
+    );
+    assert.ok(
+      system.includes("a fact that appears only in a context block must not be stored"),
+      "the context-only storage rule rides the context_only_user_turn bullet",
+    );
+    assert.ok(
+      system.indexOf("<context_only_user_turn>") < system.indexOf("<user_message>..."),
+      "the context_only_user_turn bullet leads the tag list",
+    );
+    assert.ok(system.includes("wraps ONE NEW message written by the human user."), "user_message is taught as the NEW delta");
+    assert.ok(
+      system.includes("Memories may only be grounded here."),
+      "user-block grounding stays exclusive in context mode",
+    );
+    assert.ok(user.includes("Extract memory candidates ONLY from <user_message> blocks."));
+    assert.ok(!(system + user).includes("also valid sources"), "no eligible-mode vocabulary may leak in");
+  });
+
+  it("teaches processed-context tags alongside eligible tags under captureAssistant=true + window", () => {
+    const { system, user } = buildExtractionPrompt(transcript, "User", {
+      assistantEligible: true,
+      contextWindow: true,
+    });
+    assert.ok(system.includes("also valid sources"), "eligible attribution rules stay in the system half");
+    assert.ok(system.includes("already processed in previous runs — NEVER extract memories from them again"));
+    assert.ok(!system.includes("a source of memories"), "the false-mode self-context wording must not leak into eligible mode");
+    assert.ok(!user.includes("a source of memories"), "the false-mode self-context wording must not leak into the eligible-mode format legend");
+  });
+
   it("keeps a real configured name in the prompt header and drops the generic 'User: User' line", () => {
     const { user: withName } = buildExtractionPrompt(transcript, "Alex");
     const { user: generic } = buildExtractionPrompt(transcript, "User");

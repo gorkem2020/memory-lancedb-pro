@@ -156,6 +156,8 @@ export function normalizeAutoCaptureText(
 export interface ConversationTurn {
   role: "user" | "assistant";
   text: string;
+  /** Already processed by a previous extraction (retained window turn): renders as a context_only_* tag, never an extraction source. */
+  context?: boolean;
   /**
    * Stable identity of the source message: every block of one multi-block
    * message shares it, distinct messages never do. Referent-run walks extend
@@ -190,7 +192,7 @@ export function nextAutoCaptureMessageId(): number {
  * covers attribute-bearing and self-closing forms like
  * <assistant_message id="x"> and <user_message/>.
  */
-const SPEAKER_TAG_SPOOF_NAMES = ["user_message", "assistant_message"];
+const SPEAKER_TAG_SPOOF_NAMES = ["user_message", "assistant_message", "context_only_user_turn", "context_only_assistant_turn"];
 
 function isSpoofWhitespaceCode(code: number): boolean {
   return (
@@ -318,10 +320,18 @@ export function neutralizeSpeakerTagSpoof(text: string): string {
 export function formatConversationTranscript(
   turns: ConversationTurn[],
   _userLabel: string = "User",
+  options: { assistantContextOnly?: boolean } = {},
 ): string {
   return turns
     .map((turn) => {
-      const tag = turn.role === "user" ? "user_message" : "assistant_message";
+      const tag =
+        turn.role === "user"
+          ? turn.context
+            ? "context_only_user_turn"
+            : "user_message"
+          : turn.context || options.assistantContextOnly === true
+            ? "context_only_assistant_turn"
+            : "assistant_message";
       return `<${tag}>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</${tag}>`;
     })
     .join("\n");
@@ -348,13 +358,23 @@ export function buildBoundedTranscript(turns: ConversationTurn[], maxChars: numb
 export function buildBoundedTranscriptWithStats(
   turns: ConversationTurn[],
   maxChars: number,
-  options: { protectedPrefixTurns?: number } = {},
+  options: { protectedPrefixTurns?: number; assistantContextOnly?: boolean } = {},
 ): { transcript: string; fullLength: number; protectedPrefixKept: boolean } {
-  const blocks = turns.map((turn) => ({
-    open: turn.role === "user" ? "<user_message>" : "<assistant_message>",
-    close: turn.role === "user" ? "</user_message>" : "</assistant_message>",
-    text: neutralizeSpeakerTagSpoof(turn.text),
-  }));
+  const blocks = turns.map((turn) => {
+    const tag =
+      turn.role === "user"
+        ? turn.context
+          ? "context_only_user_turn"
+          : "user_message"
+        : turn.context || options.assistantContextOnly === true
+          ? "context_only_assistant_turn"
+          : "assistant_message";
+    return {
+      open: `<${tag}>`,
+      close: `</${tag}>`,
+      text: neutralizeSpeakerTagSpoof(turn.text),
+    };
+  });
   const rendered = blocks.map((block) => `${block.open}\n${block.text}\n${block.close}`);
   const full = rendered.join("\n");
   if (full.length <= maxChars) {

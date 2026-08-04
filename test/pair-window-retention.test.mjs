@@ -268,6 +268,36 @@ describe("pair-window retention across successful extractions", () => {
     assert.ok(!third.includes(U1), "long-dropped pairs never resurface");
   });
 
+  it("rides assistant replies into the transcript as context under captureAssistant=false + context window", async () => {
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+
+    await fireAgentEnd(hook, turnMessages(4), ctx);
+    assert.equal(extractionPrompts.length, 1);
+    const first = extractionPrompts[0];
+    assert.ok(first.includes(`<context_only_assistant_turn>\n${A1}`), "self replies must appear as context_only_assistant_turn blocks");
+    assert.ok(first.includes("Context only"), "the prompt must teach the assistant tag as context");
+    assert.ok(first.includes("a fact that appears only in a context block must not be stored"), "the context-only extraction rule must be present");
+    assert.ok(!/(?<!context_)<assistant_message>/.test(first) && !first.includes("\n<assistant_message>"), "no eligible assistant tag may appear under captureAssistant=false");
+
+    await fireAgentEnd(hook, turnMessages(6), ctx);
+    const second = extractionPrompts[1];
+    assert.ok(second.includes(`<context_only_assistant_turn>\n${A2}`), "the retained window keeps the prior pair's reply as context");
+    assert.ok(second.includes(`<context_only_assistant_turn>\n${A3}`), "the new pair's self reply is context too (self is never a source)");
+  });
+
+  it("wraps ALREADY-PROCESSED user turns as context_only_user_turn while the new delta keeps user_message", async () => {
+    const ctx = { sessionKey: "agent:test-agent:main", agentId: "test-agent" };
+
+    await fireAgentEnd(hook, turnMessages(4), ctx);
+    await fireAgentEnd(hook, turnMessages(6), ctx);
+    assert.equal(extractionPrompts.length, 2);
+    const second = extractionPrompts[1];
+    assert.ok(second.includes(`<context_only_user_turn>\n${U2}`), "the watermark-seen user turn must be wrapped as processed context");
+    assert.ok(second.includes(`<user_message>\n${U3}`), "the new user turn keeps the extractable user_message tag");
+    assert.ok(!second.includes(`<user_message>\n${U2}`), "a processed user turn must not wear the extractable tag");
+    assert.ok(second.includes("ALREADY processed by a previous extraction run"), "the prompt must teach the processed-context tag");
+  });
+
   it("retains nothing between calls when autoCaptureContextTurns is 0", async () => {
     const zeroHook = registerFresh({
       autoCaptureContextTurns: 0,

@@ -2815,6 +2815,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         smartExtractor = new SmartExtractor(store, embedder, llmClient, {
           user: "User",
           manualEchoLedger,
+          contextWindowEnabled: (config.autoCaptureContextTurns ?? 0) > 0,
           captureAssistantEligible: config.captureAssistant === true,
           extractMinMessages: config.extractMinMessages ?? 4,
           extractMaxChars: config.extractMaxChars ?? 8000,
@@ -4313,6 +4314,12 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
           );
 
+          // Context-only assistant admission: with the context window on and
+          // captureAssistant off, self replies join the transcript window for
+          // reference resolution but never the eligible set — they cannot
+          // fire the gate, move the watermark, or ground a memory.
+          const assistantContextOnly =
+            config.captureAssistant !== true && (config.autoCaptureContextTurns ?? 0) > 0;
           // Extract text content from messages, keeping the role-tagged
           // message-loop order alongside the flat eligible-text list.
           const eligibleTexts: string[] = [];
@@ -4326,10 +4333,10 @@ const memoryLanceDBProPlugin = {
 
             const role = msgObj.role;
             const captureAssistant = config.captureAssistant === true;
-            if (
-              role !== "user" &&
-              !(captureAssistant && role === "assistant")
-            ) {
+            const isEligibleRole =
+              role === "user" || (captureAssistant && role === "assistant");
+            const isContextOnlyRole = assistantContextOnly && role === "assistant";
+            if (!isEligibleRole && !isContextOnlyRole) {
               continue;
             }
 
@@ -4341,7 +4348,7 @@ const memoryLanceDBProPlugin = {
               if (!normalized) {
                 skippedAutoCaptureTexts++;
               } else {
-                eligibleTexts.push(normalized);
+                if (isEligibleRole) eligibleTexts.push(normalized);
                 messageLoopTurns.push({ role: role as "user" | "assistant", text: normalized, messageId });
               }
               continue;
@@ -4362,7 +4369,7 @@ const memoryLanceDBProPlugin = {
                   if (!normalized) {
                     skippedAutoCaptureTexts++;
                   } else {
-                    eligibleTexts.push(normalized);
+                    if (isEligibleRole) eligibleTexts.push(normalized);
                     messageLoopTurns.push({ role: role as "user" | "assistant", text: normalized, messageId });
                   }
                 }
@@ -4813,7 +4820,16 @@ const memoryLanceDBProPlugin = {
               // texts the selectors dropped back into extraction. Kept indices
               // pin each surviving copy to its own turn; occurrence counting
               // stays as the fallback when positional alignment is unavailable.
-              let finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+              // Context-only assistant replies have no kept-text counterpart by
+              // design (they are never extraction sources); reconcile over the
+              // union so they ride the transcript, in original order. Positional
+              // pinning stays in force in every other mode.
+              const contextOnlyAssistantTexts = assistantContextOnly
+                ? thisCallTurns.filter((turn) => turn.role === "assistant").map((turn) => turn.text)
+                : [];
+              let finalConversationTurns = contextOnlyAssistantTexts.length > 0
+                ? reconcileTurnsWithKeptTexts(thisCallTurns, [...cleanTexts, ...contextOnlyAssistantTexts])
+                : reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
               // Rolling PAIR window sized by autoCaptureContextTurns (0 =
               // disabled: each extraction sees only its own call's turns, and
               // nothing is retained between calls). When enabled, this call's
@@ -4828,7 +4844,9 @@ const memoryLanceDBProPlugin = {
               // referent turns from position zero.
               const contextTurns = config.autoCaptureContextTurns ?? 0;
               if (contextTurns > 0 && rememberPrependedTurns.length === 0) {
-                const priorPairTurns = autoCaptureRecentPairTurns.get(sessionKey) || [];
+                const priorPairTurns = (autoCaptureRecentPairTurns.get(sessionKey) || []).map(
+                  (turn) => ({ ...turn, context: true }),
+                );
                 finalConversationTurns = trimTurnsToUserCap(
                   dedupePairWindow([...priorPairTurns, ...finalConversationTurns]),
                   Math.max(contextTurns, finalConversationTurns.filter((turn) => turn.role === "user").length),

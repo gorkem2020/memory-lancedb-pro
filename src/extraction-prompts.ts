@@ -42,30 +42,47 @@ export interface SplitPrompt {
 export function buildExtractionPrompt(
   conversationText: string,
   user: string,
-  options: { assistantEligible?: boolean } = {},
+  options: { assistantEligible?: boolean; contextWindow?: boolean } = {},
 ): SplitPrompt {
-  // Transcript modes, driven by captureAssistant:
-  // - assistantEligible (captureAssistant=true): assistant blocks appear in
-  //   the transcript AND are valid grounding sources, with attribution rules.
-  // - default (captureAssistant=false): assistant lines are excluded from the
-  //   transcript entirely, so the prompt does not describe assistant blocks
-  //   at all.
+  // Transcript modes, driven by captureAssistant x autoCaptureContextTurns:
+  // - assistantEligible (captureAssistant=true): assistant blocks appear AND are
+  //   valid grounding sources, with attribution rules.
+  // - contextWindow (autoCaptureContextTurns > 0): already-processed turns ride
+  //   along under context_only_user_turn / context_only_assistant_turn tags —
+  //   context only, never sources. With captureAssistant=false every assistant
+  //   turn is context (self messages are never sources).
+  // - neither: assistant lines are excluded from the transcript entirely, so
+  //   the prompt does not describe assistant blocks at all.
   const assistantEligible = options.assistantEligible === true;
+  const contextWindow = options.contextWindow === true;
+  const assistantContext = !assistantEligible && contextWindow;
+  const contextUserBullet = contextWindow
+    ? `
+- <context_only_user_turn>...</context_only_user_turn> wraps a user message that was ALREADY processed by a previous extraction run. Context only — do not extract it again; a fact that appears only in a context block must not be stored. You may use it, if needed, to understand the conversation's flow and what the user means.`
+    : "";
   const assistantFormatBullet = assistantEligible
     ? `
 - <assistant_message>...</assistant_message> wraps ONE message written by the AI assistant.`
+    : assistantContext
+      ? `
+- <context_only_assistant_turn>...</context_only_assistant_turn> wraps ONE message written by the AI assistant. Context only — you may use it, if needed, to resolve what the user meant (pronouns, follow-ups, corrections); it is never a source of memories.`
+      : "";
+  const contextAssistantEligibleBullet = contextWindow && assistantEligible
+    ? `
+- <context_only_assistant_turn>...</context_only_assistant_turn> wraps an assistant message that was ALREADY processed by a previous extraction run. Context only.`
     : "";
   const userGroundingSuffix = assistantEligible ? "" : " Memories may only be grounded here.";
   const assistantBlocksRule = assistantEligible
     ? `
 - <assistant_message> blocks: also valid sources — but only for concrete facts the user did not correct. Skip the assistant's greetings, guesses, and self-description.
-- Attribute every memory to whoever actually said it. When both said it, use the <user_message> version.`
+- Attribute every memory to whoever actually said it. When both said it, use the <user_message> version.${contextWindow ? `
+- <context_only_user_turn> and <context_only_assistant_turn> blocks: already processed in previous runs — NEVER extract memories from them again.` : ""}`
     : "";
   const system = `${EXTRACTION_AGENT_IDENTITY} Analyze session context and extract memories worth long-term preservation.
 
 ## Transcript format
-The conversation is a sequence of tagged blocks in chronological order:
-- <user_message>...</user_message> wraps ONE message written by the human user.${userGroundingSuffix}${assistantFormatBullet}
+The conversation is a sequence of tagged blocks in chronological order:${contextUserBullet}
+- <user_message>...</user_message> wraps ONE${contextWindow ? " NEW" : ""} message written by the human user.${userGroundingSuffix}${assistantFormatBullet}${contextAssistantEligibleBullet}
 
 # Memory Extraction Criteria
 
