@@ -1315,6 +1315,7 @@ export function registerMemoryStoreTool(api, context) {
                             // invalidation instead of silently reporting it as superseded.
                             console.warn(`memory-pro: failed to invalidate superseded record ${failure.id.slice(0, 8)}: ${failure.reason}`);
                         }
+                        context.manualEchoLedger?.record(agentId, text);
                         // Dual-write to Markdown mirror if enabled
                         if (context.mdMirror) {
                             await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: newEntry.timestamp }, { source: "memory_store", agentId });
@@ -1394,6 +1395,7 @@ export function registerMemoryStoreTool(api, context) {
                             valid_until: validUntil,
                         })),
                     });
+                    context.manualEchoLedger?.record(agentId, text);
                     // Dual-write to Markdown mirror if enabled
                     if (context.mdMirror) {
                         await context.mdMirror({ text, category: storageCategory, scope: targetScope, timestamp: entry.timestamp }, { source: "memory_store", agentId });
@@ -1777,6 +1779,7 @@ export function registerMemoryUpdateTool(api, context) {
                             details: { error: "not_found", id: resolvedId },
                         };
                     }
+                    context.manualEchoLedger?.record(agentId, updated.text);
                     return {
                         content: [
                             {
