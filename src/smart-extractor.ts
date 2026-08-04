@@ -177,7 +177,7 @@ type PendingSupersedeInvalidation = {
 // tell a genuine "LLM found nothing" verdict from a gateway/model failure or
 // a malformed response shape — only the former is a real noise signal.
 type ExtractCandidatesResult =
-  | { status: "ok"; candidates: CandidateMemory[]; groundingOrPolicyDropped?: boolean }
+  | { status: "ok"; candidates: CandidateMemory[]; rawCandidateCount: number; groundingOrPolicyDropped?: boolean }
   | { status: "llm_failure"; candidates: [] }
   | { status: "malformed"; candidates: [] }
   | { status: "empty_input"; candidates: [] };
@@ -734,12 +734,17 @@ export class SmartExtractor {
         // No LLM call was made, so the caller's rate limiter must not be charged.
         stats.skippedNoInput = true;
       }
-      if (extraction.status === "ok" && !extraction.groundingOrPolicyDropped) {
+      if (extraction.status === "ok" && extraction.rawCandidateCount === 0) {
         // LLM genuinely returned zero candidates → strongest noise signal → feedback to noise bank
         this.learnAsNoise(conversationText);
       } else if (extraction.status === "ok") {
-        this.debugLog(
-          "memory-pro: smart-extractor: skipping noise-bank learning (batch emptied by grounding/register/policy drops, not a genuine zero-extraction)",
+        // The model DID emit candidates; validation, grounding, or the batch
+        // contradiction check dropped them all. That is a policy verdict about
+        // those candidates, not evidence the conversation is noise — learning
+        // it as noise would pre-filter similar real content away from future
+        // extractions.
+        this.log(
+          `memory-pro: smart-extractor: skipping noise-bank learning (validation emptied the batch, raw=${extraction.rawCandidateCount})`,
         );
       } else {
         this.debugLog(
@@ -2201,6 +2206,15 @@ export class SmartExtractor {
       }
     }
 
+    if (contradictionDemotedCount > 0) {
+      // At the standard log level so a fully-demoted batch is distinguishable
+      // from "model found nothing" without debug logging (mirrors the
+      // admission-rejection lines).
+      this.log(
+        `memory-lancedb-pro: smart-extractor: batch contradiction demoted ${contradictionDemotedCount} real-tagged durable candidate(s) (register=${conversationRegister}, constructed siblings present)`,
+      );
+    }
+
     this.debugLog(
       `memory-lancedb-pro: smart-extractor: validation summary register=${conversationRegister}, accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}, policyDropped=${policyDroppedCount}, constructedDropped=${constructedDroppedCount}, fictionRegisterDropped=${fictionRegisterDroppedCount}, contradictionDemoted=${contradictionDemotedCount}`,
     );
@@ -2208,6 +2222,7 @@ export class SmartExtractor {
     return {
       status: "ok",
       candidates,
+      rawCandidateCount: result.memories.length,
       // A batch emptied by grounding, register, or policy drops is NOT a
       // "the LLM found nothing here" signal — the LLM found plenty and the
       // filters excluded it — so the caller must not train the noise bank
