@@ -75,12 +75,14 @@ import { isNoise } from "./src/noise-filter.js";
 import {
   type ConversationTurn,
   buildConversationTurnsForExtraction,
+  capUnknownWatermarkWindow,
   formatConversationTranscript,
   neutralizeSpeakerTagSpoof,
   nextAutoCaptureMessageId,
   normalizeAutoCaptureText,
   reconcileTurnsWithKeptTexts,
 } from "./src/auto-capture-cleanup.js";
+import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter, stripEnvelopeMetadata } from "./src/smart-extractor.js";
@@ -1356,6 +1358,20 @@ function pruneMapIfOver<K, V>(map: Map<K, V>, maxEntries: number): void {
   }
 }
 
+/**
+ * Prune a Set to stay within the given maximum number of entries.
+ * Deletes the oldest (earliest-inserted) values when over the limit.
+ */
+function pruneSetIfOver<T>(set: Set<T>, maxEntries: number): void {
+  if (set.size <= maxEntries) return;
+  const excess = set.size - maxEntries;
+  const iter = set.values();
+  for (let i = 0; i < excess; i++) {
+    const value = iter.next().value;
+    if (value !== undefined) set.delete(value);
+  }
+}
+
 function isExplicitRememberCommand(text: string): boolean {
   return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
 }
@@ -2504,11 +2520,13 @@ interface PluginSingletonState {
   recallHistory: Map<string, Map<string, number>>;
   turnCounter: Map<string, number>;
   autoCaptureSeenTextCount: Map<string, number>;
+  autoCapturePayloadShapeLoggedSessions: Set<string>;
   autoCapturePendingIngressTexts: Map<string, string[]>;
   autoCaptureCountedPendingCount: Map<string, number>;
   autoCaptureRecentTurns: Map<string, ConversationTurn[]>;
   autoCaptureDeferredFlushTurns: Map<string, ConversationTurn[]>;
   autoCaptureSessionIdToKey: Map<string, string>;
+  autoCaptureSessionIds: Map<string, string>;
   autoCaptureInFlightRuns: Map<string, Set<Promise<void>>>;
   captureAdmissionController: () => AdmissionController | null;
   captureAdmissionAudit: () => boolean;
@@ -2845,12 +2863,14 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const reflectionByAgentCacheGeneration = { count: 0 };
   const recallHistory = new Map<string, Map<string, number>>();
   const turnCounter = new Map<string, number>();
-  const autoCaptureSeenTextCount = new Map<string, number>();
+  const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
+  const autoCapturePayloadShapeLoggedSessions = new Set<string>();
   const autoCapturePendingIngressTexts = new Map<string, string[]>();
   const autoCaptureCountedPendingCount = new Map<string, number>();
   const autoCaptureRecentTurns = new Map<string, ConversationTurn[]>();
   const autoCaptureDeferredFlushTurns = new Map<string, ConversationTurn[]>();
   const autoCaptureSessionIdToKey = new Map<string, string>();
+  const autoCaptureSessionIds = new Map<string, string>();
   const autoCaptureInFlightRuns = new Map<string, Set<Promise<void>>>();
 
   return {
@@ -2879,11 +2899,13 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     recallHistory,
     turnCounter,
     autoCaptureSeenTextCount,
+    autoCapturePayloadShapeLoggedSessions,
     autoCapturePendingIngressTexts,
     autoCaptureCountedPendingCount,
     autoCaptureRecentTurns,
     autoCaptureDeferredFlushTurns,
     autoCaptureSessionIdToKey,
+    autoCaptureSessionIds,
     autoCaptureInFlightRuns,
     captureAdmissionController,
     captureAdmissionAudit,
@@ -3040,17 +3062,33 @@ const memoryLanceDBProPlugin = {
       recallHistory,
       turnCounter,
       autoCaptureSeenTextCount,
+      autoCapturePayloadShapeLoggedSessions,
       autoCapturePendingIngressTexts,
       autoCaptureCountedPendingCount,
       autoCaptureRecentTurns,
       autoCaptureDeferredFlushTurns,
-    autoCaptureSessionIdToKey,
+      autoCaptureSessionIdToKey,
+      autoCaptureSessionIds,
       autoCaptureInFlightRuns,
       captureAdmissionController,
       captureAdmissionAudit,
       captureReflectionAdmissionController,
       admissionRejectionAuditWriter,
     } = singleton;
+
+    // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
+    // must also go through here so the on-disk watermark never drifts from the
+    // in-memory Map -- a process restart rehydrates from exactly what was last
+    // written here (see loadAutoCaptureWatermarks at construction, above).
+    const persistAutoCaptureWatermark = async (key: string, value: number): Promise<void> => {
+      autoCaptureSeenTextCount.set(key, value);
+      pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+      await saveAutoCaptureWatermarks(resolvedDbPath, autoCaptureSeenTextCount, (message) => api.logger.debug(message));
+    };
+    const retireAutoCaptureWatermark = async (key: string): Promise<void> => {
+      autoCaptureSeenTextCount.delete(key);
+      await saveAutoCaptureWatermarks(resolvedDbPath, autoCaptureSeenTextCount, (message) => api.logger.debug(message));
+    };
 
     const learnAutoCaptureSessionAlias = (sessionId: unknown, sessionKey: unknown) => {
       if (
@@ -4338,6 +4376,28 @@ const memoryLanceDBProPlugin = {
             autoCaptureCountedPendingCount.delete(conversationKey);
           }
 
+          // Session renewal detection: a rotated sessionId under a stable
+          // sessionKey (e.g. /reset) means the persisted watermark counts a
+          // conversation that no longer exists. A stale-HIGH cursor silently
+          // swallows the fresh session's first messages as already-seen; a
+          // stale-LOW cursor fires a spurious first-message extraction. Reset
+          // to zero so the fresh session counts from its own start. The map
+          // is deliberately in-memory: after a process restart it records
+          // without resetting, preserving the watermark's restart survival.
+          if (hookSessionId) {
+            const recordedSessionId = autoCaptureSessionIds.get(sessionKey);
+            if (recordedSessionId && recordedSessionId !== hookSessionId) {
+              await persistAutoCaptureWatermark(sessionKey, 0);
+              api.logger.info(
+                `memory-lancedb-pro: auto-capture watermark reset for ${sessionKey} (session renewed: ${recordedSessionId.slice(0, 8)} -> ${hookSessionId.slice(0, 8)})`,
+              );
+            }
+            autoCaptureSessionIds.set(sessionKey, hookSessionId);
+            pruneMapIfOver(autoCaptureSessionIds, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          }
+
+          const minMessages = config.extractMinMessages ?? 4;
+          let watermarkAdvanceOverride: number | null = null;
           const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
           let newTexts = eligibleTexts;
           let newlyObservedCount = eligibleTexts.length;
@@ -4367,17 +4427,42 @@ const memoryLanceDBProPlugin = {
               newTexts = [];
               newlyObservedCount = 0;
             }
+          } else if (previousSeenCount === 0 && eligibleTexts.length > Math.max(minMessages * 4, 12)) {
+            // issue #417 item 5: a genuinely unknown watermark (first-ever
+            // run, or persisted state lost) meeting a pathological backlog
+            // (far more than one batch's worth) must not ingest the entire
+            // transcript in one call. Cap to the most recent batch and
+            // forfeit the rest by marking it seen below, rather than
+            // queueing it for a later turn. Ordinary first turns with a
+            // handful of history texts stay whole: compression and
+            // extractMaxChars govern those, and the tagged-transcript
+            // contract expects every kept text to arrive.
+            newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
+            watermarkAdvanceOverride = eligibleTexts.length;
           }
           // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
-          const cumulativeCount = previousSeenCount + newlyObservedCount;
-          autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
-          pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+          const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newlyObservedCount);
+          await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
+
+          // Once per session per process (not persisted, not per turn): a
+          // restart re-emits this, which is exactly when you want to
+          // re-confirm the payload shape in the new process. This single
+          // INFO line answers the delta-only-vs-history-carrying question
+          // and the gate's fire/skip decision without reconstructing them
+          // from DEBUG-only evidence across unrelated log lines.
+          if (!autoCapturePayloadShapeLoggedSessions.has(sessionKey)) {
+            autoCapturePayloadShapeLoggedSessions.add(sessionKey);
+            pruneSetIfOver(autoCapturePayloadShapeLoggedSessions, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            api.logger.info(
+              `memory-lancedb-pro: auto-capture payload shape for agent ${agentId} (sessionKey=${sessionKey}): messages=${event.messages.length}, eligible=${eligibleTexts.length}, previousSeen=${previousSeenCount}, cumulative=${cumulativeCount}, fired=${cumulativeCount >= minMessages ? "yes" : "no"}`,
+            );
+          }
 
           let terminalFlushTurns: ConversationTurn[] | null = null;
           if (isTerminalFlush) {
             const deferredFlushTurns = autoCaptureDeferredFlushTurns.get(sessionKey) || [];
             autoCaptureDeferredFlushTurns.delete(sessionKey);
-            autoCaptureSeenTextCount.delete(sessionKey);
+            await retireAutoCaptureWatermark(sessionKey);
             // Deferred turns keep their original roles and message ids;
             // pending ingress is user-authored by construction. Dedup by
             // text with first occurrence winning, mirroring the previous
@@ -4545,7 +4630,6 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          const minMessages = config.extractMinMessages ?? 4;
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
               `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
@@ -4628,7 +4712,10 @@ const memoryLanceDBProPlugin = {
               return;
             }
             if (pendingIngressTexts.length === 0) {
-              autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+              // Sync closure: the in-memory set inside the helper runs before its
+              // first await; the disk write is best-effort fire-and-forget (the
+              // store never throws).
+              void persistAutoCaptureWatermark(sessionKey, previousSeenCount);
               return;
             }
             if (conversationKey) {
@@ -4809,7 +4896,7 @@ const memoryLanceDBProPlugin = {
                 // turn re-read and re-extract the entire history. Record the
                 // consumed history length there instead, so the next turn
                 // only sees the delta.
-                autoCaptureSeenTextCount.set(
+                await persistAutoCaptureWatermark(
                   sessionKey,
                   pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
                 );
@@ -4830,7 +4917,7 @@ const memoryLanceDBProPlugin = {
                     `(rejected=${stats.rejected ?? 0}, skipped=${stats.skipped}, supported=${stats.supported ?? 0}, ` +
                     `superseded=${stats.superseded ?? 0}); consuming texts without retry`,
                   );
-                  autoCaptureSeenTextCount.set(
+                  await persistAutoCaptureWatermark(
                     sessionKey,
                     pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length,
                   );
@@ -4869,7 +4956,7 @@ const memoryLanceDBProPlugin = {
               // already gone.
               const retainedCap = autoCaptureRetainedTextCap(minMessages);
               if (pendingIngressTexts.length === 0) {
-                autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+                await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
                 // History content lives in the session transcript, which is gone
                 // once the session ends: retain the deferred texts so a terminal
                 // flush can still consume them.

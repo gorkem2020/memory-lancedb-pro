@@ -437,6 +437,49 @@ function keepRenderedTail(
 }
 
 /**
+ * Bounds the extraction input when a session's watermark is genuinely
+ * unknown (first-ever run, or persisted state lost) and its eligible-text
+ * history is larger than one batch's worth -- ingesting the entire history
+ * in one extraction call risks an oversized, stale-content-heavy prompt.
+ * Caps to the most recent `batchSize` texts, then trims further from the
+ * front of that window if it still exceeds `maxChars`. Always keeps at
+ * least the single most recent text, even if it alone exceeds `maxChars`.
+ */
+export function capUnknownWatermarkWindow(
+  eligibleTexts: string[],
+  batchSize: number,
+  maxChars: number,
+): string[] {
+  const window = eligibleTexts.slice(-Math.max(1, batchSize));
+  let start = 0;
+  let totalChars = window.reduce((sum, text) => sum + text.length, 0);
+  while (totalChars > maxChars && start < window.length - 1) {
+    totalChars -= window[start].length;
+    start++;
+  }
+  return window.slice(start);
+}
+
+/**
+ * Bounds a tag-wrapped transcript to `maxChars` by keeping the tail and then
+ * snapping the cut to the next opening tag, so the prompt never leads with a
+ * headless half message whose speaker was sliced away.
+ */
+export function trimTranscriptToTagBoundary(transcript: string, maxChars: number): string {
+  if (transcript.length <= maxChars) {
+    return transcript;
+  }
+  const sliced = transcript.slice(-maxChars);
+  const tagStarts = ["<user_message>", "<assistant_message>", "<context_only_user_turn>", "<context_only_assistant_turn>"]
+    .map((tag) => sliced.indexOf(tag))
+    .filter((index) => index >= 0);
+  if (tagStarts.length === 0) {
+    return sliced;
+  }
+  return sliced.slice(Math.min(...tagStarts));
+}
+
+/**
  * Assembles the ordered turn sequence for the extraction prompt's transcript
  * from this call's true message-loop order, without recomputing any
  * eligibility or watermark decision -- it only consumes their already-decided
