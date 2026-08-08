@@ -95,6 +95,7 @@ function makeStore() {
     },
     async update(_id, _patch, _scopeFilter) {
       entries.push({ action: "update", id: _id });
+      return { id: _id };
     },
     async getById(_id, _scopeFilter) {
       return null;

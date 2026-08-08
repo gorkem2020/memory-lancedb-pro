@@ -60,6 +60,7 @@ function makeStore({ getByIdThrows = false } = {}) {
     },
     async update(id, patch, scopeFilter) {
       updates.push({ id, patch, scopeFilter });
+      return EXISTING_ENTRY;
     },
     async getById() {
       if (getByIdThrows) throw new Error("mock getById failure");

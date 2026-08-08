@@ -228,6 +228,7 @@ function makeNeighborStore({ sharedTarget = false, neighbors = true } = {}) {
     },
     async update(id, patch) {
       updates.push({ id, patch });
+      return rows.get(id) ?? null;
     },
     async store() {},
     async bulkStore(entries) {
