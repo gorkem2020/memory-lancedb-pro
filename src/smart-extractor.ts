@@ -71,7 +71,7 @@ type StoreEntry = Omit<import("./store.js").MemoryEntry, "id" | "timestamp">;
 type PendingMergeAddition = {
   candidate: CandidateMemory;
   contextLabel?: string;
-  admissionAudit?: AdmissionAuditRecord;
+  admissionAudit?: AdmissionWriteEvidence;
 };
 
 /**
@@ -79,12 +79,39 @@ type PendingMergeAddition = {
  * entry's metadata. Used by the gated-candidate lane so downstream verdict
  * handling persists the real gate record, never a synthetic marker.
  */
-function parseEntryAdmissionAudit(
+type AdmissionFailOpenEvidence = {
+  provenance: string;
+  failedOpen: true;
+  reason?: string;
+  error?: string;
+};
+
+/**
+ * The evidence a mutation may carry to its write site: either the caller's
+ * complete gate audit, or a fail-open marker proving the content was never
+ * evaluated. The write site (withAdmissionAudit) discriminates: complete
+ * audits replace admission_control as before; fail-open markers never touch
+ * an existing audit and are appended to admission_bypass_events instead.
+ */
+type AdmissionWriteEvidence = AdmissionAuditRecord | AdmissionFailOpenEvidence;
+
+const MAX_ADMISSION_BYPASS_EVENTS = 20;
+
+function isFailOpenEvidence(
+  value: AdmissionWriteEvidence,
+): value is AdmissionFailOpenEvidence {
+  return (
+    (value as AdmissionFailOpenEvidence).failedOpen === true &&
+    typeof (value as AdmissionFailOpenEvidence).provenance === "string"
+  );
+}
+
+function parseEntryAdmissionEvidence(
   entry: Omit<import("./store.js").MemoryEntry, "id" | "timestamp">,
-): AdmissionAuditRecord | undefined {
+): { audit?: AdmissionAuditRecord; failOpen?: AdmissionFailOpenEvidence } {
   const raw = entry.metadata;
   if (typeof raw !== "string" || raw.length === 0) {
-    return undefined;
+    return {};
   }
   try {
     const meta = JSON.parse(raw);
@@ -92,20 +119,30 @@ function parseEntryAdmissionAudit(
     // gate record as a nested JSON string under admission_audit.
     const audit = meta.admission_audit;
     const parsed = typeof audit === "string" && audit.length > 0 ? JSON.parse(audit) : audit;
-    // Fail-open gate markers ({provenance, failedOpen, reason, error}) are
-    // evidence of a skipped evaluation, not an audit: adopting one would let
-    // MERGE/SUPPORT overwrite a target's complete audit with it.
     if (
       parsed &&
       typeof parsed === "object" &&
       (parsed as Record<string, unknown>).version === "amac-v1" &&
       typeof (parsed as Record<string, unknown>).decision === "string"
     ) {
-      return parsed as AdmissionAuditRecord;
+      return { audit: parsed as AdmissionAuditRecord };
     }
-    return undefined;
+    // Fail-open gate markers ({provenance, failedOpen, reason, error}) are
+    // evidence of a skipped evaluation, not an audit. They must never be
+    // adopted as admission_control, but dropping them entirely would leave a
+    // mutated target with no trace that unevaluated content became durable —
+    // carry them separately so write sites can append bypass evidence.
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      (parsed as Record<string, unknown>).failedOpen === true &&
+      typeof (parsed as Record<string, unknown>).provenance === "string"
+    ) {
+      return { failOpen: parsed as AdmissionFailOpenEvidence };
+    }
+    return {};
   } catch {
-    return undefined;
+    return {};
   }
 }
 /**
@@ -1008,7 +1045,7 @@ export class SmartExtractor {
       this.externalEntryBuilders.set(item.candidate, {
         build: item.buildEntry,
         prebuilt,
-        audit: parseEntryAdmissionAudit(prebuilt),
+        ...parseEntryAdmissionEvidence(prebuilt),
       });
     }
 
@@ -1287,7 +1324,8 @@ export class SmartExtractor {
       const followupMerges: PendingMergeJob[] = [];
       const followupCreates: StoreEntry[] = [];
       for (const pending of pendingSiblingVerdicts) {
-        const audit = this.externalEntryBuilders.get(pending.candidate)?.audit;
+        const ext = this.externalEntryBuilders.get(pending.candidate);
+        const audit: AdmissionWriteEvidence | undefined = ext?.audit ?? ext?.failOpen;
         const failOpenCreate = async (why: string) => {
           followupCreates.push(
             await this.externalOrBuiltFallbackEntry(pending.candidate, targetScope, sessionKey, pending.vector, audit),
@@ -2227,7 +2265,7 @@ export class SmartExtractor {
 
     switch (dedupResult.decision) {
       case "create":
-        createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
+        createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, this.admissionWriteEvidenceFor(candidate, admission)));
         stats.created++;
         break;
 
@@ -2244,7 +2282,7 @@ export class SmartExtractor {
                 targetScope,
                 scopeFilter,
                 dedupResult.contextLabel,
-                admission?.audit,
+                this.admissionWriteEvidenceFor(candidate, admission),
                 createEntries,
                 agentId,
               )
@@ -2254,7 +2292,7 @@ export class SmartExtractor {
                 targetScope,
                 scopeFilter,
                 dedupResult.contextLabel,
-                admission?.audit,
+                this.admissionWriteEvidenceFor(candidate, admission),
                 createEntries,
                 agentId,
               );
@@ -2268,7 +2306,7 @@ export class SmartExtractor {
           // "queued": accounted when the batched merge writer flushes.
         } else {
           // Category doesn't support merge → create instead
-          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, this.admissionWriteEvidenceFor(candidate, admission)));
           stats.created++;
         }
         break;
@@ -2292,7 +2330,7 @@ export class SmartExtractor {
             sessionKey,
             targetScope,
             scopeFilter,
-            admission?.audit,
+            this.admissionWriteEvidenceFor(candidate, admission),
             createEntries,
             pendingSupersedeInvalidations,
             agentId,
@@ -2300,34 +2338,34 @@ export class SmartExtractor {
           stats.created++;
           stats.superseded = (stats.superseded ?? 0) + 1;
         } else {
-          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, this.admissionWriteEvidenceFor(candidate, admission)));
           stats.created++;
         }
         break;
 
       case "support":
         if (dedupResult.matchId) {
-          const supportOutcome = await this.handleSupport(dedupResult.matchId, { session: sessionKey, timestamp: Date.now() }, dedupResult.reason, dedupResult.contextLabel, scopeFilter, admission?.audit);
+          const supportOutcome = await this.handleSupport(dedupResult.matchId, { session: sessionKey, timestamp: Date.now() }, dedupResult.reason, dedupResult.contextLabel, scopeFilter, this.admissionWriteEvidenceFor(candidate, admission));
           if (supportOutcome === "supported") {
             stats.supported = (stats.supported ?? 0) + 1;
           } else {
             // Target vanished mid-flight: same semantics as a support verdict
             // with no target — the candidate lands as a new row.
-            createEntries?.push(await this.externalOrBuiltFallbackEntry(candidate, targetScope, sessionKey, vector, admission?.audit));
+            createEntries?.push(await this.externalOrBuiltFallbackEntry(candidate, targetScope, sessionKey, vector, this.admissionWriteEvidenceFor(candidate, admission)));
             stats.created++;
           }
         } else {
-          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, this.admissionWriteEvidenceFor(candidate, admission)));
           stats.created++;
         }
         break;
 
       case "contextualize":
         if (dedupResult.matchId) {
-          await this.handleContextualize(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
+          await this.handleContextualize(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, this.admissionWriteEvidenceFor(candidate, admission), createEntries, agentId);
           stats.created++;
         } else {
-          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, this.admissionWriteEvidenceFor(candidate, admission)));
           stats.created++;
         }
         break;
@@ -2345,7 +2383,7 @@ export class SmartExtractor {
               sessionKey,
               targetScope,
               scopeFilter,
-              admission?.audit,
+              this.admissionWriteEvidenceFor(candidate, admission),
               createEntries,
               pendingSupersedeInvalidations,
               agentId,
@@ -2353,11 +2391,11 @@ export class SmartExtractor {
             stats.created++;
             stats.superseded = (stats.superseded ?? 0) + 1;
           } else {
-            await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, admission?.audit, createEntries, agentId);
+            await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, this.admissionWriteEvidenceFor(candidate, admission), createEntries, agentId);
             stats.created++;
           }
         } else {
-          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admission?.audit));
+          createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, this.admissionWriteEvidenceFor(candidate, admission)));
           stats.created++;
         }
         break;
@@ -2627,7 +2665,7 @@ export class SmartExtractor {
     sessionKey: string,
     targetScope: string,
     scopeFilter?: string[],
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
     createEntries?: StoreEntry[],
     agentId?: string,
     pendingMerges?: PendingMergeJob[],
@@ -2739,7 +2777,7 @@ export class SmartExtractor {
     targetScope: string,
     scopeFilter?: string[],
     contextLabel?: string,
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
     createEntries?: StoreEntry[],
     agentId?: string,
   ): Promise<"merged" | "created" | "llm-failed"> {
@@ -2801,7 +2839,7 @@ export class SmartExtractor {
     targetScope: string,
     sessionLabel: string,
     vector?: number[],
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
   ): Promise<StoreEntry> {
     const ext = this.externalEntryBuilders.get(candidate);
     if (ext?.prebuilt) {
@@ -2866,7 +2904,7 @@ export class SmartExtractor {
     targetScope: string,
     scopeFilter?: string[],
     contextLabel?: string,
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
     createEntries?: StoreEntry[],
     agentId?: string,
   ): Promise<"queued" | "created"> {
@@ -3058,7 +3096,7 @@ export class SmartExtractor {
     targetScope: string,
     scopeFilter: string[] | undefined,
     contextLabels: Array<string | undefined>,
-    admissionAudit: AdmissionAuditRecord | undefined,
+    admissionAudit: AdmissionWriteEvidence | undefined,
     agentId: string | undefined,
     mirrorSource: string = "smart-extraction",
   ): Promise<"updated" | "target-missing"> {
@@ -3159,7 +3197,7 @@ export class SmartExtractor {
     sessionKey: string,
     targetScope: string,
     scopeFilter?: string[],
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
     createEntries?: StoreEntry[],
     pendingSupersedeInvalidations?: PendingSupersedeInvalidation[],
     agentId?: string,
@@ -3241,11 +3279,11 @@ export class SmartExtractor {
     }
 
     const created = await this.store.store(entry);
-    await this.invalidateSupersededMemory(
+    const invalidated = await this.invalidateSupersededMemory(
       matchId,
       existing,
       factKey,
-      created.id,
+      created,
       scopeFilter,
     );
     await this.notifyPersisted(
@@ -3254,9 +3292,11 @@ export class SmartExtractor {
       agentId,
     );
 
-    this.log(
-      `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
-    );
+    if (invalidated) {
+      this.log(
+        `memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
+      );
+    }
   }
 
   private async applyPendingSupersedeInvalidations(
@@ -3271,42 +3311,90 @@ export class SmartExtractor {
         );
         continue;
       }
-      await this.invalidateSupersededMemory(
+      const invalidated = await this.invalidateSupersededMemory(
         pending.matchId,
         pending.existing,
         pending.factKey,
-        created.id,
+        created,
         pending.scopeFilter,
       );
-      this.log(
-        `memory-pro: smart-extractor: superseded ${pending.matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
-      );
+      if (invalidated) {
+        this.log(
+          `memory-pro: smart-extractor: superseded ${pending.matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`,
+        );
+      }
     }
   }
 
+  /**
+   * Invalidate the superseded row AFTER its replacement is committed. The
+   * replacement commit is irrevocable by this point, so this step must never
+   * reject past it: any failure (thrown read/update, or an update that
+   * reports nothing written) is isolated per row, the outcome downgrades to
+   * a plain CREATE, and the replacement's supersedes claim is stripped
+   * best-effort so the pair never reports a supersede that did not happen.
+   * Returns true only when the old row was actually invalidated.
+   */
   private async invalidateSupersededMemory(
     matchId: string,
     existing: MemoryEntry,
     factKey: string,
-    createdId: string,
+    created: MemoryEntry,
     scopeFilter?: string[],
-  ): Promise<void> {
-    const existingMeta = parseSmartMetadata(existing.metadata, existing);
-    const invalidatedMetadata = buildSmartMetadata(existing, {
-      fact_key: factKey,
-      invalidated_at: Date.now(),
-      superseded_by: createdId,
-      relations: appendRelation(existingMeta.relations, {
-        type: "superseded_by",
-        targetId: createdId,
-      }),
-    });
+  ): Promise<boolean> {
+    try {
+      const existingMeta = parseSmartMetadata(existing.metadata, existing);
+      const invalidatedMetadata = buildSmartMetadata(existing, {
+        fact_key: factKey,
+        invalidated_at: Date.now(),
+        superseded_by: created.id,
+        relations: appendRelation(existingMeta.relations, {
+          type: "superseded_by",
+          targetId: created.id,
+        }),
+      });
 
-    await this.store.update(
-      matchId,
-      { metadata: stringifySmartMetadata(invalidatedMetadata) },
-      scopeFilter,
+      const written = await this.store.update(
+        matchId,
+        { metadata: stringifySmartMetadata(invalidatedMetadata) },
+        scopeFilter,
+      );
+      if (written) {
+        return true;
+      }
+      await this.downgradeSupersedeToCreate(matchId, created, scopeFilter, "update wrote nothing");
+      return false;
+    } catch (err) {
+      await this.downgradeSupersedeToCreate(matchId, created, scopeFilter, String(err));
+      return false;
+    }
+  }
+
+  private async downgradeSupersedeToCreate(
+    matchId: string,
+    created: MemoryEntry,
+    scopeFilter: string[] | undefined,
+    cause: string,
+  ): Promise<void> {
+    this.log(
+      `memory-pro: smart-extractor: supersede invalidation failed for ${matchId.slice(0, 8)} (${cause}) — outcome downgraded to plain CREATE, old row remains active`,
     );
+    try {
+      const createdMeta = parseSmartMetadata(created.metadata, created);
+      delete (createdMeta as Record<string, unknown>).supersedes;
+      createdMeta.relations = (createdMeta.relations ?? []).filter(
+        (r) => !(r.type === "supersedes" && r.targetId === matchId),
+      );
+      await this.store.update(
+        created.id,
+        { metadata: stringifySmartMetadata(createdMeta) },
+        scopeFilter,
+      );
+    } catch (stripErr) {
+      this.log(
+        `memory-pro: smart-extractor: supersede-claim strip failed for ${created.id.slice(0, 8)}: ${String(stripErr)}`,
+      );
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -3322,7 +3410,7 @@ export class SmartExtractor {
     reason: string,
     contextLabel?: string,
     scopeFilter?: string[],
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
   ): Promise<"supported" | "target-missing"> {
     const existing = await this.store.getById(matchId, scopeFilter);
     if (!existing) {
@@ -3367,10 +3455,21 @@ export class SmartExtractor {
     targetScope: string,
     scopeFilter?: string[],
     contextLabel?: string,
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
     createEntries?: StoreEntry[],
     agentId?: string,
   ): Promise<void> {
+    // A vanished target downgrades to an ordinary create: never persist a
+    // relation to a row that no longer exists.
+    const targetExists = Boolean(await this.store.getById(matchId, scopeFilter));
+    if (!targetExists) {
+      this.log(
+        `memory-pro: smart-extractor: contextualize target ${matchId.slice(0, 8)} no longer exists — storing as ordinary create without a relation`,
+      );
+    }
+    const contextualizeRelations = targetExists
+      ? [{ type: "contextualizes", targetId: matchId }]
+      : [];
     const storeCategory = this.mapToStoreCategory(candidate.category);
     const metadata = stringifySmartMetadata(this.withAdmissionAudit({
       l0_abstract: candidate.abstract,
@@ -3389,13 +3488,13 @@ export class SmartExtractor {
       bad_recall_count: 0,
       suppressed_until_turn: 0,
       contexts: contextLabel ? [contextLabel] : [],
-      relations: [{ type: "contextualizes", targetId: matchId }],
+      relations: contextualizeRelations,
     }, admissionAudit));
 
     const entry_c: StoreEntry = this.externalVerdictEntry(candidate, {
       state: "confirmed",
       contexts: contextLabel ? [contextLabel] : [],
-      relations: [{ type: "contextualizes", targetId: matchId }],
+      relations: contextualizeRelations,
     }) ?? {
       text: candidate.abstract,
       vector,
@@ -3432,7 +3531,7 @@ export class SmartExtractor {
     targetScope: string,
     scopeFilter?: string[],
     contextLabel?: string,
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
     createEntries?: StoreEntry[],
     agentId?: string,
   ): Promise<void> {
@@ -3448,9 +3547,16 @@ export class SmartExtractor {
         { metadata: stringifySmartMetadata(meta) },
         scopeFilter,
       );
+    } else {
+      this.log(
+        `memory-pro: smart-extractor: contradict target ${matchId.slice(0, 8)} no longer exists — storing as ordinary create without a relation`,
+      );
     }
 
-    // 2. Store the contradicting entry as a new memory
+    // 2. Store the contradicting entry as a new memory. A vanished target
+    // downgrades to an ordinary create: never persist a relation to a row
+    // that no longer exists.
+    const contradictRelations = existing ? [{ type: "contradicts", targetId: matchId }] : [];
     const storeCategory = this.mapToStoreCategory(candidate.category);
     const metadata = stringifySmartMetadata(this.withAdmissionAudit({
       l0_abstract: candidate.abstract,
@@ -3469,13 +3575,13 @@ export class SmartExtractor {
       bad_recall_count: 0,
       suppressed_until_turn: 0,
       contexts: contextLabel ? [contextLabel] : [],
-      relations: [{ type: "contradicts", targetId: matchId }],
+      relations: contradictRelations,
     }, admissionAudit));
 
     const entry_d: StoreEntry = this.externalVerdictEntry(candidate, {
       state: "confirmed",
       contexts: contextLabel ? [contextLabel] : [],
-      relations: [{ type: "contradicts", targetId: matchId }],
+      relations: contradictRelations,
     }) ?? {
       text: candidate.abstract,
       vector,
@@ -3518,6 +3624,7 @@ export class SmartExtractor {
       build: (vector: number[]) => StoreEntry;
       prebuilt?: StoreEntry;
       audit?: AdmissionAuditRecord;
+      failOpen?: AdmissionFailOpenEvidence;
     }
   >();
 
@@ -3557,7 +3664,7 @@ export class SmartExtractor {
     vector: number[],
     sessionKey: string,
     targetScope: string,
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
   ): Omit<import("./store.js").MemoryEntry, "id" | "timestamp"> {
     const external = this.externalEntryBuilders.get(candidate);
     if (external) {
@@ -3618,7 +3725,7 @@ export class SmartExtractor {
     vector: number[],
     sessionKey: string,
     targetScope: string,
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
   ): Promise<void> {
     const entry = this.buildStoreEntry(candidate, vector, sessionKey, targetScope, admissionAudit);
     await this.store.store(entry);
@@ -3675,12 +3782,34 @@ export class SmartExtractor {
   /**
    * Embed admission audit record into metadata if audit persistence is enabled.
    */
+  private admissionWriteEvidenceFor(
+    candidate: CandidateMemory,
+    admission?: { audit?: AdmissionAuditRecord },
+  ): AdmissionWriteEvidence | undefined {
+    return admission?.audit ?? this.externalEntryBuilders.get(candidate)?.failOpen;
+  }
+
   private withAdmissionAudit<T extends Record<string, unknown>>(
     metadata: T,
-    admissionAudit?: AdmissionAuditRecord,
+    admissionAudit?: AdmissionWriteEvidence,
   ): T & { admission_control?: AdmissionAuditRecord } {
     if (!admissionAudit || !this.persistAdmissionAudit) {
       return metadata as T & { admission_control?: AdmissionAuditRecord };
+    }
+    if (isFailOpenEvidence(admissionAudit)) {
+      // A fail-open marker proves this mutation carried unevaluated content.
+      // Preserve whatever complete audit the target already has and append
+      // the marker as bypass evidence (append-only, capped to the newest).
+      const prior = Array.isArray((metadata as Record<string, unknown>).admission_bypass_events)
+        ? ((metadata as Record<string, unknown>).admission_bypass_events as unknown[])
+        : [];
+      const events = [...prior, { at: Date.now(), ...admissionAudit }].slice(
+        -MAX_ADMISSION_BYPASS_EVENTS,
+      );
+      return {
+        ...metadata,
+        admission_bypass_events: events,
+      } as T & { admission_control?: AdmissionAuditRecord };
     }
     return { ...metadata, admission_control: admissionAudit };
   }

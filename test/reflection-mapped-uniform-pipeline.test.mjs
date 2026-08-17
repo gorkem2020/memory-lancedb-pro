@@ -792,3 +792,177 @@ describe("reflection mapped rows: deferred sibling-verdict fail-open", () => {
     assert.equal(stats.created, 3, "the unresolvable verdict falls open to its own create");
   });
 });
+
+// Round-5 review regressions: supersede invalidation is isolated from the
+// already-committed replacement, and fail-open admission markers survive as
+// bypass evidence on MERGE/SUPPORT targets instead of vanishing.
+// Fixtures are entirely synthetic; no real conversation data.
+const PRODUCTION_FAIL_OPEN_MARKER = {
+  provenance: "memory-reflection-mapped",
+  failedOpen: true,
+  reason: "admission evaluation failed open",
+  error: "Error: gate outage",
+};
+
+function failOpenReflectionItem(text, opts = {}) {
+  const item = reflectionItem(text, opts);
+  const build = item.buildEntry;
+  item.buildEntry = (v) => {
+    const entry = build(v);
+    const meta = JSON.parse(entry.metadata);
+    meta.admission_audit = JSON.stringify(PRODUCTION_FAIL_OPEN_MARKER);
+    return { ...entry, metadata: JSON.stringify(meta) };
+  };
+  return item;
+}
+
+function auditedNeighborRow(id, text) {
+  const row = neighborRow(id, text);
+  const meta = JSON.parse(row.metadata);
+  meta.admission_control = PRODUCTION_MAPPED_AUDIT;
+  row.metadata = JSON.stringify(meta);
+  return row;
+}
+
+describe("reflection mapped rows: round-5 data-integrity regressions", () => {
+  it("isolates a throwing supersede invalidation: replacement stays, claim stripped, later invalidations run", async () => {
+    const store = makeStore({
+      neighbors: [
+        neighborRow("row-1", "The nightly export job writes into the archive bucket."),
+        neighborRow("row-2", "Weekly metrics roll up on Mondays before standup."),
+      ],
+    });
+    const baseUpdate = store.update.bind(store);
+    store.update = async (id, patch, scopeFilter) => {
+      if (id === "row-1" && patch?.metadata?.includes("superseded_by")) {
+        throw new Error("invalidate outage");
+      }
+      return baseUpdate(id, patch, scopeFilter);
+    };
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "supersede", match_index: 1, reason: "newer fact" },
+          { index: 2, decision: "supersede", match_index: 2, reason: "newer fact" },
+        ],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { stats, createdEntries } = await extractor.persistGatedCandidates(
+      [
+        reflectionItem("The nightly export job now writes into the cold-storage bucket instead.", { category: "preferences" }),
+        reflectionItem("Weekly metrics now roll up on Fridays after the retro instead.", { category: "entities" }),
+      ],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(stats.created, 2, "both replacements are committed");
+    assert.equal(createdEntries.length, 2, "the batch resolves instead of rejecting past the commit");
+    const oldRowMeta = JSON.parse(store.rows.get("row-1").metadata);
+    assert.equal(oldRowMeta.superseded_by, undefined, "the old row stays active after the failed invalidation");
+    const row2Invalidation = store.updates.find(
+      (u) => u.id === "row-2" && u.patch?.metadata?.includes("superseded_by"),
+    );
+    assert.ok(row2Invalidation, "the later invalidation still runs after the earlier one failed");
+    assert.equal(
+      store.updates.some((u) => u.id === "row-1" && u.patch?.metadata?.includes("superseded_by")),
+      false,
+      "the failed invalidation never lands on the old row",
+    );
+    const stripWrite = store.updates.find((u) => u.id === "new-3" && u.patch?.metadata);
+    assert.ok(stripWrite, "the downgrade rewrites the failed pair's replacement row");
+    const strippedMeta = JSON.parse(stripWrite.patch.metadata);
+    assert.equal(strippedMeta.supersedes, undefined, "the supersedes claim is stripped");
+    assert.equal(
+      (strippedMeta.relations ?? []).some((r) => r.type === "supersedes"),
+      false,
+      "the supersedes relation is stripped",
+    );
+  });
+
+  it("treats an invalidation update that writes nothing as a failure and downgrades to a plain create", async () => {
+    const store = makeStore({
+      neighbors: [neighborRow("row-1", "The canary check gates every rollout stage.")],
+    });
+    const baseUpdate = store.update.bind(store);
+    store.update = async (id, patch, scopeFilter) => {
+      if (id === "row-1" && patch?.metadata?.includes("superseded_by")) {
+        return null;
+      }
+      return baseUpdate(id, patch, scopeFilter);
+    };
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [{ index: 1, decision: "supersede", match_index: 1, reason: "newer fact" }],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { createdEntries } = await extractor.persistGatedCandidates(
+      [reflectionItem("The canary check now gates only the final rollout stage.", { category: "preferences" })],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(createdEntries.length, 1, "the replacement row stays committed");
+    const oldRowMeta = JSON.parse(store.rows.get("row-1").metadata);
+    assert.equal(oldRowMeta.superseded_by, undefined, "a nothing-written update must not count as invalidated");
+    const stripWrite = store.updates.find((u) => u.id === "new-2" && u.patch?.metadata);
+    assert.ok(stripWrite, "the outcome downgrades to a plain create");
+    assert.equal(JSON.parse(stripWrite.patch.metadata).supersedes, undefined, "the supersedes claim is stripped");
+  });
+
+  it("MERGE with a production fail-open marker preserves the target audit and appends bypass evidence", async () => {
+    const store = makeStore({
+      neighbors: [auditedNeighborRow("row-1", "Keep the sandbox image list inside the platform handbook.")],
+    });
+    const llm = makeLlm({
+      onDedupBatch: () => ({ results: [{ index: 1, decision: "merge", match_index: 1, reason: "adds detail" }] }),
+      onMergeBatch: () => ({ results: [{ index: 1, abstract: "merged abstract", overview: "o", content: "merged content" }] }),
+    });
+    const extractor = makeExtractor(store, llm, { admissionControl: { enabled: true } });
+
+    await extractor.persistGatedCandidates(
+      [failOpenReflectionItem("List every sandbox image in the platform handbook appendix as well.")],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    const targetWrite = store.updates.find((u) => u.id === "row-1" && u.patch?.metadata);
+    assert.ok(targetWrite, "the merge must update its target");
+    const meta = JSON.parse(targetWrite.patch.metadata);
+    assert.deepEqual(
+      meta.admission_control,
+      PRODUCTION_MAPPED_AUDIT,
+      "the target's complete audit must be preserved, never replaced by the marker",
+    );
+    assert.ok(Array.isArray(meta.admission_bypass_events), "bypass evidence must be recorded");
+    assert.equal(meta.admission_bypass_events.length, 1);
+    assert.equal(meta.admission_bypass_events[0].failedOpen, true);
+    assert.equal(meta.admission_bypass_events[0].provenance, "memory-reflection-mapped");
+    assert.equal(typeof meta.admission_bypass_events[0].at, "number");
+  });
+
+  it("SUPPORT with a production fail-open marker preserves the target audit and appends bypass evidence", async () => {
+    const store = makeStore({
+      neighbors: [auditedNeighborRow("row-1", "Run the schema linter before publishing any config change.")],
+    });
+    const llm = makeLlm({
+      onDedupBatch: () => ({ results: [{ index: 1, decision: "support", match_index: 1, reason: "same practice" }] }),
+    });
+    const extractor = makeExtractor(store, llm, { admissionControl: { enabled: true } });
+
+    const { stats } = await extractor.persistGatedCandidates(
+      [failOpenReflectionItem("Always run the schema linter ahead of publishing configuration changes.")],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(stats.skipped >= 1 || stats.merged >= 1 || stats.created === 0, true, "support resolves against the target");
+    const targetWrite = store.updates.find((u) => u.id === "row-1" && u.patch?.metadata);
+    assert.ok(targetWrite, "the support must update its target");
+    const meta = JSON.parse(targetWrite.patch.metadata);
+    assert.deepEqual(meta.admission_control, PRODUCTION_MAPPED_AUDIT, "the complete audit survives");
+    assert.equal(meta.admission_bypass_events?.length, 1, "the bypass marker is appended once");
+    assert.equal(meta.admission_bypass_events[0].failedOpen, true);
+    assert.ok(meta.support_info, "the support stats still update");
+  });
+});
