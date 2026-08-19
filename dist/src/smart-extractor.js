@@ -657,7 +657,7 @@ export class SmartExtractor {
         if (createEntries.length > 0) {
             const createdEntries = await this.bulkStoreAndValidate(createEntries);
             if (createdEntries) {
-                await this.applyPendingSupersedeInvalidations(createdEntries, pendingSupersedeInvalidations);
+                await this.applyPendingSupersedeInvalidations(createEntries, createdEntries, pendingSupersedeInvalidations, stats);
                 for (const created of createdEntries) {
                     await this.notifyPersisted({
                         text: created.text,
@@ -896,7 +896,7 @@ export class SmartExtractor {
             const stored = await this.bulkStoreAndValidate(createEntries);
             if (stored) {
                 createdEntries = stored;
-                await this.applyPendingSupersedeInvalidations(stored, pendingSupersedeInvalidations);
+                await this.applyPendingSupersedeInvalidations(createEntries, stored, pendingSupersedeInvalidations, stats);
             }
             else if (pendingSupersedeInvalidations.length > 0) {
                 this.log("memory-pro: smart-extractor: gated-candidate supersede invalidation skipped because bulkStore() did not return created entries");
@@ -1702,9 +1702,14 @@ export class SmartExtractor {
             case "supersede":
                 if (dedupResult.matchId &&
                     TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category)) {
-                    await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, this.admissionWriteEvidenceFor(candidate, admission), createEntries, pendingSupersedeInvalidations, agentId);
+                    const supersedeOutcome = await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, this.admissionWriteEvidenceFor(candidate, admission), createEntries, pendingSupersedeInvalidations, agentId);
                     stats.created++;
-                    stats.superseded = (stats.superseded ?? 0) + 1;
+                    // Deferred invalidations count only after they are CONFIRMED in
+                    // applyPendingSupersedeInvalidations; a failed/downgraded supersede
+                    // is a plain create and must not inflate the superseded stat.
+                    if (supersedeOutcome === "superseded") {
+                        stats.superseded = (stats.superseded ?? 0) + 1;
+                    }
                 }
                 else {
                     createEntries?.push(this.buildStoreEntry(candidate, vector, sessionKey, targetScope, this.admissionWriteEvidenceFor(candidate, admission)));
@@ -1743,9 +1748,11 @@ export class SmartExtractor {
                 if (dedupResult.matchId) {
                     if (TEMPORAL_VERSIONED_CATEGORIES.has(candidate.category) &&
                         dedupResult.contextLabel === "general") {
-                        await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, this.admissionWriteEvidenceFor(candidate, admission), createEntries, pendingSupersedeInvalidations, agentId);
+                        const contradictSupersede = await this.handleSupersede(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, this.admissionWriteEvidenceFor(candidate, admission), createEntries, pendingSupersedeInvalidations, agentId);
                         stats.created++;
-                        stats.superseded = (stats.superseded ?? 0) + 1;
+                        if (contradictSupersede === "superseded") {
+                            stats.superseded = (stats.superseded ?? 0) + 1;
+                        }
                     }
                     else {
                         await this.handleContradict(candidate, vector, dedupResult.matchId, sessionKey, targetScope, scopeFilter, dedupResult.contextLabel, this.admissionWriteEvidenceFor(candidate, admission), createEntries, agentId);
@@ -2023,7 +2030,7 @@ export class SmartExtractor {
             this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");
             return "llm-failed";
         }
-        const applied = await this.applyMergedContent(matchId, candidate.category, merged, targetScope, scopeFilter, [contextLabel], admissionAudit, agentId);
+        const applied = await this.applyMergedContent(matchId, candidate.category, merged, targetScope, scopeFilter, [contextLabel], [admissionAudit], agentId);
         if (applied === "target-missing") {
             createEntries?.push(await this.externalOrBuiltFallbackEntry(candidate, targetScope, "merge-fallback", undefined, admissionAudit));
             return "created";
@@ -2168,7 +2175,7 @@ export class SmartExtractor {
                 continue;
             }
             try {
-                const applied = await this.applyMergedContent(job.matchId, job.category, merged, job.targetScope, job.scopeFilter, job.additions.map((a) => a.contextLabel), job.additions[0]?.admissionAudit, job.agentId, mirrorSourceFor(job));
+                const applied = await this.applyMergedContent(job.matchId, job.category, merged, job.targetScope, job.scopeFilter, job.additions.map((a) => a.contextLabel), job.additions.map((a) => a.admissionAudit), job.agentId, mirrorSourceFor(job));
                 if (applied === "target-missing") {
                     failOpenAdditions(job, "target vanished");
                     continue;
@@ -2235,7 +2242,7 @@ export class SmartExtractor {
      * stats update once per merged-in candidate. Shared by the inline
      * single-call merge path and the batched merge writer.
      */
-    async applyMergedContent(matchId, category, merged, targetScope, scopeFilter, contextLabels, admissionAudit, agentId, mirrorSource = "smart-extraction") {
+    async applyMergedContent(matchId, category, merged, targetScope, scopeFilter, contextLabels, admissionEvidence, agentId, mirrorSource = "smart-extraction") {
         // Re-embed the merged content
         const mergedText = `${merged.abstract} ${merged.content}`;
         const newVector = await this.embedder.embed(mergedText);
@@ -2256,14 +2263,18 @@ export class SmartExtractor {
         // category views on a cross-category merge.
         const existingMeta = parseSmartMetadata(existing.metadata, existing);
         const targetCategory = existingMeta.memory_category || category;
-        const metadata = stringifySmartMetadata(this.withAdmissionAudit(buildSmartMetadata(existing, {
+        // A grouped merge folds N additions into one write: the first addition
+        // keeps the historical single-evidence semantics, and every later
+        // addition's audit/fail-open evidence is appended to the capped
+        // append-only field so no row's admission provenance is dropped.
+        const metadata = stringifySmartMetadata(this.appendAdditionalAdmissionEvidence(this.withAdmissionAudit(buildSmartMetadata(existing, {
             l0_abstract: merged.abstract,
             l1_overview: merged.overview,
             l2_content: merged.content,
             memory_category: targetCategory,
             tier: "working",
             confidence: 0.8,
-        }), admissionAudit));
+        }), admissionEvidence?.[0]), admissionEvidence?.slice(1) ?? []));
         const updated = await this.store.update(matchId, {
             text: merged.abstract,
             vector: newVector,
@@ -2306,7 +2317,7 @@ export class SmartExtractor {
         const existing = await this.store.getById(matchId, scopeFilter);
         if (!existing) {
             createEntries?.push(await this.externalOrBuiltFallbackEntry(candidate, targetScope, sessionKey, vector, admissionAudit));
-            return;
+            return "create-only";
         }
         const now = Date.now();
         const existingMeta = parseSmartMetadata(existing.metadata, existing);
@@ -2361,29 +2372,52 @@ export class SmartExtractor {
             createEntries.push(entry);
             pendingSupersedeInvalidations.push({
                 entryIndex,
+                entry,
                 matchId,
                 existing,
                 factKey,
                 scopeFilter,
             });
-            return;
+            return "deferred";
         }
         const created = await this.store.store(entry);
         const invalidated = await this.invalidateSupersededMemory(matchId, existing, factKey, created, scopeFilter);
         await this.notifyPersisted({ text: created.text, category: created.category, scope: created.scope, timestamp: created.timestamp }, "smart-extraction", agentId);
         if (invalidated) {
             this.log(`memory-pro: smart-extractor: superseded [${candidate.category}] ${matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`);
+            return "superseded";
         }
+        return "create-only";
     }
-    async applyPendingSupersedeInvalidations(createdEntries, pendingSupersedeInvalidations) {
+    async applyPendingSupersedeInvalidations(queuedEntries, createdEntries, pendingSupersedeInvalidations, stats) {
+        const claimedIds = new Set();
+        const resolveCreated = (pending) => {
+            if (createdEntries.length === queuedEntries.length) {
+                return createdEntries[pending.entryIndex];
+            }
+            // bulkStore accepted fewer entries than were queued, so positions have
+            // shifted: bind by stable entry identity (the same fallback the
+            // sibling-verdict resolver uses) and never invalidate unless the exact
+            // replacement row is found — a positional read here could point the
+            // old row's superseded_by at an unrelated create.
+            const want = pending.entry;
+            return createdEntries.find((e) => e.text === want.text &&
+                e.category === want.category &&
+                laneFromMetadata(e.metadata) === laneFromMetadata(want.metadata) &&
+                !claimedIds.has(e.id));
+        };
         for (const pending of pendingSupersedeInvalidations) {
-            const created = createdEntries[pending.entryIndex];
+            const created = resolveCreated(pending);
             if (!created) {
-                this.log(`memory-pro: smart-extractor: supersede invalidation skipped for ${pending.matchId.slice(0, 8)} because batch create returned no matching entry`);
+                this.log(`memory-pro: smart-extractor: supersede invalidation skipped for ${pending.matchId.slice(0, 8)} because batch create returned no matching replacement entry`);
                 continue;
             }
+            claimedIds.add(created.id);
             const invalidated = await this.invalidateSupersededMemory(pending.matchId, pending.existing, pending.factKey, created, pending.scopeFilter);
             if (invalidated) {
+                if (stats) {
+                    stats.superseded = (stats.superseded ?? 0) + 1;
+                }
                 this.log(`memory-pro: smart-extractor: superseded ${pending.matchId.slice(0, 8)} -> ${created.id.slice(0, 8)}`);
             }
         }
@@ -2422,15 +2456,24 @@ export class SmartExtractor {
         }
     }
     async downgradeSupersedeToCreate(matchId, created, scopeFilter, cause) {
-        this.log(`memory-pro: smart-extractor: supersede invalidation failed for ${matchId.slice(0, 8)} (${cause}) — outcome downgraded to plain CREATE, old row remains active`);
+        let stripped = false;
         try {
             const createdMeta = parseSmartMetadata(created.metadata, created);
             delete createdMeta.supersedes;
             createdMeta.relations = (createdMeta.relations ?? []).filter((r) => !(r.type === "supersedes" && r.targetId === matchId));
-            await this.store.update(created.id, { metadata: stringifySmartMetadata(createdMeta) }, scopeFilter);
+            stripped = Boolean(await this.store.update(created.id, { metadata: stringifySmartMetadata(createdMeta) }, scopeFilter));
         }
         catch (stripErr) {
             this.log(`memory-pro: smart-extractor: supersede-claim strip failed for ${created.id.slice(0, 8)}: ${String(stripErr)}`);
+        }
+        if (stripped) {
+            this.log(`memory-pro: smart-extractor: supersede invalidation failed for ${matchId.slice(0, 8)} (${cause}) — outcome downgraded to plain CREATE, old row remains active`);
+        }
+        else {
+            // The downgrade itself could not be confirmed: the old row is still
+            // active AND the replacement still carries a durable supersedes claim.
+            // Surface the unresolved repair state instead of a success-style log.
+            this.log(`memory-pro: smart-extractor: UNRESOLVED supersede repair for ${matchId.slice(0, 8)} (${cause}) — old row remains active and replacement ${created.id.slice(0, 8)} still carries its supersedes claim (strip unconfirmed)`);
         }
     }
     // --------------------------------------------------------------------------
@@ -2463,10 +2506,18 @@ export class SmartExtractor {
      */
     async handleContextualize(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries, agentId) {
         // A vanished target downgrades to an ordinary create: never persist a
-        // relation to a row that no longer exists.
-        const targetExists = Boolean(await this.store.getById(matchId, scopeFilter));
-        if (!targetExists) {
-            this.log(`memory-pro: smart-extractor: contextualize target ${matchId.slice(0, 8)} no longer exists — storing as ordinary create without a relation`);
+        // relation to a row that no longer exists. A THROWING read gets the same
+        // treatment — dropping an admitted candidate over a transient store
+        // failure would silently lose it.
+        let targetExists = false;
+        try {
+            targetExists = Boolean(await this.store.getById(matchId, scopeFilter));
+            if (!targetExists) {
+                this.log(`memory-pro: smart-extractor: contextualize target ${matchId.slice(0, 8)} no longer exists — storing as ordinary create without a relation`);
+            }
+        }
+        catch (readErr) {
+            this.log(`memory-pro: smart-extractor: contextualize target read failed for ${matchId.slice(0, 8)} (${String(readErr)}) — storing as ordinary create without a relation`);
         }
         const contextualizeRelations = targetExists
             ? [{ type: "contextualizes", targetId: matchId }]
@@ -2517,22 +2568,35 @@ export class SmartExtractor {
      * on the original memory's support stats.
      */
     async handleContradict(candidate, vector, matchId, sessionKey, targetScope, scopeFilter, contextLabel, admissionAudit, createEntries, agentId) {
-        // 1. Record contradiction on the existing memory
-        const existing = await this.store.getById(matchId, scopeFilter);
-        if (existing) {
-            const meta = parseSmartMetadata(existing.metadata, existing);
-            const supportInfo = parseSupportInfo(meta.support_info);
-            const updated = updateSupportStats(supportInfo, contextLabel, "contradict");
-            meta.support_info = updated;
-            await this.store.update(matchId, { metadata: stringifySmartMetadata(meta) }, scopeFilter);
+        // 1. Record contradiction on the existing memory. The relation below is
+        // persisted only when this evidence write CONFIRMS the target still
+        // exists — a read/update that throws or reports nothing written means
+        // the target is gone (or unprovable), and a relation to it would dangle.
+        let targetLinked = false;
+        try {
+            const existing = await this.store.getById(matchId, scopeFilter);
+            if (existing) {
+                const meta = parseSmartMetadata(existing.metadata, existing);
+                const supportInfo = parseSupportInfo(meta.support_info);
+                const updated = updateSupportStats(supportInfo, contextLabel, "contradict");
+                meta.support_info = updated;
+                const written = await this.store.update(matchId, { metadata: stringifySmartMetadata(meta) }, scopeFilter);
+                if (written) {
+                    targetLinked = true;
+                }
+                else {
+                    this.log(`memory-pro: smart-extractor: contradict target ${matchId.slice(0, 8)} vanished during update — storing as ordinary create without a relation`);
+                }
+            }
+            else {
+                this.log(`memory-pro: smart-extractor: contradict target ${matchId.slice(0, 8)} no longer exists — storing as ordinary create without a relation`);
+            }
         }
-        else {
-            this.log(`memory-pro: smart-extractor: contradict target ${matchId.slice(0, 8)} no longer exists — storing as ordinary create without a relation`);
+        catch (evidenceErr) {
+            this.log(`memory-pro: smart-extractor: contradict target read/update failed for ${matchId.slice(0, 8)} (${String(evidenceErr)}) — storing as ordinary create without a relation`);
         }
-        // 2. Store the contradicting entry as a new memory. A vanished target
-        // downgrades to an ordinary create: never persist a relation to a row
-        // that no longer exists.
-        const contradictRelations = existing ? [{ type: "contradicts", targetId: matchId }] : [];
+        // 2. Store the contradicting entry as a new memory.
+        const contradictRelations = targetLinked ? [{ type: "contradicts", targetId: matchId }] : [];
         const storeCategory = this.mapToStoreCategory(candidate.category);
         const metadata = stringifySmartMetadata(this.withAdmissionAudit({
             l0_abstract: candidate.abstract,
@@ -2730,6 +2794,24 @@ export class SmartExtractor {
             };
         }
         return { ...metadata, admission_control: admissionAudit };
+    }
+    /**
+     * Append every provided evidence record (full audits and fail-open markers
+     * alike) to the capped append-only bypass field. Used for grouped merges,
+     * where additions beyond the first would otherwise lose their admission
+     * provenance entirely.
+     */
+    appendAdditionalAdmissionEvidence(metadata, evidence) {
+        const additional = evidence.filter((e) => Boolean(e));
+        if (additional.length === 0 || !this.persistAdmissionAudit) {
+            return metadata;
+        }
+        const prior = Array.isArray(metadata.admission_bypass_events)
+            ? metadata.admission_bypass_events
+            : [];
+        const now = Date.now();
+        const events = [...prior, ...additional.map((e) => ({ at: now, ...e }))].slice(-MAX_ADMISSION_BYPASS_EVENTS);
+        return { ...metadata, admission_bypass_events: events };
     }
     /**
      * Record a rejected admission to the durable audit log.

@@ -966,3 +966,237 @@ describe("reflection mapped rows: round-5 data-integrity regressions", () => {
     assert.ok(meta.support_info, "the support stats still update");
   });
 });
+
+// Round-6 review regressions: failure-path integrity — identity-stable
+// deferred invalidation under bulkStore filtering, complete evidence on
+// grouped merges, guarded contextualize/contradict fallbacks, confirmed-only
+// downgrade and statistics. Fixtures are entirely synthetic.
+describe("reflection mapped rows: round-6 failure-path integrity", () => {
+  it("binds a deferred supersede invalidation by entry identity when bulkStore filters an earlier row", async () => {
+    const store = makeStore({
+      neighbors: [neighborRow("row-1", "The staging balancer drains connections before each maintenance window.")],
+    });
+    const filteredText = "Rotate the artifact signing key at the start of every quarter.";
+    const baseBulkStore = store.bulkStore.bind(store);
+    store.bulkStore = async (entries) => {
+      const accepted = entries.filter((e) => e.text !== filteredText);
+      store.bulkStored.push(...entries);
+      const stored = accepted.map((e, i) => ({ ...e, id: `new-${i + 2}`, timestamp: 1_700_000_500_000 }));
+      for (const s of stored) store.rows.set(s.id, s);
+      return stored;
+    };
+    void baseBulkStore;
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "create", reason: "novel" },
+          { index: 2, decision: "supersede", match_index: 1, reason: "newer fact" },
+          { index: 3, decision: "create", reason: "novel" },
+        ],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { stats } = await extractor.persistGatedCandidates(
+      [
+        reflectionItem(filteredText),
+        reflectionItem("The staging balancer now drains connections only during the overnight window.", { category: "preferences" }),
+        reflectionItem("Publish the deprecation calendar to the shared operations wiki."),
+      ],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    const invalidation = store.updates.find(
+      (u) => u.id === "row-1" && u.patch?.metadata?.includes("superseded_by"),
+    );
+    assert.ok(invalidation, "the surviving replacement still invalidates its target");
+    const oldMeta = JSON.parse(invalidation.patch.metadata);
+    assert.equal(
+      oldMeta.superseded_by,
+      "new-2",
+      "superseded_by must point at the actual replacement, not the row that shifted into its position",
+    );
+    assert.notEqual(oldMeta.superseded_by, "new-3", "an unrelated create must never claim the supersede");
+    assert.equal(stats.superseded, 1);
+  });
+
+  it("skips a deferred invalidation entirely when bulkStore filtered the replacement itself", async () => {
+    const store = makeStore({
+      neighbors: [neighborRow("row-1", "Cache warmers replay the top queries after every deploy completes.")],
+    });
+    const filteredText = "Cache warmers now replay only the checkout queries after deploys.";
+    store.bulkStore = async (entries) => {
+      const accepted = entries.filter((e) => e.text !== filteredText);
+      store.bulkStored.push(...entries);
+      const stored = accepted.map((e, i) => ({ ...e, id: `new-${i + 2}`, timestamp: 1_700_000_500_000 }));
+      for (const s of stored) store.rows.set(s.id, s);
+      return stored;
+    };
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "supersede", match_index: 1, reason: "newer fact" },
+          { index: 2, decision: "create", reason: "novel" },
+        ],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { stats } = await extractor.persistGatedCandidates(
+      [
+        reflectionItem(filteredText, { category: "preferences" }),
+        reflectionItem("Route the weekly digest through the notifications relay instead of direct send."),
+      ],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(
+      store.updates.some((u) => u.id === "row-1" && u.patch?.metadata?.includes("superseded_by")),
+      false,
+      "no replacement row exists, so the old row must stay untouched",
+    );
+    assert.equal(stats.superseded ?? 0, 0, "an unconfirmed supersede must not be counted");
+  });
+
+  it("aggregates every merge addition's fail-open evidence, not only the first addition's", async () => {
+    const store = makeStore({
+      neighbors: [auditedNeighborRow("row-1", "Keep the incident timeline template pinned in the response channel.")],
+    });
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "merge", match_index: 1, reason: "adds detail" },
+          { index: 2, decision: "merge", match_index: 1, reason: "adds detail" },
+        ],
+      }),
+      onMergeBatch: () => ({
+        results: [{ index: 1, abstract: "merged abstract", overview: "o", content: "merged content" }],
+      }),
+    });
+    const extractor = makeExtractor(store, llm, { admissionControl: { enabled: true } });
+
+    await extractor.persistGatedCandidates(
+      [
+        reflectionItem("Pin the incident timeline template near the top of the response channel."),
+        failOpenReflectionItem("Link the incident timeline template from the escalation runbook too."),
+      ],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    const targetWrite = store.updates.find((u) => u.id === "row-1" && u.patch?.metadata?.includes("l0_abstract"));
+    assert.ok(targetWrite, "the grouped merge must update its target");
+    const meta = JSON.parse(targetWrite.patch.metadata);
+    assert.deepEqual(meta.admission_control, PRODUCTION_MAPPED_AUDIT, "the target's complete audit survives");
+    assert.ok(Array.isArray(meta.admission_bypass_events), "the second addition's marker must be recorded");
+    assert.equal(meta.admission_bypass_events.length, 1);
+    assert.equal(meta.admission_bypass_events[0].failedOpen, true, "the fail-open marker from the non-first addition survives");
+  });
+
+  it("falls back to an unlinked create when the contextualize target read throws", async () => {
+    const logs = [];
+    const store = makeStore({
+      neighbors: [neighborRow("row-1", "Pre-warm the reporting cluster ahead of the month-end close.")],
+    });
+    store.getById = async (id) => {
+      if (id === "row-1") throw new Error("read outage");
+      return store.rows.get(id) ?? null;
+    };
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [{ index: 1, decision: "contextualize", match_index: 1, reason: "adds nuance" }],
+      }),
+    });
+    const extractor = makeExtractor(store, llm, { log: (m) => logs.push(m) });
+
+    const { createdEntries } = await extractor.persistGatedCandidates(
+      [reflectionItem("Pre-warming matters most when the close lands right after a long weekend.")],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(createdEntries.length, 1, "the admitted candidate must still land");
+    assert.ok(
+      logs.some((m) => m.includes("contextualize target read failed")),
+      "the read failure resolves through the guarded contextualize fallback, not the generic processing-failure catch",
+    );
+    const meta = JSON.parse(store.bulkStored[0].metadata);
+    assert.equal(
+      (meta.relations ?? []).some((r) => r.type === "contextualizes"),
+      false,
+      "no relation may point at an unreadable target",
+    );
+  });
+
+  it("stores a contradict candidate without a relation when the evidence update writes nothing", async () => {
+    const logs = [];
+    const store = makeStore({
+      neighbors: [neighborRow("row-1", "Roll access reviews on the first business day of each month.")],
+    });
+    const baseUpdate = store.update.bind(store);
+    store.update = async (id, patch, scopeFilter) => {
+      if (id === "row-1") return null;
+      return baseUpdate(id, patch, scopeFilter);
+    };
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [{ index: 1, decision: "contradict", match_index: 1, reason: "opposite practice" }],
+      }),
+    });
+    const extractor = makeExtractor(store, llm, { log: (m) => logs.push(m) });
+
+    const { createdEntries } = await extractor.persistGatedCandidates(
+      [reflectionItem("Access reviews actually roll on the last business day of each month.")],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(createdEntries.length, 1, "the contradicting row still lands");
+    const meta = JSON.parse(store.bulkStored[0].metadata);
+    assert.equal(
+      (meta.relations ?? []).some((r) => r.type === "contradicts"),
+      false,
+      "a nothing-written evidence update must not leave a dangling contradicts relation",
+    );
+    assert.ok(
+      logs.some((m) => m.includes("vanished during update")),
+      "the null update is surfaced as a vanished target",
+    );
+  });
+
+  it("surfaces an unresolved repair when the downgrade strip also writes nothing, and counts only confirmed supersedes", async () => {
+    const logs = [];
+    const store = makeStore({
+      neighbors: [
+        neighborRow("row-1", "Mirror the build artifacts into the secondary region nightly."),
+        neighborRow("row-2", "Contract tests run against the recorded provider snapshots."),
+      ],
+    });
+    const baseUpdate = store.update.bind(store);
+    store.update = async (id, patch, scopeFilter) => {
+      if (id === "row-1" && patch?.metadata?.includes("superseded_by")) return null;
+      if (id === "new-3" ) return null;
+      return baseUpdate(id, patch, scopeFilter);
+    };
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "supersede", match_index: 1, reason: "newer fact" },
+          { index: 2, decision: "supersede", match_index: 2, reason: "newer fact" },
+        ],
+      }),
+    });
+    const extractor = makeExtractor(store, llm, { log: (m) => logs.push(m) });
+
+    const { stats } = await extractor.persistGatedCandidates(
+      [
+        reflectionItem("Build artifacts now mirror into the secondary region twice a day.", { category: "preferences" }),
+        reflectionItem("Contract tests now run against live provider sandboxes instead.", { category: "entities" }),
+      ],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.ok(
+      logs.some((m) => m.includes("UNRESOLVED supersede repair")),
+      "an unconfirmed strip must surface the unresolved repair state, never a success-style downgrade log",
+    );
+    assert.equal(stats.superseded, 1, "only the confirmed invalidation is counted");
+  });
+});
