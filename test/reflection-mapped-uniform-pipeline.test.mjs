@@ -1200,3 +1200,100 @@ describe("reflection mapped rows: round-6 failure-path integrity", () => {
     assert.equal(stats.superseded, 1, "only the confirmed invalidation is counted");
   });
 });
+
+// Round-7 review regressions: a partial bulkStore result must not break
+// anchor sharing between deferred verdicts, and the bypass history stays
+// exclusive to fail-open markers so pass audits can never evict them.
+// Fixtures are entirely synthetic; no real conversation data.
+describe("reflection mapped rows: round-7 partial-batch and evidence-history integrity", () => {
+  it("lets multiple deferred verdicts share one surviving anchor after bulkStore filters an unrelated row", async () => {
+    const filtered = reflectionItem("Digest emails render with the compact template from now on.", { category: "preferences" });
+    const anchor = reflectionItem("Rotate the standby database credentials during the monthly window.");
+    const firstSupport = reflectionItem("Standby database credentials rotate in the monthly window.");
+    const secondSupport = reflectionItem("Credential rotation for the standby database happens monthly.");
+    // Geometry: the filtered row is orthogonal to the cluster; both support
+    // rows score the anchor as their top sibling with comfortable margins.
+    filtered.vector = [0, 1, 0, 0];
+    anchor.vector = [1, 0, 0, 0];
+    firstSupport.vector = [0.98, 0.19899749, 0, 0];
+    secondSupport.vector = [0.9995, 0.0316186, 0, 0];
+
+    // bulkStore filters the unrelated row, shortening the result so the
+    // anchor resolves through the identity fallback for BOTH verdicts.
+    const store = makeStore({ neighbors: [] });
+    const baseBulkStore = store.bulkStore.bind(store);
+    let firstBulk = true;
+    store.bulkStore = async (entries) => {
+      if (!firstBulk) {
+        return baseBulkStore(entries);
+      }
+      firstBulk = false;
+      store.bulkStored.push(...entries);
+      const kept = entries.filter((e) => !String(e.metadata).includes('"memory_category":"preferences"'));
+      const stored = kept.map((e, i) => ({ ...e, id: `new-${store.rows.size + i + 1}`, timestamp: 1_700_000_500_000 }));
+      for (const s of stored) store.rows.set(s.id, s);
+      return stored;
+    };
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "support", match_index: 1, reason: "same practice restated" },
+          { index: 2, decision: "support", match_index: 1, reason: "same practice restated" },
+        ],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { stats } = await extractor.persistGatedCandidates(
+      [filtered, anchor, firstSupport, secondSupport],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(stats.supported ?? 0, 2, "both verdicts must resolve through the shared surviving anchor");
+    assert.equal(stats.created, 2, "no duplicate fail-open create may land beside the anchor");
+    assert.equal(store.bulkStored.length, 2, "only the two create rows are ever enqueued");
+    const supportWrites = store.updates.filter((u) => u.patch && !u.patch.text);
+    assert.equal(supportWrites.length, 2, "both support writes must land");
+    assert.ok(supportWrites.every((u) => u.id === "new-1"), "both supports bind to the same surviving anchor row");
+  });
+
+  it("keeps the bypass history exclusive to fail-open markers and routes complete audits to admission_control_history", async () => {
+    const store = makeStore({
+      neighbors: [auditedNeighborRow("row-1", "Keep the retro action list pinned to the team wiki page.")],
+    });
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "merge", match_index: 1, reason: "adds detail" },
+          { index: 2, decision: "merge", match_index: 1, reason: "adds detail" },
+          { index: 3, decision: "merge", match_index: 1, reason: "adds detail" },
+        ],
+      }),
+      onMergeBatch: () => ({
+        results: [{ index: 1, abstract: "merged abstract", overview: "o", content: "merged content" }],
+      }),
+    });
+    const extractor = makeExtractor(store, llm, { admissionControl: { enabled: true } });
+
+    await extractor.persistGatedCandidates(
+      [
+        reflectionItem("Pin the retro action list at the top of the team wiki."),
+        auditedReflectionItem("Retro action items belong on the pinned wiki list as well."),
+        failOpenReflectionItem("Link the retro action list from the sprint board too."),
+      ],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    const targetWrite = store.updates.find((u) => u.id === "row-1" && u.patch?.metadata?.includes("l0_abstract"));
+    assert.ok(targetWrite, "the grouped merge must update its target");
+    const meta = JSON.parse(targetWrite.patch.metadata);
+    assert.deepEqual(meta.admission_control, PRODUCTION_MAPPED_AUDIT, "the target's own complete audit survives untouched");
+    assert.equal(meta.admission_bypass_events?.length ?? 0, 1, "only the fail-open marker may occupy the bypass history");
+    assert.equal(meta.admission_bypass_events[0].failedOpen, true, "the bypass record is the fail-open marker");
+    assert.equal(meta.admission_control_history?.length ?? 0, 1, "the additional complete audit lands in its own history");
+    assert.equal(meta.admission_control_history[0].version, "amac-v1");
+    assert.equal(meta.admission_control_history[0].decision, "pass_to_dedup");
+    assert.equal(typeof meta.admission_control_history[0].at, "number");
+    assert.equal(meta.admission_control_history[0].failedOpen, undefined, "no fail-open marker may leak into the audit history");
+  });
+});

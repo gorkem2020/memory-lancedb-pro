@@ -96,6 +96,7 @@ type AdmissionFailOpenEvidence = {
 type AdmissionWriteEvidence = AdmissionAuditRecord | AdmissionFailOpenEvidence;
 
 const MAX_ADMISSION_BYPASS_EVENTS = 20;
+const MAX_ADMISSION_CONTROL_HISTORY = 20;
 
 function isFailOpenEvidence(
   value: AdmissionWriteEvidence,
@@ -1296,36 +1297,46 @@ export class SmartExtractor {
     // cannot be resolved keeps the caller's row (fail open to create).
     if (pendingSiblingVerdicts.length > 0) {
       const claimedIds = new Set<string>();
+      const resolvedIdBySurviving = new Map<number, string | undefined>();
       const storedIdForSurviving = (survivingIndex: number): string | undefined => {
-        const slot = createSlotBySurviving.get(survivingIndex);
-        if (slot === undefined) {
-          return undefined;
+        // Verdicts may share one surviving anchor: the first resolution is
+        // cached per index so every later verdict reuses the same row.
+        // claimedIds only keeps DISTINCT surviving entries apart in the
+        // filtered-result fallback — it must never exclude the row an index
+        // already resolved.
+        if (resolvedIdBySurviving.has(survivingIndex)) {
+          return resolvedIdBySurviving.get(survivingIndex);
         }
-        if (createdEntries.length === createEntries.length) {
-          const id = createdEntries[slot]?.id;
-          if (id) {
-            claimedIds.add(id);
+        const resolve = (): string | undefined => {
+          const slot = createSlotBySurviving.get(survivingIndex);
+          if (slot === undefined) {
+            return undefined;
           }
-          return id;
+          if (createdEntries.length === createEntries.length) {
+            return createdEntries[slot]?.id;
+          }
+          // bulkStore may filter entries, shifting positions: fall back to the
+          // first unclaimed row with the same text AND the same lane/category
+          // identity — identical text is legal across lanes, so a text-only
+          // match could bind the verdict to another lane's row.
+          const want = createEntries[slot];
+          const hit = want
+            ? createdEntries.find(
+                (e) =>
+                  e.text === want.text &&
+                  e.category === want.category &&
+                  laneFromMetadata(e.metadata) === laneFromMetadata(want.metadata) &&
+                  !claimedIds.has(e.id),
+              )
+            : undefined;
+          return hit?.id;
+        };
+        const id = resolve();
+        if (id) {
+          claimedIds.add(id);
         }
-        // bulkStore may filter entries, shifting positions: fall back to the
-        // first unclaimed row with the same text AND the same lane/category
-        // identity — identical text is legal across lanes, so a text-only
-        // match could bind the verdict to another lane's row.
-        const want = createEntries[slot];
-        const hit = want
-          ? createdEntries.find(
-              (e) =>
-                e.text === want.text &&
-                e.category === want.category &&
-                laneFromMetadata(e.metadata) === laneFromMetadata(want.metadata) &&
-                !claimedIds.has(e.id),
-            )
-          : undefined;
-        if (hit) {
-          claimedIds.add(hit.id);
-        }
-        return hit?.id;
+        resolvedIdBySurviving.set(survivingIndex, id);
+        return id;
       };
       const followupMerges: PendingMergeJob[] = [];
       const followupCreates: StoreEntry[] = [];
@@ -2661,7 +2672,7 @@ export class SmartExtractor {
       decision,
       reason: data.reason ?? "",
       matchId: ["merge", "support", "contextualize", "contradict", "supersede"].includes(decision) ? matchEntry?.entry.id : undefined,
-      contextLabel: typeof (data as any).context_label === "string" ? (data as any).context_label : undefined,
+      contextLabel: typeof data.context_label === "string" ? data.context_label : undefined,
     };
   }
 
@@ -3901,10 +3912,13 @@ export class SmartExtractor {
   }
 
   /**
-   * Append every provided evidence record (full audits and fail-open markers
-   * alike) to the capped append-only bypass field. Used for grouped merges,
-   * where additions beyond the first would otherwise lose their admission
-   * provenance entirely.
+   * Append every non-first addition's evidence from a grouped mutation to a
+   * capped append-only history, so no addition loses its admission
+   * provenance. The two evidence kinds stay in separate fields:
+   * admission_bypass_events remains exclusive to fail-open markers
+   * (unevaluated content), while complete audits append to
+   * admission_control_history — a pass audit must never consume the bypass
+   * cap and evict genuine fail-open evidence.
    */
   private appendAdditionalAdmissionEvidence<T extends Record<string, unknown>>(
     metadata: T,
@@ -3914,14 +3928,26 @@ export class SmartExtractor {
     if (additional.length === 0 || !this.persistAdmissionAudit) {
       return metadata;
     }
-    const prior = Array.isArray((metadata as Record<string, unknown>).admission_bypass_events)
-      ? ((metadata as Record<string, unknown>).admission_bypass_events as unknown[])
-      : [];
     const now = Date.now();
-    const events = [...prior, ...additional.map((e) => ({ at: now, ...e }))].slice(
-      -MAX_ADMISSION_BYPASS_EVENTS,
-    );
-    return { ...metadata, admission_bypass_events: events };
+    const priorOf = (field: string): unknown[] =>
+      Array.isArray((metadata as Record<string, unknown>)[field])
+        ? ((metadata as Record<string, unknown>)[field] as unknown[])
+        : [];
+    const stamped = (records: AdmissionWriteEvidence[]) => records.map((e) => ({ at: now, ...e }));
+    const bypassMarkers = additional.filter((e) => isFailOpenEvidence(e));
+    const completeAudits = additional.filter((e) => !isFailOpenEvidence(e));
+    const next: Record<string, unknown> = { ...metadata };
+    if (bypassMarkers.length > 0) {
+      next.admission_bypass_events = [...priorOf("admission_bypass_events"), ...stamped(bypassMarkers)].slice(
+        -MAX_ADMISSION_BYPASS_EVENTS,
+      );
+    }
+    if (completeAudits.length > 0) {
+      next.admission_control_history = [...priorOf("admission_control_history"), ...stamped(completeAudits)].slice(
+        -MAX_ADMISSION_CONTROL_HISTORY,
+      );
+    }
+    return next as T;
   }
 
   /**
