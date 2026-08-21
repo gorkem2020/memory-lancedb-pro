@@ -812,11 +812,14 @@ export class SmartExtractor {
             const siblings = burstSiblingsFor(i);
             try {
                 const prefilter = await this.dedupPrefilter(candidate, vector, scopeFilter);
-                const emptyStoreShortCircuit = prefilter.shortCircuit?.reason === NO_SIMILAR_MEMORIES_REASON;
-                if (prefilter.shortCircuit && !(siblings.length > 0 && emptyStoreShortCircuit)) {
-                    // Domain short-circuits (e.g. the preference-slot guard) stay
-                    // authoritative even when burst siblings exist; only the plain
-                    // "nothing similar stored yet" bypass yields to sibling context.
+                const yieldsToSiblings = prefilter.shortCircuit?.decision === "create" && siblings.length > 0;
+                if (prefilter.shortCircuit && !yieldsToSiblings) {
+                    // A create-decision short-circuit is authoritative about STORED
+                    // rows only (nothing similar stored yet, or the preference guard
+                    // ruled every stored row a different item slot) — it says nothing
+                    // about burst siblings, so eligible siblings still get
+                    // adjudicated, alone: the short circuit carries no stored rows.
+                    // Non-create short-circuits resolve the candidate and stand.
                     precomputedDedups.set(i, prefilter.shortCircuit);
                 }
                 else {
@@ -841,6 +844,12 @@ export class SmartExtractor {
         const pendingMerges = [];
         const pendingSiblingVerdicts = [];
         const createSlotBySurviving = new Map();
+        // Durable-anchor bookkeeping for deferred verdict chains: a survivor
+        // that itself merged/supported/skipped into an earlier sibling anchors
+        // at that sibling (chased transitively at resolution time), and one
+        // whose verdict targeted an existing stored row anchors at that row.
+        const anchorSiblingBySurviving = new Map();
+        const anchorStoredIdBySurviving = new Map();
         for (let i = 0; i < surviving.length; i++) {
             const { candidate, vector } = surviving[i];
             const pre = precomputedDedups.get(i);
@@ -848,11 +857,13 @@ export class SmartExtractor {
                 const siblingIndex = Number(pre.matchId.slice(BURST_SIBLING_PREFIX.length));
                 const resolvable = Number.isInteger(siblingIndex) && siblingIndex >= 0 && siblingIndex < i;
                 if (pre.decision === "skip" && resolvable) {
+                    anchorSiblingBySurviving.set(i, siblingIndex);
                     stats.skipped++;
                     this.log(`memory-pro: smart-extractor: gated candidate judged same-burst duplicate of an earlier sibling [${candidate.category}]`);
                     continue;
                 }
                 if ((pre.decision === "merge" || pre.decision === "support") && resolvable) {
+                    anchorSiblingBySurviving.set(i, siblingIndex);
                     pendingSiblingVerdicts.push({
                         candidate,
                         vector,
@@ -869,6 +880,11 @@ export class SmartExtractor {
                     decision: "create",
                     reason: "sibling verdict fallback (unsupported decision for a pending row)",
                 });
+            }
+            if (pre?.matchId &&
+                !pre.matchId.startsWith(BURST_SIBLING_PREFIX) &&
+                (pre.decision === "merge" || pre.decision === "support")) {
+                anchorStoredIdBySurviving.set(i, pre.matchId);
             }
             const createCountBefore = createEntries.length;
             try {
@@ -909,35 +925,66 @@ export class SmartExtractor {
         if (pendingSiblingVerdicts.length > 0) {
             const claimedIds = new Set();
             const resolvedIdBySurviving = new Map();
+            const resolveSlotId = (slot) => {
+                if (createdEntries.length === createEntries.length) {
+                    return createdEntries[slot]?.id;
+                }
+                // bulkStore may filter entries, shifting positions: fall back to the
+                // first unclaimed row with the same text AND the same lane/category
+                // identity — identical text is legal across lanes, so a text-only
+                // match could bind the verdict to another lane's row.
+                const want = createEntries[slot];
+                const hit = want
+                    ? createdEntries.find((e) => e.text === want.text &&
+                        e.category === want.category &&
+                        laneFromMetadata(e.metadata) === laneFromMetadata(want.metadata) &&
+                        !claimedIds.has(e.id))
+                    : undefined;
+                return hit?.id;
+            };
             const storedIdForSurviving = (survivingIndex) => {
                 // Verdicts may share one surviving anchor: the first resolution is
                 // cached per index so every later verdict reuses the same row.
                 // claimedIds only keeps DISTINCT surviving entries apart in the
                 // filtered-result fallback — it must never exclude the row an index
-                // already resolved.
+                // already resolved. A survivor without its own create slot resolves
+                // through its durable anchor: sibling chains are chased transitively
+                // (indices strictly decrease, so chains terminate) and may end at a
+                // created row or at an existing stored row.
                 if (resolvedIdBySurviving.has(survivingIndex)) {
                     return resolvedIdBySurviving.get(survivingIndex);
                 }
                 const resolve = () => {
-                    const slot = createSlotBySurviving.get(survivingIndex);
-                    if (slot === undefined) {
-                        return undefined;
+                    let index = survivingIndex;
+                    for (let hops = 0; hops <= surviving.length; hops++) {
+                        if (index !== survivingIndex && resolvedIdBySurviving.has(index)) {
+                            return resolvedIdBySurviving.get(index);
+                        }
+                        const slot = createSlotBySurviving.get(index);
+                        if (slot !== undefined) {
+                            const id = resolveSlotId(slot);
+                            if (index !== survivingIndex) {
+                                // A chain terminal is a shared anchor: cache and claim it
+                                // under its own index so other chains landing here reuse
+                                // the row instead of consuming another twin.
+                                if (id) {
+                                    claimedIds.add(id);
+                                }
+                                resolvedIdBySurviving.set(index, id);
+                            }
+                            return id;
+                        }
+                        const storedId = anchorStoredIdBySurviving.get(index);
+                        if (storedId) {
+                            return storedId;
+                        }
+                        const next = anchorSiblingBySurviving.get(index);
+                        if (next === undefined) {
+                            return undefined;
+                        }
+                        index = next;
                     }
-                    if (createdEntries.length === createEntries.length) {
-                        return createdEntries[slot]?.id;
-                    }
-                    // bulkStore may filter entries, shifting positions: fall back to the
-                    // first unclaimed row with the same text AND the same lane/category
-                    // identity — identical text is legal across lanes, so a text-only
-                    // match could bind the verdict to another lane's row.
-                    const want = createEntries[slot];
-                    const hit = want
-                        ? createdEntries.find((e) => e.text === want.text &&
-                            e.category === want.category &&
-                            laneFromMetadata(e.metadata) === laneFromMetadata(want.metadata) &&
-                            !claimedIds.has(e.id))
-                        : undefined;
-                    return hit?.id;
+                    return undefined;
                 };
                 const id = resolve();
                 if (id) {

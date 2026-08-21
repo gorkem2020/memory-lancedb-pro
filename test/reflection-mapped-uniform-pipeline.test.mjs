@@ -1297,3 +1297,111 @@ describe("reflection mapped rows: round-7 partial-batch and evidence-history int
     assert.equal(meta.admission_control_history[0].failedOpen, undefined, "no fail-open marker may leak into the audit history");
   });
 });
+
+// Round-8 review regressions: deferred verdict chains resolve transitively
+// to their durable anchor (created row or existing stored row), and a
+// create-decision short circuit no longer suppresses burst-sibling
+// adjudication. Fixtures are entirely synthetic; no real conversation data.
+describe("reflection mapped rows: round-8 transitive anchors and short-circuit sibling adjudication", () => {
+  it("resolves a merge chain transitively: B merges into A, C merges into B, one row persists", async () => {
+    const anchor = reflectionItem("Archive the load-test artifacts to cold storage every Friday.");
+    const restated = reflectionItem("Load-test artifacts move to cold storage on Fridays.");
+    const restatedAgain = reflectionItem("Every Friday the load-test artifacts go into cold storage.");
+    anchor.vector = [1, 0, 0, 0];
+    restated.vector = [0.98, 0.19899749, 0, 0];
+    restatedAgain.vector = [0.97, 0.24310491, 0, 0];
+
+    const store = makeStore({ neighbors: [] });
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "merge", match_index: 1, reason: "same practice restated" },
+          { index: 2, decision: "merge", match_index: 1, reason: "restates the restatement" },
+        ],
+      }),
+      onMergeBatch: () => ({
+        results: [{ index: 1, abstract: "merged cold-storage practice", overview: "o", content: "merged cold-storage practice content" }],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { stats } = await extractor.persistGatedCandidates(
+      [anchor, restated, restatedAgain],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(stats.created, 1, "only the chain anchor may persist as a create");
+    assert.equal(stats.merged, 2, "both chained merge verdicts must resolve");
+    assert.equal(store.bulkStored.length, 1, "no fail-open duplicate may land beside the anchor");
+    const contentUpdate = store.updates.find((u) => u.id === "new-1" && u.patch?.metadata?.includes("l0_abstract"));
+    assert.ok(contentUpdate, "the grouped merge lands on the anchor row");
+  });
+
+  it("resolves a sibling verdict through an anchor that itself merged into an existing stored row", async () => {
+    const store = makeStore({
+      neighbors: [neighborRow("row-1", "Rotate the audit log encryption key at the end of each quarter.")],
+    });
+    const mergingAnchor = reflectionItem("The audit log encryption key rotates at quarter end.");
+    const supporter = reflectionItem("Quarter end is when the audit log encryption key gets rotated.");
+    supporter.vector = [...mergingAnchor.vector];
+
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "merge", match_index: 1, reason: "adds nothing new beyond the stored row" },
+          { index: 2, decision: "support", match_index: 1, reason: "same practice restated" },
+        ],
+      }),
+      onMergeBatch: () => ({
+        results: [{ index: 1, abstract: "merged rotation practice", overview: "o", content: "merged rotation practice content" }],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { stats } = await extractor.persistGatedCandidates(
+      [mergingAnchor, supporter],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(store.bulkStored.length, 0, "neither candidate may create a row");
+    assert.equal(stats.created ?? 0, 0, "the supporter must not fall open to a duplicate create");
+    assert.equal(stats.merged, 1, "the anchor's merge into the stored row resolves");
+    assert.equal(stats.supported ?? 0, 1, "the deferred support resolves through the anchor's stored target");
+    const supportWrite = store.updates.find((u) => u.id === "row-1" && u.patch && !u.patch.text);
+    assert.ok(supportWrite, "the support evidence lands on the stored row the anchor merged into");
+  });
+
+  it("adjudicates burst siblings when the preference-slot guard excludes every stored neighbor", async () => {
+    const storedPreference = {
+      ...neighborRow("row-1", "I really like the curly fries from Crown Grill."),
+      category: "preferences",
+      metadata: JSON.stringify({
+        memory_category: "preferences",
+        l0_abstract: "I really like the curly fries from Crown Grill.",
+        l1_overview: "## Existing\nI really like the curly fries from Crown Grill.",
+        l2_content: "I really like the curly fries from Crown Grill.",
+      }),
+    };
+    const store = makeStore({ neighbors: [storedPreference] });
+    const firstWording = reflectionItem("I really like the smash burger from Crown Grill.", { category: "preferences" });
+    const secondWording = reflectionItem("I still love the smash burger from Crown Grill.", { category: "preferences" });
+    secondWording.vector = [...firstWording.vector];
+
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [{ index: 1, decision: "skip", match_index: 1, reason: "same incoming preference reworded" }],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { stats } = await extractor.persistGatedCandidates(
+      [firstWording, secondWording],
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(llm.calls.filter((c) => c === "dedup-decision-batch").length, 1, "eligible burst siblings must reach the judge despite the guard");
+    assert.equal(stats.created, 1, "only the first wording persists");
+    assert.equal(stats.skipped ?? 0, 1, "the reworded twin collapses through sibling adjudication");
+    assert.equal(store.bulkStored.length, 1, "the guard must not double-create same-item siblings");
+  });
+});
