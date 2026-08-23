@@ -1405,3 +1405,71 @@ describe("reflection mapped rows: round-8 transitive anchors and short-circuit s
     assert.equal(store.bulkStored.length, 1, "the guard must not double-create same-item siblings");
   });
 });
+
+// Round-9 review regression: a same-burst SKIP must preserve its anchor so
+// later sibling verdicts resolve through the skipped survivor.
+// Fixtures are entirely synthetic; no real conversation data.
+describe("reflection mapped rows: round-9 skip-anchored sibling chains", () => {
+  function skipChainItems() {
+    const anchor = reflectionItem("Publish the incident retro notes within two days of closure.");
+    const skippedTwin = reflectionItem("Incident retro notes go out within two days of closing.");
+    const chained = reflectionItem("Within two days of an incident closing, the retro notes get published.");
+    anchor.vector = [1, 0, 0, 0];
+    skippedTwin.vector = [0.98, 0.19899749, 0, 0];
+    chained.vector = [0.97, 0.24310491, 0, 0];
+    return [anchor, skippedTwin, chained];
+  }
+
+  it("resolves a MERGE through a skipped sibling anchor: B skips against A, C merges into B", async () => {
+    const store = makeStore({ neighbors: [] });
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "skip", match_index: 1, reason: "same practice reworded" },
+          { index: 2, decision: "merge", match_index: 1, reason: "adds phrasing detail" },
+        ],
+      }),
+      onMergeBatch: () => ({
+        results: [{ index: 1, abstract: "merged retro practice", overview: "o", content: "merged retro practice content" }],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { stats } = await extractor.persistGatedCandidates(
+      skipChainItems(),
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(stats.created, 1, "only the anchor persists");
+    assert.equal(stats.skipped ?? 0, 1, "the twin collapses as a skip");
+    assert.equal(stats.merged, 1, "the chained merge resolves through the skipped survivor to the anchor");
+    assert.equal(store.bulkStored.length, 1, "no fail-open duplicate lands");
+    const contentUpdate = store.updates.find((u) => u.id === "new-1" && u.patch?.metadata?.includes("l0_abstract"));
+    assert.ok(contentUpdate, "the merge lands on the anchor row");
+  });
+
+  it("resolves a SUPPORT through a skipped sibling anchor: B skips against A, C supports B", async () => {
+    const store = makeStore({ neighbors: [] });
+    const llm = makeLlm({
+      onDedupBatch: () => ({
+        results: [
+          { index: 1, decision: "skip", match_index: 1, reason: "same practice reworded" },
+          { index: 2, decision: "support", match_index: 1, reason: "restates the practice" },
+        ],
+      }),
+    });
+    const extractor = makeExtractor(store, llm);
+
+    const { stats } = await extractor.persistGatedCandidates(
+      skipChainItems(),
+      { targetScope: "agent:probe", scopeFilter: ["agent:probe"], sessionKey: "refl-test" },
+    );
+
+    assert.equal(stats.created, 1, "only the anchor persists");
+    assert.equal(stats.skipped ?? 0, 1, "the twin collapses as a skip");
+    assert.equal(stats.supported ?? 0, 1, "the support resolves through the skipped survivor to the anchor");
+    assert.equal(store.bulkStored.length, 1, "no fail-open duplicate lands");
+    const supportWrite = store.updates.find((u) => u.id === "new-1" && u.patch && !u.patch.text);
+    assert.ok(supportWrite, "the support evidence lands on the anchor row");
+  });
+});

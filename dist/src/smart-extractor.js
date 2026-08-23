@@ -883,7 +883,7 @@ export class SmartExtractor {
             }
             if (pre?.matchId &&
                 !pre.matchId.startsWith(BURST_SIBLING_PREFIX) &&
-                (pre.decision === "merge" || pre.decision === "support")) {
+                (pre.decision === "merge" || pre.decision === "support" || pre.decision === "skip")) {
                 anchorStoredIdBySurviving.set(i, pre.matchId);
             }
             const createCountBefore = createEntries.length;
@@ -1996,7 +1996,10 @@ export class SmartExtractor {
         return {
             decision,
             reason: data.reason ?? "",
-            matchId: ["merge", "support", "contextualize", "contradict", "supersede"].includes(decision) ? matchEntry?.entry.id : undefined,
+            // skip carries its target too: a same-burst SKIP anchors the skipped
+            // survivor at its duplicate, and later sibling verdicts must be able
+            // to resolve through that anchor (the skip handler itself ignores it).
+            matchId: ["merge", "support", "contextualize", "contradict", "supersede", "skip"].includes(decision) ? matchEntry?.entry.id : undefined,
             contextLabel: typeof data.context_label === "string" ? data.context_label : undefined,
         };
     }
