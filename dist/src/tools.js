@@ -1782,7 +1782,7 @@ export function registerMemoryUpdateTool(api, context) {
                             details: { error: "not_found", id: resolvedId },
                         };
                     }
-                    runtimeContext.manualEchoLedger?.record(agentId, updated.text);
+                    context.manualEchoLedger?.record(agentId, updated.text);
                     return {
                         content: [
                             {

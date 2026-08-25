@@ -1592,49 +1592,6 @@ async function ensureDailyLogFile(dailyPath: string, dateStr: string): Promise<v
   }
 }
 
-// Reflection reads its transcript back from disk as a rendered string, so
-// bounding happens on the string: slice to budget, then snap forward to the
-// first tag start so a clipped INPUT never opens with a headless half message.
-// (The extraction lane, with structured turns in hand, uses buildBoundedTranscript.)
-function trimTranscriptToTagBoundary(transcript: string, maxChars: number): string {
-  if (transcript.length <= maxChars) {
-    return transcript;
-  }
-  const sliced = transcript.slice(-maxChars);
-  const tagStarts = ["<user_message>", "<assistant_message>"]
-    .map((tag) => sliced.indexOf(tag))
-    .filter((index) => index >= 0);
-  if (tagStarts.length > 0) {
-    return sliced.slice(Math.min(...tagStarts));
-  }
-  // No opening tag in the window: the tail sits inside one oversized block.
-  // Rebuild it as a structurally complete block with its content tail-sliced,
-  // so the INPUT never opens headless mid-message.
-  const openStarts = ["<user_message>", "<assistant_message>"]
-    .map((tag) => transcript.lastIndexOf(tag))
-    .filter((index) => index >= 0);
-  if (openStarts.length === 0) {
-    return sliced;
-  }
-  const openStart = Math.max(...openStarts);
-  const open = transcript.startsWith("<user_message>", openStart) ? "<user_message>" : "<assistant_message>";
-  const close = open === "<user_message>" ? "</user_message>" : "</assistant_message>";
-  let content = transcript.slice(openStart + open.length);
-  if (content.startsWith("\n")) {
-    content = content.slice(1);
-  }
-  const closeAt = content.lastIndexOf(close);
-  if (closeAt >= 0) {
-    content = content.slice(0, closeAt);
-    if (content.endsWith("\n")) {
-      content = content.slice(0, -1);
-    }
-  }
-  const contentBudget = maxChars - open.length - close.length - 2;
-  const kept = contentBudget > 0 ? content.slice(-contentBudget) : "";
-  return `${open}\n${kept}\n${close}`;
-}
-
 export function buildReflectionPrompt(
   conversation: string,
   maxInputChars: number,

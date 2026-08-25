@@ -26,6 +26,7 @@ import { createRetriever, normalizeRetrievalConfig, } from "./src/retriever.js";
 import { createScopeManager, resolveScopeFilter, isSystemBypassId, parseAgentIdFromSessionKey } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
+import { ManualEchoLedger } from "./src/manual-echo-guard.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { parseClawteamScopes, applyClawteamScopes } from "./src/clawteam-scope.js";
@@ -41,7 +42,8 @@ import { buildFallbackCandidate, gateRegexFallbackCapture } from "./src/autocapt
 import { gateMappedReflectionEntries, resolveMappedRowAdmissionController } from "./src/reflection-mapped-admission.js";
 import { createMemoryCLI } from "./cli.js";
 import { isNoise } from "./src/noise-filter.js";
-import { buildConversationTurnsForExtraction, formatConversationTranscript, neutralizeSpeakerTagSpoof, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, } from "./src/auto-capture-cleanup.js";
+import { MESSAGE_TOOL_DELIVERY_BANNER_PREFIX, anchorTextToRawIngress, buildConversationTurnsForExtraction, capUnknownWatermarkWindow, dedupePairWindow, formatConversationTranscript, neutralizeSpeakerTagSpoof, isDirectConversationSessionKey, nextAutoCaptureMessageId, normalizeAutoCaptureText, reconcileTurnsWithKeptTexts, trimTranscriptToTagBoundary, trimTurnsToUserCap, } from "./src/auto-capture-cleanup.js";
+import { loadAutoCaptureWatermarks, saveAutoCaptureWatermarks } from "./src/auto-capture-watermark-store.js";
 // Import smart extraction & lifecycle components
 import { SmartExtractor, createExtractionRateLimiter, stripEnvelopeMetadata } from "./src/smart-extractor.js";
 import { compressTexts, estimateConversationValue } from "./src/session-compressor.js";
@@ -895,6 +897,21 @@ function pruneMapIfOver(map, maxEntries) {
             map.delete(key);
     }
 }
+/**
+ * Prune a Set to stay within the given maximum number of entries.
+ * Deletes the oldest (earliest-inserted) values when over the limit.
+ */
+function pruneSetIfOver(set, maxEntries) {
+    if (set.size <= maxEntries)
+        return;
+    const excess = set.size - maxEntries;
+    const iter = set.values();
+    for (let i = 0; i < excess; i++) {
+        const value = iter.next().value;
+        if (value !== undefined)
+            set.delete(value);
+    }
+}
 function isExplicitRememberCommand(text) {
     return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
 }
@@ -915,6 +932,7 @@ export function buildAutoCaptureConversationKeyFromIngress(channelId, conversati
  * the second colon as the conversation key, or null if the format
  * does not match.
  */
+const RAW_INGRESS_GLOBAL_KEY = ":global:";
 function autoCaptureRetainedTextCap(minMessages) {
     return Math.max(6, minMessages);
 }
@@ -1084,48 +1102,6 @@ async function ensureDailyLogFile(dailyPath, dateStr) {
     catch {
         await writeFile(dailyPath, `# ${dateStr}\n\n`, "utf-8");
     }
-}
-// Reflection reads its transcript back from disk as a rendered string, so
-// bounding happens on the string: slice to budget, then snap forward to the
-// first tag start so a clipped INPUT never opens with a headless half message.
-// (The extraction lane, with structured turns in hand, uses buildBoundedTranscript.)
-function trimTranscriptToTagBoundary(transcript, maxChars) {
-    if (transcript.length <= maxChars) {
-        return transcript;
-    }
-    const sliced = transcript.slice(-maxChars);
-    const tagStarts = ["<user_message>", "<assistant_message>"]
-        .map((tag) => sliced.indexOf(tag))
-        .filter((index) => index >= 0);
-    if (tagStarts.length > 0) {
-        return sliced.slice(Math.min(...tagStarts));
-    }
-    // No opening tag in the window: the tail sits inside one oversized block.
-    // Rebuild it as a structurally complete block with its content tail-sliced,
-    // so the INPUT never opens headless mid-message.
-    const openStarts = ["<user_message>", "<assistant_message>"]
-        .map((tag) => transcript.lastIndexOf(tag))
-        .filter((index) => index >= 0);
-    if (openStarts.length === 0) {
-        return sliced;
-    }
-    const openStart = Math.max(...openStarts);
-    const open = transcript.startsWith("<user_message>", openStart) ? "<user_message>" : "<assistant_message>";
-    const close = open === "<user_message>" ? "</user_message>" : "</assistant_message>";
-    let content = transcript.slice(openStart + open.length);
-    if (content.startsWith("\n")) {
-        content = content.slice(1);
-    }
-    const closeAt = content.lastIndexOf(close);
-    if (closeAt >= 0) {
-        content = content.slice(0, closeAt);
-        if (content.endsWith("\n")) {
-            content = content.slice(0, -1);
-        }
-    }
-    const contentBudget = maxChars - open.length - close.length - 2;
-    const kept = contentBudget > 0 ? content.slice(-contentBudget) : "";
-    return `${open}\n${kept}\n${close}`;
 }
 export function buildReflectionPrompt(conversation, maxInputChars, toolErrorSignals = []) {
     const clipped = trimTranscriptToTagBoundary(conversation, maxInputChars);
@@ -1989,6 +1965,10 @@ function _initPluginState(api) {
     // enabled. admissionControl.enabled remains a supported configuration on
     // its own.
     let smartExtractor = null;
+    // Echo guard: shared between the manual store/update tools (record side)
+    // and the smart extractor (drop side); lives here so the tools keep
+    // recording even when smart extraction is disabled.
+    const manualEchoLedger = new ManualEchoLedger();
     let admissionController = null;
     let admissionControllerReflectionLane = null;
     if (config.smartExtraction !== false || config.admissionControl?.enabled === true) {
@@ -2056,6 +2036,8 @@ function _initPluginState(api) {
                 noiseBank.init(embedder).catch((err) => api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`));
                 smartExtractor = new SmartExtractor(store, embedder, llmClient, {
                     user: "User",
+                    manualEchoLedger,
+                    contextWindowEnabled: (config.autoCaptureContextTurns ?? 0) > 0,
                     captureAssistantEligible: config.captureAssistant === true,
                     extractMinMessages: config.extractMinMessages ?? 4,
                     extractMaxChars: config.extractMaxChars ?? 8000,
@@ -2104,12 +2086,20 @@ function _initPluginState(api) {
     const reflectionByAgentCacheGeneration = { count: 0 };
     const recallHistory = new Map();
     const turnCounter = new Map();
-    const autoCaptureSeenTextCount = new Map();
+    const autoCaptureSeenTextCount = loadAutoCaptureWatermarks(resolvedDbPath);
+    const autoCapturePayloadShapeLoggedSessions = new Set();
     const autoCapturePendingIngressTexts = new Map();
     const autoCaptureCountedPendingCount = new Map();
     const autoCaptureRecentTurns = new Map();
     const autoCaptureDeferredFlushTurns = new Map();
     const autoCaptureSessionIdToKey = new Map();
+    const autoCaptureSessionIds = new Map();
+    const autoCaptureRecentPairTurns = new Map();
+    // Raw inbound texts as the channel delivered them, pre-composition: the
+    // anchor pool for channel-agnostic injection slicing. Never consumed;
+    // small per-conversation rings plus a global ring under a reserved key
+    // (main-collapsed DM sessions cannot reconstruct the ingress key).
+    const autoCaptureRecentRawIngress = new Map();
     const autoCaptureInFlightRuns = new Map();
     return {
         config,
@@ -2126,6 +2116,7 @@ function _initPluginState(api) {
         scopeManager,
         migrator,
         smartExtractor,
+        manualEchoLedger,
         mdMirror,
         extractionRateLimiter,
         reflectionErrorStateBySession,
@@ -2136,11 +2127,15 @@ function _initPluginState(api) {
         recallHistory,
         turnCounter,
         autoCaptureSeenTextCount,
+        autoCapturePayloadShapeLoggedSessions,
         autoCapturePendingIngressTexts,
         autoCaptureCountedPendingCount,
         autoCaptureRecentTurns,
         autoCaptureDeferredFlushTurns,
         autoCaptureSessionIdToKey,
+        autoCaptureSessionIds,
+        autoCaptureRecentPairTurns,
+        autoCaptureRecentRawIngress,
         autoCaptureInFlightRuns,
         captureAdmissionController,
         captureAdmissionAudit,
@@ -2254,7 +2249,20 @@ const memoryLanceDBProPlugin = {
             _registeredApisMap.delete(api); // dual-track rollback: Map un-claim
             throw err;
         }
-        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
+        const { config, resolvedDbPath, vectorDim, store, embedder, retriever, canonicalCorpusIndexer, dreamingEngine, dreamingScheduler, scopeManager, migrator, smartExtractor, manualEchoLedger, mdMirror, decayEngine, tierManager, extractionRateLimiter, reflectionErrorStateBySession, reflectionDerivedBySession, reflectionDerivedSuppressionBySession, reflectionByAgentCache, reflectionByAgentCacheGeneration, recallHistory, turnCounter, autoCaptureSeenTextCount, autoCapturePayloadShapeLoggedSessions, autoCapturePendingIngressTexts, autoCaptureCountedPendingCount, autoCaptureRecentTurns, autoCaptureDeferredFlushTurns, autoCaptureSessionIdToKey, autoCaptureSessionIds, autoCaptureRecentPairTurns, autoCaptureRecentRawIngress, autoCaptureInFlightRuns, captureAdmissionController, captureAdmissionAudit, captureReflectionAdmissionController, admissionRejectionAuditWriter, } = singleton;
+        // issue #417 restart-survivability: every mutation of autoCaptureSeenTextCount
+        // must also go through here so the on-disk watermark never drifts from the
+        // in-memory Map -- a process restart rehydrates from exactly what was last
+        // written here (see loadAutoCaptureWatermarks at construction, above).
+        const persistAutoCaptureWatermark = async (key, value) => {
+            autoCaptureSeenTextCount.set(key, value);
+            pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+            await saveAutoCaptureWatermarks(resolvedDbPath, autoCaptureSeenTextCount, (message) => api.logger.debug(message));
+        };
+        const retireAutoCaptureWatermark = async (key) => {
+            autoCaptureSeenTextCount.delete(key);
+            await saveAutoCaptureWatermarks(resolvedDbPath, autoCaptureSeenTextCount, (message) => api.logger.debug(message));
+        };
         const learnAutoCaptureSessionAlias = (sessionId, sessionKey) => {
             if (typeof sessionId !== "string" || !sessionId
                 || typeof sessionKey !== "string" || !sessionKey
@@ -2580,6 +2588,13 @@ const memoryLanceDBProPlugin = {
                         queue.push(normalized);
                         autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-autoCaptureRetainedTextCap(config.extractMinMessages ?? 4)));
                         pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        const rawRing = autoCaptureRecentRawIngress.get(conversationKey) || [];
+                        rawRing.push(normalized);
+                        autoCaptureRecentRawIngress.set(conversationKey, rawRing.slice(-8));
+                        const globalRing = autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || [];
+                        globalRing.push(normalized);
+                        autoCaptureRecentRawIngress.set(RAW_INGRESS_GLOBAL_KEY, globalRing.slice(-24));
+                        pruneMapIfOver(autoCaptureRecentRawIngress, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                     }
                 }
             }
@@ -2614,6 +2629,7 @@ const memoryLanceDBProPlugin = {
             workspaceBoundary: config.workspaceBoundary,
             selfImprovementMaxEntries: config.selfImprovement?.maxEntries,
             manualStoreSupersede: config.manualStoreSupersede === true,
+            manualEchoLedger,
             // Mirrors the CLI context wiring below: keep in-process reflection caches
             // consistent after a live memory_forget delete too, not just CLI delete/delete-bulk.
             onMemoriesDeleted: ({ scopeFilter }) => invalidateReflectionCachesAfterDelete(scopeFilter),
@@ -3262,6 +3278,52 @@ const memoryLanceDBProPlugin = {
                         // alias so the terminal flush resolves to the same buckets.
                         learnAutoCaptureSessionAlias(hookSessionId, sessionKey);
                         api.logger.debug(`memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`);
+                        const isDirectSession = isDirectConversationSessionKey(sessionKey);
+                        // Opt-out knob: unset follows autoCapture (groups keep capturing,
+                        // no surprises on install); explicit false skips group-chat capture
+                        // entirely until per-sender speaker awareness lands.
+                        if (!isDirectSession && config.autoCaptureGroupChats === false) {
+                            api.logger.debug(`memory-lancedb-pro: auto-capture skipped for group-chat session ${sessionKey} (autoCaptureGroupChats=false)`);
+                            return;
+                        }
+                        // Group chats force captureAssistant=false and contextTurns=0
+                        // (plain user-only capture) regardless of config: with every
+                        // non-self participant arriving role=user, assistant-sourced
+                        // extraction in a multi-party room misattributes at will. Full
+                        // channel support will be implemented with speaker awareness.
+                        // Direct keys are allowlisted; unknown key shapes count as group,
+                        // fail-closed.
+                        const captureAssistantEligible = config.captureAssistant === true && isDirectSession;
+                        const contextWindowActive = isDirectSession && (config.autoCaptureContextTurns ?? 0) > 0;
+                        // Context-only assistant admission: with the context window on and
+                        // captureAssistant off, self replies join the transcript window for
+                        // reference resolution but never the eligible set — they cannot
+                        // fire the gate, move the watermark, or ground a memory.
+                        const assistantContextOnly = !captureAssistantEligible && contextWindowActive;
+                        const rawAnchorConversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
+                        const rawAnchorPool = [
+                            ...(rawAnchorConversationKey
+                                ? autoCaptureRecentRawIngress.get(rawAnchorConversationKey) || []
+                                : []),
+                            ...(autoCaptureRecentRawIngress.get(RAW_INGRESS_GLOBAL_KEY) || []),
+                        ];
+                        // Message-tool runs (Slack groups etc.) never auto-deliver the final
+                        // assistant text — the real reply left via the message tool, so
+                        // assistant texts in this payload are internal monologue, not
+                        // conversation. Detected via the host's Delivery banner.
+                        const messageToolRun = (event.messages ?? []).some((msg) => {
+                            if (!msg || typeof msg !== "object")
+                                return false;
+                            const content = msg.content;
+                            if (typeof content === "string")
+                                return content.includes(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX);
+                            if (Array.isArray(content)) {
+                                return content.some((block) => block && typeof block === "object" &&
+                                    typeof block.text === "string" &&
+                                    block.text.includes(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX));
+                            }
+                            return false;
+                        });
                         // Extract text content from messages, keeping the role-tagged
                         // message-loop order alongside the flat eligible-text list.
                         const eligibleTexts = [];
@@ -3273,9 +3335,13 @@ const memoryLanceDBProPlugin = {
                             }
                             const msgObj = msg;
                             const role = msgObj.role;
-                            const captureAssistant = config.captureAssistant === true;
-                            if (role !== "user" &&
-                                !(captureAssistant && role === "assistant")) {
+                            const isEligibleRole = role === "user" || (captureAssistantEligible && role === "assistant");
+                            const isContextOnlyRole = assistantContextOnly && role === "assistant";
+                            if (!isEligibleRole && !isContextOnlyRole) {
+                                continue;
+                            }
+                            if (role === "assistant" && messageToolRun) {
+                                skippedAutoCaptureTexts++;
                                 continue;
                             }
                             const content = msgObj.content;
@@ -3286,8 +3352,12 @@ const memoryLanceDBProPlugin = {
                                     skippedAutoCaptureTexts++;
                                 }
                                 else {
-                                    eligibleTexts.push(normalized);
-                                    messageLoopTurns.push({ role: role, text: normalized, messageId });
+                                    const anchored = role === "user" && rawAnchorPool.length > 0
+                                        ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                                        : normalized;
+                                    if (isEligibleRole)
+                                        eligibleTexts.push(anchored);
+                                    messageLoopTurns.push({ role: role, text: anchored, messageId });
                                 }
                                 continue;
                             }
@@ -3305,8 +3375,12 @@ const memoryLanceDBProPlugin = {
                                             skippedAutoCaptureTexts++;
                                         }
                                         else {
-                                            eligibleTexts.push(normalized);
-                                            messageLoopTurns.push({ role: role, text: normalized, messageId });
+                                            const anchored = role === "user" && rawAnchorPool.length > 0
+                                                ? anchorTextToRawIngress(normalized, rawAnchorPool)
+                                                : normalized;
+                                            if (isEligibleRole)
+                                                eligibleTexts.push(anchored);
+                                            messageLoopTurns.push({ role: role, text: anchored, messageId });
                                         }
                                     }
                                 }
@@ -3326,6 +3400,25 @@ const memoryLanceDBProPlugin = {
                             autoCapturePendingIngressTexts.delete(conversationKey);
                             autoCaptureCountedPendingCount.delete(conversationKey);
                         }
+                        // Session renewal detection: a rotated sessionId under a stable
+                        // sessionKey (e.g. /reset) means the persisted watermark counts a
+                        // conversation that no longer exists. A stale-HIGH cursor silently
+                        // swallows the fresh session's first messages as already-seen; a
+                        // stale-LOW cursor fires a spurious first-message extraction. Reset
+                        // to zero so the fresh session counts from its own start. The map
+                        // is deliberately in-memory: after a process restart it records
+                        // without resetting, preserving the watermark's restart survival.
+                        if (hookSessionId) {
+                            const recordedSessionId = autoCaptureSessionIds.get(sessionKey);
+                            if (recordedSessionId && recordedSessionId !== hookSessionId) {
+                                await persistAutoCaptureWatermark(sessionKey, 0);
+                                api.logger.info(`memory-lancedb-pro: auto-capture watermark reset for ${sessionKey} (session renewed: ${recordedSessionId.slice(0, 8)} -> ${hookSessionId.slice(0, 8)})`);
+                            }
+                            autoCaptureSessionIds.set(sessionKey, hookSessionId);
+                            pruneMapIfOver(autoCaptureSessionIds, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        }
+                        const minMessages = config.extractMinMessages ?? 4;
+                        let watermarkAdvanceOverride = null;
                         const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
                         let newTexts = eligibleTexts;
                         let newlyObservedCount = eligibleTexts.length;
@@ -3355,15 +3448,38 @@ const memoryLanceDBProPlugin = {
                                 newlyObservedCount = 0;
                             }
                         }
+                        else if (previousSeenCount === 0 && eligibleTexts.length > Math.max(minMessages * 4, 12)) {
+                            // issue #417 item 5: a genuinely unknown watermark (first-ever
+                            // run, or persisted state lost) meeting a pathological backlog
+                            // (far more than one batch's worth) must not ingest the entire
+                            // transcript in one call. Cap to the most recent batch and
+                            // forfeit the rest by marking it seen below, rather than
+                            // queueing it for a later turn. Ordinary first turns with a
+                            // handful of history texts stay whole: compression and
+                            // extractMaxChars govern those, and the tagged-transcript
+                            // contract expects every kept text to arrive.
+                            newTexts = capUnknownWatermarkWindow(eligibleTexts, minMessages, config.extractMaxChars ?? 8000);
+                            watermarkAdvanceOverride = eligibleTexts.length;
+                        }
                         // issue #417 Fix #4: cumulative counting — increment by newly observed texts.
-                        const cumulativeCount = previousSeenCount + newlyObservedCount;
-                        autoCaptureSeenTextCount.set(sessionKey, cumulativeCount);
-                        pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                        const cumulativeCount = watermarkAdvanceOverride ?? (previousSeenCount + newlyObservedCount);
+                        await persistAutoCaptureWatermark(sessionKey, cumulativeCount);
+                        // Once per session per process (not persisted, not per turn): a
+                        // restart re-emits this, which is exactly when you want to
+                        // re-confirm the payload shape in the new process. This single
+                        // INFO line answers the delta-only-vs-history-carrying question
+                        // and the gate's fire/skip decision without reconstructing them
+                        // from DEBUG-only evidence across unrelated log lines.
+                        if (!autoCapturePayloadShapeLoggedSessions.has(sessionKey)) {
+                            autoCapturePayloadShapeLoggedSessions.add(sessionKey);
+                            pruneSetIfOver(autoCapturePayloadShapeLoggedSessions, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                            api.logger.info(`memory-lancedb-pro: auto-capture payload shape for agent ${agentId} (sessionKey=${sessionKey}): messages=${event.messages.length}, eligible=${eligibleTexts.length}, previousSeen=${previousSeenCount}, cumulative=${cumulativeCount}, fired=${cumulativeCount >= minMessages ? "yes" : "no"}`);
+                        }
                         let terminalFlushTurns = null;
                         if (isTerminalFlush) {
                             const deferredFlushTurns = autoCaptureDeferredFlushTurns.get(sessionKey) || [];
                             autoCaptureDeferredFlushTurns.delete(sessionKey);
-                            autoCaptureSeenTextCount.delete(sessionKey);
+                            await retireAutoCaptureWatermark(sessionKey);
                             // Deferred turns keep their original roles and message ids;
                             // pending ingress is user-authored by construction. Dedup by
                             // text with first occurrence winning, mirroring the previous
@@ -3502,7 +3618,6 @@ const memoryLanceDBProPlugin = {
                             autoCaptureRecentTurns.set(rememberWindowKey(agentId, sessionKey), nextRecentTurns);
                             pruneMapIfOver(autoCaptureRecentTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
                         }
-                        const minMessages = config.extractMinMessages ?? 4;
                         if (skippedAutoCaptureTexts > 0) {
                             api.logger.debug(`memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`);
                         }
@@ -3566,7 +3681,10 @@ const memoryLanceDBProPlugin = {
                                 return;
                             }
                             if (pendingIngressTexts.length === 0) {
-                                autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+                                // Sync closure: the in-memory set inside the helper runs before its
+                                // first await; the disk write is best-effort fire-and-forget (the
+                                // store never throws).
+                                void persistAutoCaptureWatermark(sessionKey, previousSeenCount);
                                 return;
                             }
                             if (conversationKey) {
@@ -3640,7 +3758,45 @@ const memoryLanceDBProPlugin = {
                                 // texts the selectors dropped back into extraction. Kept indices
                                 // pin each surviving copy to its own turn; occurrence counting
                                 // stays as the fallback when positional alignment is unavailable.
-                                const finalConversationTurns = reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+                                // Context-only assistant replies have no kept-text counterpart by
+                                // design (they are never extraction sources); reconcile over the
+                                // union so they ride the transcript, in original order. Positional
+                                // pinning stays in force in every other mode.
+                                const contextOnlyAssistantTexts = assistantContextOnly
+                                    ? thisCallTurns.filter((turn) => turn.role === "assistant").map((turn) => turn.text)
+                                    : [];
+                                let finalConversationTurns = contextOnlyAssistantTexts.length > 0
+                                    ? reconcileTurnsWithKeptTexts(thisCallTurns, [...cleanTexts, ...contextOnlyAssistantTexts])
+                                    : reconcileTurnsWithKeptTexts(thisCallTurns, cleanTexts, cleanTurnIndices);
+                                // Rolling PAIR window sized by autoCaptureContextTurns (0 =
+                                // disabled: each extraction sees only its own call's turns, and
+                                // nothing is retained between calls). When enabled, this call's
+                                // reconciled pairs extend what earlier calls buffered, bounded
+                                // to autoCaptureContextTurns user turns (or this call's own
+                                // new-user count when larger, so unextracted user turns are
+                                // never trimmed out of their own transcript). The buffer holds
+                                // the FILTERED window, so selector-dropped texts can never
+                                // re-enter a later transcript as retained context. A remember
+                                // flow (prepended referent) bypasses the prepend for its own
+                                // call: the extractor's protected-prefix contract counts
+                                // referent turns from position zero.
+                                const contextTurns = contextWindowActive ? config.autoCaptureContextTurns ?? 0 : 0;
+                                if (contextTurns > 0 && rememberPrependedTurns.length === 0) {
+                                    const priorPairTurns = (autoCaptureRecentPairTurns.get(sessionKey) || []).map((turn) => ({ ...turn, context: true }));
+                                    finalConversationTurns = trimTurnsToUserCap(dedupePairWindow([...priorPairTurns, ...finalConversationTurns]), Math.max(contextTurns, finalConversationTurns.filter((turn) => turn.role === "user").length));
+                                }
+                                if (contextTurns === 0) {
+                                    autoCaptureRecentPairTurns.delete(sessionKey);
+                                }
+                                else if (thisCallTurns.length > 0) {
+                                    // Deliberately retained across successful extractions:
+                                    // deleting it here would mean steady-state captures (one
+                                    // extraction per turn) always see a bare current pair. The
+                                    // set-time trim bounds it; the watermark keeps retained
+                                    // turns from re-becoming sources.
+                                    autoCaptureRecentPairTurns.set(sessionKey, finalConversationTurns);
+                                    pruneMapIfOver(autoCaptureRecentPairTurns, AUTO_CAPTURE_MAP_MAX_ENTRIES);
+                                }
                                 // The referent is the OLDEST turn of the prepended window, which is
                                 // exactly what the extractor's newest-first budget walk sacrifices
                                 // first, so it needs a guaranteed share. Only the referent RUN gets
@@ -3667,7 +3823,7 @@ const memoryLanceDBProPlugin = {
                                 // issue #417 Fix #10: prevent hook crash on LLM API errors / network timeouts
                                 let stats = null;
                                 try {
-                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, conversationTurns: finalConversationTurns, protectedPrefixTurns });
+                                    stats = await smartExtractor.extractAndPersist(conversationText, sessionKey, { scope: defaultScope, scopeFilter: accessibleScopes, agentId, conversationTurns: finalConversationTurns, protectedPrefixTurns, contextWindowActive, captureAssistantActive: captureAssistantEligible });
                                 }
                                 catch (err) {
                                     api.logger.error(`memory-lancedb-pro: smart-extract failed for agent ${agentId}: ${String(err)}`);
@@ -3720,7 +3876,7 @@ const memoryLanceDBProPlugin = {
                                     // turn re-read and re-extract the entire history. Record the
                                     // consumed history length there instead, so the next turn
                                     // only sees the delta.
-                                    autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
+                                    await persistAutoCaptureWatermark(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
                                     return; // Smart extraction handled everything
                                 }
                                 if ((stats.boundarySkipped ?? 0) === 0) {
@@ -3735,7 +3891,7 @@ const memoryLanceDBProPlugin = {
                                         api.logger.info(`memory-lancedb-pro: smart extraction settled with no persisted rows for agent ${agentId} ` +
                                             `(rejected=${stats.rejected ?? 0}, skipped=${stats.skipped}, supported=${stats.supported ?? 0}, ` +
                                             `superseded=${stats.superseded ?? 0}); consuming texts without retry`);
-                                        autoCaptureSeenTextCount.set(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
+                                        await persistAutoCaptureWatermark(sessionKey, pendingIngressTexts.length > 0 ? 0 : eligibleTexts.length);
                                         return;
                                     }
                                     api.logger.info(`memory-lancedb-pro: smart extraction produced no candidates and no boundary texts for agent ${agentId}; skipping regex fallback`);
@@ -3762,7 +3918,7 @@ const memoryLanceDBProPlugin = {
                                 // already gone.
                                 const retainedCap = autoCaptureRetainedTextCap(minMessages);
                                 if (pendingIngressTexts.length === 0) {
-                                    autoCaptureSeenTextCount.set(sessionKey, previousSeenCount);
+                                    await persistAutoCaptureWatermark(sessionKey, previousSeenCount);
                                     // History content lives in the session transcript, which is gone
                                     // once the session ends: retain the deferred texts so a terminal
                                     // flush can still consume them.
@@ -5708,6 +5864,8 @@ export function parsePluginConfig(value) {
             })()
             : undefined,
         extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
+        autoCaptureContextTurns: Math.min(10, Math.max(0, Math.floor(Number(cfg.autoCaptureContextTurns)) || 0)),
+        autoCaptureGroupChats: typeof cfg.autoCaptureGroupChats === "boolean" ? cfg.autoCaptureGroupChats : undefined,
         extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
         batchChunkSize: (() => { const raw = parsePositiveInt(cfg.batchChunkSize); return raw === undefined ? undefined : Math.min(50, raw); })(),
         scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes : undefined,

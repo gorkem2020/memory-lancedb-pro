@@ -108,10 +108,98 @@ export function stripAutoCaptureInjectedPrefix(role, text) {
     normalized = normalized.replace(/\n{3,}/g, "\n\n");
     return normalized.trim();
 }
+/**
+ * Message-tool channels (Slack groups and other non-auto-delivery runs) hand
+ * the plugin a "user" message that concatenates runtime scaffolding around the
+ * real inbound content: a Delivery banner first, then optionally a quoted
+ * re-render of channel history the session has already seen. Both are
+ * host-emitted grammar, matched exactly and stripped fail-closed — unmatched
+ * lines always pass through. Full group-channel support (per-sender speaker
+ * awareness) is the permanent design; this keeps the transcript clean until
+ * that lands.
+ */
+export const MESSAGE_TOOL_DELIVERY_BANNER_PREFIX = "Delivery: Final assistant text is not automatically delivered in this run.";
+const CHAT_HISTORY_QUOTE_HEADERS = [
+    "Chat history since last reply (untrusted, for context):",
+    "Conversation context (untrusted, chronological, selected for current message):",
+];
+const QUOTED_HISTORY_LINE = /^#\d+(?:\.\d+)? \S+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \S+ [^:]+: /;
+export function stripGroupChannelScaffold(text) {
+    const lines = text.split("\n");
+    const kept = [];
+    let index = 0;
+    while (index < lines.length) {
+        const line = lines[index];
+        if (line.startsWith(MESSAGE_TOOL_DELIVERY_BANNER_PREFIX)) {
+            index++;
+            continue;
+        }
+        if (CHAT_HISTORY_QUOTE_HEADERS.includes(line.trim())) {
+            index++;
+            while (index < lines.length && (QUOTED_HISTORY_LINE.test(lines[index]) || lines[index].trim() === "")) {
+                index++;
+            }
+            continue;
+        }
+        kept.push(line);
+        index++;
+    }
+    return kept.join("\n").trim();
+}
+/**
+ * Channel-agnostic injection slicing: the ingress hook delivers each inbound
+ * message RAW, before the host composes the prompt and layers channel
+ * injections above it, and the raw message always sits at the absolute
+ * bottom of the composed text. Anchoring on a recently seen raw text slices
+ * every injection shape — including channels whose grammar we have never
+ * seen — without parsing any of them. The newline boundary requirement stops
+ * mid-line false matches (a raw that merely ends the same as real content),
+ * the minimum length keeps trivial raws ("ok") from slicing multi-line
+ * messages, and no match leaves the text untouched (the deterministic
+ * header strips remain the fallback).
+ */
+export const RAW_INGRESS_ANCHOR_MIN_LENGTH = 12;
+export function anchorTextToRawIngress(text, recentRaws) {
+    let best = null;
+    for (const raw of recentRaws) {
+        if (!raw || raw.length < RAW_INGRESS_ANCHOR_MIN_LENGTH)
+            continue;
+        if (text === raw)
+            return text;
+        if (text.endsWith("\n" + raw) && (best === null || raw.length > best.length)) {
+            best = raw;
+        }
+    }
+    return best ?? text;
+}
+/**
+ * Direct (1:1) conversations by session-key grammar, allowlisted from the
+ * host's key builder: the dmScope-collapsed main key, dashboard/webchat
+ * sessions, and the explicit `:direct:` peer forms. Everything else —
+ * channels, groups, threads, topics, and any key shape we have never seen —
+ * is treated as a group chat, fail-closed. The context window falls back to
+ * contextTurns=0 there (original captureAssistant-gated behavior); full
+ * group-channel support arrives with per-sender speaker awareness.
+ */
+export function isDirectConversationSessionKey(sessionKey) {
+    if (typeof sessionKey !== "string" || sessionKey.length === 0)
+        return false;
+    const key = sessionKey.toLowerCase();
+    if (/^agent:[^:]+:main$/.test(key))
+        return true;
+    if (/^agent:[^:]+:dashboard(?::|$)/.test(key))
+        return true;
+    if (key.includes(":direct:"))
+        return true;
+    return false;
+}
 export function normalizeAutoCaptureText(role, text, shouldSkipMessage) {
     if (typeof role !== "string")
         return null;
-    const normalized = stripAutoCaptureInjectedPrefix(role, text);
+    const descaffolded = role === "user" ? stripGroupChannelScaffold(text) : text;
+    if (!descaffolded)
+        return null;
+    const normalized = stripAutoCaptureInjectedPrefix(role, descaffolded);
     if (!normalized)
         return null;
     if (shouldSkipMessage?.(role, normalized))
@@ -139,7 +227,7 @@ export function nextAutoCaptureMessageId() {
  * covers attribute-bearing and self-closing forms like
  * <assistant_message id="x"> and <user_message/>.
  */
-const SPEAKER_TAG_SPOOF_NAMES = ["user_message", "assistant_message"];
+const SPEAKER_TAG_SPOOF_NAMES = ["user_message", "assistant_message", "context_only_user_turn", "context_only_assistant_turn"];
 function isSpoofWhitespaceCode(code) {
     return ((code >= 9 && code <= 13) ||
         code === 32 ||
@@ -254,10 +342,16 @@ export function neutralizeSpeakerTagSpoof(text) {
  * `_userLabel` parameter is kept for call-site compatibility -- the user's
  * display name travels in the prompt header, not per turn.
  */
-export function formatConversationTranscript(turns, _userLabel = "User") {
+export function formatConversationTranscript(turns, _userLabel = "User", options = {}) {
     return turns
         .map((turn) => {
-        const tag = turn.role === "user" ? "user_message" : "assistant_message";
+        const tag = turn.role === "user"
+            ? turn.context
+                ? "context_only_user_turn"
+                : "user_message"
+            : turn.context || options.assistantContextOnly === true
+                ? "context_only_assistant_turn"
+                : "assistant_message";
         return `<${tag}>\n${neutralizeSpeakerTagSpoof(turn.text)}\n</${tag}>`;
     })
         .join("\n");
@@ -280,11 +374,20 @@ export function buildBoundedTranscript(turns, maxChars) {
  * untruncated render here is byte-identical to `formatConversationTranscript`).
  */
 export function buildBoundedTranscriptWithStats(turns, maxChars, options = {}) {
-    const blocks = turns.map((turn) => ({
-        open: turn.role === "user" ? "<user_message>" : "<assistant_message>",
-        close: turn.role === "user" ? "</user_message>" : "</assistant_message>",
-        text: neutralizeSpeakerTagSpoof(turn.text),
-    }));
+    const blocks = turns.map((turn) => {
+        const tag = turn.role === "user"
+            ? turn.context
+                ? "context_only_user_turn"
+                : "user_message"
+            : turn.context || options.assistantContextOnly === true
+                ? "context_only_assistant_turn"
+                : "assistant_message";
+        return {
+            open: `<${tag}>`,
+            close: `</${tag}>`,
+            text: neutralizeSpeakerTagSpoof(turn.text),
+        };
+    });
     const rendered = blocks.map((block) => `${block.open}\n${block.text}\n${block.close}`);
     const full = rendered.join("\n");
     if (full.length <= maxChars) {
@@ -356,6 +459,171 @@ function keepRenderedTail(blocks, rendered, start, end, budget) {
         break;
     }
     return kept;
+}
+/**
+ * Bounds the extraction input when a session's watermark is genuinely
+ * unknown (first-ever run, or persisted state lost) and its eligible-text
+ * history is larger than one batch's worth -- ingesting the entire history
+ * in one extraction call risks an oversized, stale-content-heavy prompt.
+ * Caps to the most recent `batchSize` texts, then trims further from the
+ * front of that window if it still exceeds `maxChars`. Always keeps at
+ * least the single most recent text, even if it alone exceeds `maxChars`.
+ */
+export function capUnknownWatermarkWindow(eligibleTexts, batchSize, maxChars) {
+    const window = eligibleTexts.slice(-Math.max(1, batchSize));
+    let start = 0;
+    let totalChars = window.reduce((sum, text) => sum + text.length, 0);
+    while (totalChars > maxChars && start < window.length - 1) {
+        totalChars -= window[start].length;
+        start++;
+    }
+    return window.slice(start);
+}
+/**
+ * Bounds a tag-wrapped transcript to `maxChars` by keeping the tail and then
+ * snapping the cut to the next opening tag, so the prompt never leads with a
+ * headless half message whose speaker was sliced away.
+ */
+export function trimTranscriptToTagBoundary(transcript, maxChars) {
+    if (transcript.length <= maxChars) {
+        return transcript;
+    }
+    const TAG_PAIRS = [
+        ["<user_message>", "</user_message>"],
+        ["<assistant_message>", "</assistant_message>"],
+        ["<context_only_user_turn>", "</context_only_user_turn>"],
+        ["<context_only_assistant_turn>", "</context_only_assistant_turn>"],
+    ];
+    const sliced = transcript.slice(-maxChars);
+    const tagStarts = TAG_PAIRS
+        .map(([open]) => sliced.indexOf(open))
+        .filter((index) => index >= 0);
+    if (tagStarts.length > 0) {
+        return sliced.slice(Math.min(...tagStarts));
+    }
+    // No opening tag in the window: the tail sits inside one oversized block.
+    // Rebuild it as a structurally complete block with its content tail-sliced,
+    // so the INPUT never opens headless mid-message.
+    const openStarts = TAG_PAIRS
+        .map(([open]) => transcript.lastIndexOf(open))
+        .filter((index) => index >= 0);
+    if (openStarts.length === 0) {
+        return sliced;
+    }
+    const openStart = Math.max(...openStarts);
+    const pair = TAG_PAIRS.find(([open]) => transcript.startsWith(open, openStart)) ?? TAG_PAIRS[1];
+    const [open, close] = pair;
+    let content = transcript.slice(openStart + open.length);
+    if (content.startsWith("\n")) {
+        content = content.slice(1);
+    }
+    const closeAt = content.lastIndexOf(close);
+    if (closeAt >= 0) {
+        content = content.slice(0, closeAt);
+        if (content.endsWith("\n")) {
+            content = content.slice(0, -1);
+        }
+    }
+    const contentBudget = maxChars - open.length - close.length - 2;
+    const kept = contentBudget > 0 ? content.slice(-contentBudget) : "";
+    return `${open}\n${kept}\n${close}`;
+}
+/**
+ * Bounds a rolling pair window to at most `maxUserTurns` user turns, keeping
+ * the newest ones with their interleaved assistant replies, and never leaving
+ * an orphan assistant turn ahead of the window's first user turn. The caller
+ * passes max(autoCaptureContextTurns, this call's new user turns), so the
+ * transcript always contains every not-yet-extracted user turn, padded with
+ * earlier still-buffered pairs up to the configured window.
+ */
+export function trimTurnsToUserCap(turns, maxUserTurns) {
+    const cap = Math.max(1, maxUserTurns);
+    let userCount = 0;
+    let start = turns.length;
+    for (let i = turns.length - 1; i >= 0; i--) {
+        if (turns[i].role === "user") {
+            userCount++;
+            if (userCount > cap)
+                break;
+            start = i;
+        }
+    }
+    if (userCount === 0) {
+        // All-assistant window (possible under captureAssistant=true when the
+        // delta carries only assistant turns): no user anchor exists, so keep
+        // the newest `cap` turns instead of silently dropping everything.
+        return turns.slice(-cap);
+    }
+    return turns.slice(start);
+}
+/**
+ * Repairs a pair window that double-preserved deferred turns. A below-threshold
+ * deferral keeps content alive on two independent paths -- the rolling pair
+ * buffer, and the watermark rollback (or pending-ingress re-queue) whose next
+ * slice re-includes the same turns -- so the assembled window can carry the
+ * same exchange twice. Collapse duplicates by user text at pair granularity:
+ * a pair-shaped copy (user turn plus its replies) beats a flat re-queued copy,
+ * copies of an identical exchange collapse to the latest, and a repeated user
+ * text whose replies differ is a real conversation and is kept whole.
+ */
+export function dedupePairWindow(turns) {
+    const groups = [];
+    let current = null;
+    for (const turn of turns) {
+        if (turn.role === "user") {
+            current = { turns: [turn], userText: turn.text, replies: "" };
+            groups.push(current);
+        }
+        else if (current) {
+            current.turns.push(turn);
+            current.replies = JSON.stringify(current.turns.slice(1).map((t) => t.text));
+        }
+        else {
+            groups.push({ turns: [turn], userText: null, replies: "" });
+        }
+    }
+    const kept = [];
+    for (const group of groups) {
+        if (group.userText === null) {
+            kept.push(group);
+            continue;
+        }
+        let prevIndex = -1;
+        for (let i = kept.length - 1; i >= 0; i--) {
+            if (kept[i].userText === group.userText) {
+                prevIndex = i;
+                break;
+            }
+        }
+        if (prevIndex < 0) {
+            kept.push(group);
+            continue;
+        }
+        const prev = kept[prevIndex];
+        const prevPaired = prev.turns.length > 1;
+        const currPaired = group.turns.length > 1;
+        if (currPaired && prevPaired) {
+            if (prev.replies === group.replies) {
+                kept.splice(prevIndex, 1);
+                kept.push(group);
+            }
+            else {
+                kept.push(group);
+            }
+        }
+        else if (currPaired && !prevPaired) {
+            kept.splice(prevIndex, 1);
+            kept.push(group);
+        }
+        else if (!currPaired && prevPaired) {
+            continue;
+        }
+        else {
+            kept.splice(prevIndex, 1);
+            kept.push(group);
+        }
+    }
+    return kept.flatMap((group) => group.turns);
 }
 /**
  * Assembles the ordered turn sequence for the extraction prompt's transcript
