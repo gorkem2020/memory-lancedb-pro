@@ -1951,15 +1951,17 @@ function _initPluginState(api) {
                     ? undefined
                     : config.embedding.baseURL;
         const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+        const llmModelExplicit = Boolean(asNonEmptyString(config.llm?.model));
         const llmOauthPath = llmAuth === "oauth"
             ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
             : undefined;
         const llmOauthProvider = llmAuth === "oauth" ? config.llm?.oauthProvider : undefined;
         const llmTimeoutMs = resolveLlmTimeoutMs(config);
-        const makeClientForModel = (model, thinkLevel = config.llm?.thinkLevel) => createLlmClient({
+        const makeClientForModel = (model, thinkLevel = config.llm?.thinkLevel, modelExplicit = llmModelExplicit) => createLlmClient({
             auth: llmAuth,
             apiKey: llmApiKey,
             model,
+            modelExplicit,
             baseURL: llmBaseURL,
             oauthProvider: llmOauthProvider,
             oauthPath: llmOauthPath,
@@ -1972,6 +1974,7 @@ function _initPluginState(api) {
         });
         return {
             llmModel,
+            llmModelExplicit,
             llmTimeoutMs,
             llmClient: makeClientForModel(llmModel),
             makeClientForModel,
@@ -1987,7 +1990,7 @@ function _initPluginState(api) {
     let admissionControllerReflectionLane = null;
     if (config.smartExtraction !== false || config.admissionControl?.enabled === true) {
         try {
-            const { llmClient, llmModel, llmTimeoutMs, makeClientForModel } = buildMemoryLlmClient();
+            const { llmClient, llmModel, llmModelExplicit, llmTimeoutMs, makeClientForModel } = buildMemoryLlmClient();
             // Model resolution for admission calls: explicit admissionControl.model
             // override > lane affinity (the reflection lane resolves the
             // memoryReflection model and, with affinity on, its thinkLevel) >
@@ -1998,23 +2001,34 @@ function _initPluginState(api) {
                 lane: "other",
                 globalModel: llmModel,
                 reflectionModel: reflectionModelForAdmission,
+                transport: config.llm?.transport,
             });
             const admissionModelReflection = resolveAdmissionModel({
                 admissionControl: config.admissionControl,
                 lane: "reflection",
                 globalModel: llmModel,
                 reflectionModel: reflectionModelForAdmission,
+                transport: config.llm?.transport,
             });
             const globalThinkLevel = config.llm?.thinkLevel;
             const laneAffinity = config.admissionControl?.modelAffinity === "lane";
             const reflectionThinkLevel = laneAffinity
                 ? (asNonEmptyString(config.memoryReflection?.thinkLevel) ?? globalThinkLevel)
                 : globalThinkLevel;
-            const admissionClientFor = (model, thinkLevel) => {
-                const directModel = normalizeDirectModelRef(model);
-                return directModel === llmModel && thinkLevel === globalThinkLevel
+            const admissionHostTransport = config.llm?.transport === "host";
+            const admissionModelExplicitBase = Boolean(asNonEmptyString(config.admissionControl?.model));
+            const admissionModelExplicitExtraction = admissionModelExplicitBase || llmModelExplicit;
+            const admissionModelExplicitReflection = admissionModelExplicitBase ||
+                (laneAffinity && Boolean(reflectionModelForAdmission)) ||
+                llmModelExplicit;
+            const admissionClientFor = (model, thinkLevel, modelExplicit) => {
+                // Host transport keeps the full catalog reference (the host runtime
+                // resolves it); only the direct transport needs the provider-stripped
+                // form. Stripping under host can bypass the selected catalog provider.
+                const clientModel = admissionHostTransport ? model.trim() : normalizeDirectModelRef(model);
+                return clientModel === llmModel && thinkLevel === globalThinkLevel && modelExplicit === llmModelExplicit
                     ? llmClient
-                    : makeClientForModel(directModel, thinkLevel);
+                    : makeClientForModel(clientModel, thinkLevel, modelExplicit);
             };
             // The plugin-level batchChunkSize knob bounds the batch-utility stage
             // too; it is injected here rather than parsed from the admissionControl
@@ -2023,14 +2037,14 @@ function _initPluginState(api) {
                 ...config.admissionControl,
                 batchChunkSize: config.batchChunkSize,
             };
-            admissionController = createAdmissionController(store, admissionClientFor(admissionModelExtraction, globalThinkLevel), admissionConfigWithChunk, (msg) => api.logger.debug(msg));
+            admissionController = createAdmissionController(store, admissionClientFor(admissionModelExtraction, globalThinkLevel, admissionModelExplicitExtraction), admissionConfigWithChunk, (msg) => api.logger.debug(msg));
             // modelAffinity "lane": the mapped-reflection admission judge rides the
             // reflection lane's model (and thinkLevel); "global" keeps every lane
             // on the plugin llm, judge included, sharing one controller instance.
             admissionControllerReflectionLane =
                 admissionModelReflection === admissionModelExtraction && reflectionThinkLevel === globalThinkLevel
                     ? admissionController
-                    : createAdmissionController(store, admissionClientFor(admissionModelReflection, reflectionThinkLevel), admissionConfigWithChunk, (msg) => api.logger.debug(msg));
+                    : createAdmissionController(store, admissionClientFor(admissionModelReflection, reflectionThinkLevel, admissionModelExplicitReflection), admissionConfigWithChunk, (msg) => api.logger.debug(msg));
             if (admissionController && config.smartExtraction === false) {
                 api.logger.info("memory-lancedb-pro: admission control constructed for capture fallbacks (smart extraction inactive)");
             }
@@ -2671,6 +2685,7 @@ const memoryLanceDBProPlugin = {
                         auth: llmAuth,
                         apiKey: llmApiKey,
                         model: config.llm?.model || "openai/gpt-oss-120b",
+                        modelExplicit: Boolean(asNonEmptyString(config.llm?.model)),
                         baseURL: llmBaseURL,
                         oauthProvider: llmOauthProvider,
                         oauthPath: llmOauthPath,

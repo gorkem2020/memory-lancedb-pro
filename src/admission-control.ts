@@ -708,28 +708,34 @@ export function normalizeAdmissionModelRef(modelRef: string): string {
  *    audits. Every other lane stays on the global model.
  * 3. Default ("global", or the knob absent): every lane uses the global
  *    model — today's behavior, unchanged.
- * Every returned model passes through normalizeAdmissionModelRef so a
- * core-style provider-prefixed string reaches this plugin's OpenRouter-direct
- * client in the form it requires, regardless of which of the three paths
- * above produced it.
+ * Normalization is transport-aware: on the direct transport every returned
+ * model passes through normalizeAdmissionModelRef so a core-style
+ * provider-prefixed string reaches this plugin's OpenRouter-direct client in
+ * the form it requires. On the host transport the reference is returned
+ * whole (trimmed only): the host-managed runtime resolves the full catalog
+ * form itself, and stripping the provider segment there can bypass the
+ * selected catalog provider or fail its allowlist.
  */
 export function resolveAdmissionModel(params: {
   admissionControl: Pick<AdmissionControlConfig, "model" | "modelAffinity">;
   lane: AdmissionLane;
   globalModel: string;
   reflectionModel?: string;
+  transport?: "direct" | "host";
 }): string {
+  const norm = (modelRef: string): string =>
+    params.transport === "host" ? modelRef.trim() : normalizeAdmissionModelRef(modelRef);
   const explicit = params.admissionControl.model?.trim();
   if (explicit) {
-    return normalizeAdmissionModelRef(explicit);
+    return norm(explicit);
   }
 
   if (params.admissionControl.modelAffinity === "lane" && params.lane === "reflection") {
     const reflectionModel = params.reflectionModel?.trim();
-    return normalizeAdmissionModelRef(reflectionModel || params.globalModel);
+    return norm(reflectionModel || params.globalModel);
   }
 
-  return normalizeAdmissionModelRef(params.globalModel);
+  return norm(params.globalModel);
 }
 
 function buildReason(details: {

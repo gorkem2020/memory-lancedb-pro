@@ -2654,6 +2654,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
           ? undefined
           : config.embedding.baseURL;
     const llmModel = config.llm?.model || "openai/gpt-oss-120b";
+    const llmModelExplicit = Boolean(asNonEmptyString(config.llm?.model));
     const llmOauthPath = llmAuth === "oauth"
       ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
       : undefined;
@@ -2662,11 +2663,13 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     const makeClientForModel = (
       model: string,
       thinkLevel: string | undefined = config.llm?.thinkLevel,
+      modelExplicit: boolean = llmModelExplicit,
     ) =>
       createLlmClient({
         auth: llmAuth,
         apiKey: llmApiKey,
         model,
+        modelExplicit,
         baseURL: llmBaseURL,
         oauthProvider: llmOauthProvider,
         oauthPath: llmOauthPath,
@@ -2679,6 +2682,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
       });
     return {
       llmModel,
+      llmModelExplicit,
       llmTimeoutMs,
       llmClient: makeClientForModel(llmModel),
       makeClientForModel,
@@ -2695,7 +2699,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   let admissionControllerReflectionLane: AdmissionController | null = null;
   if (config.smartExtraction !== false || config.admissionControl?.enabled === true) {
     try {
-      const { llmClient, llmModel, llmTimeoutMs, makeClientForModel } = buildMemoryLlmClient();
+      const { llmClient, llmModel, llmModelExplicit, llmTimeoutMs, makeClientForModel } = buildMemoryLlmClient();
 
       // Model resolution for admission calls: explicit admissionControl.model
       // override > lane affinity (the reflection lane resolves the
@@ -2707,23 +2711,35 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
         lane: "other",
         globalModel: llmModel,
         reflectionModel: reflectionModelForAdmission,
+        transport: config.llm?.transport,
       });
       const admissionModelReflection = resolveAdmissionModel({
         admissionControl: config.admissionControl,
         lane: "reflection",
         globalModel: llmModel,
         reflectionModel: reflectionModelForAdmission,
+        transport: config.llm?.transport,
       });
       const globalThinkLevel = config.llm?.thinkLevel;
       const laneAffinity = config.admissionControl?.modelAffinity === "lane";
       const reflectionThinkLevel = laneAffinity
         ? (asNonEmptyString(config.memoryReflection?.thinkLevel) ?? globalThinkLevel)
         : globalThinkLevel;
-      const admissionClientFor = (model: string, thinkLevel: string | undefined) => {
-        const directModel = normalizeDirectModelRef(model);
-        return directModel === llmModel && thinkLevel === globalThinkLevel
+      const admissionHostTransport = config.llm?.transport === "host";
+      const admissionModelExplicitBase = Boolean(asNonEmptyString(config.admissionControl?.model));
+      const admissionModelExplicitExtraction = admissionModelExplicitBase || llmModelExplicit;
+      const admissionModelExplicitReflection =
+        admissionModelExplicitBase ||
+        (laneAffinity && Boolean(reflectionModelForAdmission)) ||
+        llmModelExplicit;
+      const admissionClientFor = (model: string, thinkLevel: string | undefined, modelExplicit: boolean) => {
+        // Host transport keeps the full catalog reference (the host runtime
+        // resolves it); only the direct transport needs the provider-stripped
+        // form. Stripping under host can bypass the selected catalog provider.
+        const clientModel = admissionHostTransport ? model.trim() : normalizeDirectModelRef(model);
+        return clientModel === llmModel && thinkLevel === globalThinkLevel && modelExplicit === llmModelExplicit
           ? llmClient
-          : makeClientForModel(directModel, thinkLevel);
+          : makeClientForModel(clientModel, thinkLevel, modelExplicit);
       };
 
       // The plugin-level batchChunkSize knob bounds the batch-utility stage
@@ -2735,7 +2751,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
       };
       admissionController = createAdmissionController(
         store,
-        admissionClientFor(admissionModelExtraction, globalThinkLevel),
+        admissionClientFor(admissionModelExtraction, globalThinkLevel, admissionModelExplicitExtraction),
         admissionConfigWithChunk,
         (msg: string) => api.logger.debug(msg),
       );
@@ -2747,7 +2763,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
           ? admissionController
           : createAdmissionController(
               store,
-              admissionClientFor(admissionModelReflection, reflectionThinkLevel),
+              admissionClientFor(admissionModelReflection, reflectionThinkLevel, admissionModelExplicitReflection),
               admissionConfigWithChunk,
               (msg: string) => api.logger.debug(msg),
             );
@@ -3559,6 +3575,7 @@ const memoryLanceDBProPlugin = {
               auth: llmAuth,
               apiKey: llmApiKey,
               model: config.llm?.model || "openai/gpt-oss-120b",
+              modelExplicit: Boolean(asNonEmptyString(config.llm?.model)),
               baseURL: llmBaseURL,
               oauthProvider: llmOauthProvider,
               oauthPath: llmOauthPath,

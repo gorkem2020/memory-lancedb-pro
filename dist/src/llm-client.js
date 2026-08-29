@@ -238,7 +238,12 @@ function createHostClient(config, runtimeLlmComplete, log, warnLog) {
                         },
                         { role: "user", content: prompt },
                     ],
-                    model: config.model,
+                    // Only an operator-selected model rides the request: the host
+                    // runtime treats any supplied model as a model override and
+                    // rejects it unless the plugin's override policy allows it, so a
+                    // plugin-internal default model must be omitted here to let the
+                    // host's own lane default apply.
+                    ...(config.modelExplicit ? { model: config.model } : {}),
                     temperature: temperature ?? 0.1,
                     purpose: `memory-lancedb-pro:${label}`,
                     reasoning: config.thinkLevel?.trim() || DEFAULT_HOST_REASONING_EFFORT,
@@ -533,18 +538,6 @@ function createOauthClient(config, log, warnLog) {
     };
 }
 /** OpenRouter's direct API base URL, used as the host->direct fallback's default when llm.baseURL is not configured. */
-const OPENROUTER_DIRECT_BASE_URL = "https://openrouter.ai/api/v1";
-/**
- * Resolves the baseURL for a host->direct fallback client: an explicitly
- * configured llm.baseURL passes through unchanged, otherwise the fallback
- * defaults to OpenRouter rather than inheriting whatever baseURL happened
- * to be on the config (which, for a host-transport setup, should not be
- * the embedding lane's baseURL -- see the credential-hygiene fix at the
- * createLlmClient callsite).
- */
-export function resolveDirectFallbackBaseURL(configuredBaseURL) {
-    return configuredBaseURL?.trim() || OPENROUTER_DIRECT_BASE_URL;
-}
 // Module-level (not per-client) so the "runtime surface unavailable"
 // warning is emitted once per process even though createLlmClient is
 // called once per lane (extraction, admission, CLI) and each call would
@@ -582,20 +575,29 @@ export function createLlmClient(config) {
             hostTransportFallbackWarned = true;
             (warnLog ?? log)("memory-lancedb-pro: llm-client transport \"host\" is configured but the OpenClaw runtime.llm.complete surface is unavailable on this host; falling back to the direct transport");
         }
+        // The configured model may be a core-style catalog reference (e.g.
+        // "openrouter/anthropic/claude-...") that only the host-managed runtime
+        // resolves; the fallback transports need the bare provider-stripped id.
+        // Only this fallback path normalizes -- an explicitly configured direct
+        // transport keeps sending whatever model string it was given, unchanged.
+        config = { ...config, model: normalizeDirectModelRef(config.model) };
+        if (config.auth === "oauth") {
+            // The OAuth client owns its endpoint and credential contract, so it is
+            // reachable on fallback without an apiKey (checking apiKey first used
+            // to make host-unavailable OAuth setups unreachable).
+            return createOauthClient(config, log, warnLog);
+        }
         if (!config.apiKey) {
             throw new Error("memory-lancedb-pro: llm-client transport \"host\" fell back to the direct transport, but no llm.apiKey is configured. " +
                 "The direct fallback does not inherit embedding.apiKey when transport is \"host\" -- set llm.apiKey explicitly.");
         }
-        // The configured model may be a core-style catalog reference (e.g.
-        // "openrouter/anthropic/claude-...") that only the host-managed runtime
-        // resolves; the direct transport needs the bare provider-stripped id.
-        // Only this fallback path normalizes -- an explicitly configured direct
-        // transport keeps sending whatever model string it was given, unchanged.
-        config = {
-            ...config,
-            model: normalizeDirectModelRef(config.model),
-            baseURL: resolveDirectFallbackBaseURL(config.baseURL),
-        };
+        const explicitFallbackBaseURL = config.baseURL?.trim();
+        if (!explicitFallbackBaseURL) {
+            throw new Error("memory-lancedb-pro: llm-client transport \"host\" fell back to the direct transport, but no llm.baseURL is configured. " +
+                "Refusing to send llm.apiKey to an inferred third-party endpoint -- set llm.baseURL explicitly for the fallback.");
+        }
+        config = { ...config, baseURL: explicitFallbackBaseURL };
+        return createApiKeyClient(config, log, warnLog);
     }
     if (config.auth === "oauth") {
         return createOauthClient(config, log, warnLog);

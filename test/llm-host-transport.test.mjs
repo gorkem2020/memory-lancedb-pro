@@ -53,6 +53,7 @@ describe("LLM host transport", () => {
     const llm = createLlmClient({
       transport: "host",
       model: "openrouter/anthropic/claude-opus-4-8",
+      modelExplicit: true,
       runtimeLlmComplete,
     });
 
@@ -78,6 +79,7 @@ describe("LLM host transport", () => {
     const llm = createLlmClient({
       transport: "host",
       model: "openrouter/anthropic/claude-opus-4-8",
+      modelExplicit: true,
       runtimeLlmComplete,
     });
 
@@ -392,6 +394,7 @@ describe("LLM host->direct fallback: warn dedupe and credential hygiene", () => 
       transport: "host",
       auth: "api-key",
       apiKey: "test-api-key",
+      baseURL: "http://127.0.0.1:9999/v1",
       model: "gpt-4o-mini",
       warnLog: (msg) => warnLogs.push(msg),
     });
@@ -399,6 +402,7 @@ describe("LLM host->direct fallback: warn dedupe and credential hygiene", () => 
       transport: "host",
       auth: "api-key",
       apiKey: "test-api-key",
+      baseURL: "http://127.0.0.1:9999/v1",
       model: "gpt-4o-mini",
       warnLog: (msg) => warnLogs.push(msg),
     });
@@ -427,11 +431,50 @@ describe("LLM host->direct fallback: warn dedupe and credential hygiene", () => 
     );
   });
 
-  it("resolveDirectFallbackBaseURL defaults to the OpenRouter API when unset, and passes an explicit baseURL through unchanged", () => {
-    const { resolveDirectFallbackBaseURL } = jiti("../src/llm-client.ts");
-    assert.equal(resolveDirectFallbackBaseURL(undefined), "https://openrouter.ai/api/v1");
-    assert.equal(resolveDirectFallbackBaseURL(""), "https://openrouter.ai/api/v1");
-    assert.equal(resolveDirectFallbackBaseURL("   "), "https://openrouter.ai/api/v1");
-    assert.equal(resolveDirectFallbackBaseURL("http://127.0.0.1:9999/v1"), "http://127.0.0.1:9999/v1");
+  it("fails closed when the fallback has llm.apiKey but no llm.baseURL, instead of inferring a third-party endpoint", () => {
+    assert.throws(
+      () =>
+        createLlmClient({
+          transport: "host",
+          auth: "api-key",
+          apiKey: "test-api-key",
+          model: "anthropic/claude-opus-4-8",
+          warnLog: () => {},
+        }),
+      (err) => {
+        assert.match(err.message, /llm\.baseURL/);
+        assert.match(err.message, /Refusing to send llm\.apiKey to an inferred third-party endpoint/);
+        return true;
+      },
+    );
+  });
+
+  it("does not route the fallback credential to a default endpoint for blank baseURL values either", () => {
+    for (const blank of ["", "   "]) {
+      assert.throws(
+        () =>
+          createLlmClient({
+            transport: "host",
+            auth: "api-key",
+            apiKey: "test-api-key",
+            baseURL: blank,
+            model: "anthropic/claude-opus-4-8",
+            warnLog: () => {},
+          }),
+        /llm\.baseURL/,
+      );
+    }
+  });
+
+  it("reaches the OAuth client on host fallback without an apiKey (auth precedes the apiKey requirement)", () => {
+    const llm = createLlmClient({
+      transport: "host",
+      auth: "oauth",
+      oauthProvider: "anthropic",
+      oauthPath: "/tmp/synthetic-oauth-fixture.json",
+      model: "openrouter/anthropic/claude-opus-4-8",
+      warnLog: () => {},
+    });
+    assert.equal(typeof llm.completeJson, "function", "expected a constructed OAuth fallback client");
   });
 });

@@ -151,3 +151,36 @@ describe("resolveAdmissionModel", () => {
     assert.equal(reflection, "anthropic/claude-opus-4-8");
   });
 });
+
+describe("resolveAdmissionModel — host transport keeps the full catalog reference", () => {
+  it("does not strip the provider prefix from an explicit admissionControl.model on the host transport", () => {
+    const model = resolveAdmissionModel({
+      admissionControl: { model: "openrouter/vendor-example/model-x" },
+      lane: "other",
+      globalModel: "vendor-example/model-y",
+      transport: "host",
+    });
+    assert.equal(model, "openrouter/vendor-example/model-x");
+  });
+
+  it("does not strip the lane-affinity reflection model on the host transport", () => {
+    const model = resolveAdmissionModel({
+      admissionControl: { modelAffinity: "lane" },
+      lane: "reflection",
+      globalModel: "vendor-example/model-y",
+      reflectionModel: "openrouter/vendor-example/model-z",
+      transport: "host",
+    });
+    assert.equal(model, "openrouter/vendor-example/model-z");
+  });
+
+  it("still strips the openrouter prefix on the direct transport (unchanged behavior)", () => {
+    const model = resolveAdmissionModel({
+      admissionControl: { model: "openrouter/vendor-example/model-x" },
+      lane: "other",
+      globalModel: "vendor-example/model-y",
+      transport: "direct",
+    });
+    assert.equal(model, "vendor-example/model-x");
+  });
+});
