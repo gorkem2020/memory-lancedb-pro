@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { statSync } from "node:fs";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import type { MemoryEntry } from "./store.js";
 import {
   parseSmartMetadata,
@@ -34,6 +36,12 @@ export interface ConsolidateCandidate {
   factKey?: string;
   source?: string;
   validFrom?: number;
+  /** Memoized at build time: clustering compares every pair, so per-pair recomputation is O(n^2) waste. */
+  topicTokens: Set<string>;
+  reversal: boolean;
+  topicLinkEligible: boolean;
+  /** Unit-normalized vector (null when the row has none): pairwise cosine reduces to a dot product. */
+  unitVector: number[] | null;
 }
 
 const REVERSAL_SIGNAL_PATTERN =
@@ -91,9 +99,7 @@ function tokensMatch(a: string, b: string): boolean {
   return shorter.length >= 4 && longer.includes(shorter);
 }
 
-function shareSignificantTopicToken(a: string, b: string): boolean {
-  const tokensA = extractTopicTokens(a);
-  const tokensB = extractTopicTokens(b);
+function shareSignificantTopicToken(tokensA: Set<string>, tokensB: Set<string>): boolean {
   for (const tokenA of tokensA) {
     for (const tokenB of tokensB) {
       if (tokensMatch(tokenA, tokenB)) return true;
@@ -110,9 +116,7 @@ function shareSignificantTopicToken(a: string, b: string): boolean {
 // evenings" both reduce to essentially {"cola"}); two short statements
 // about DIFFERENT facts rarely do, which is what keeps this fallback from
 // bridging unrelated rows the way a single-shared-token check would.
-function topicTokenOverlapRatio(a: string, b: string): number {
-  const tokensA = extractTopicTokens(a);
-  const tokensB = extractTopicTokens(b);
+function topicTokenOverlapRatio(tokensA: Set<string>, tokensB: Set<string>): number {
   if (tokensA.size === 0 || tokensB.size === 0) return 0;
   let matches = 0;
   for (const tokenA of tokensA) {
@@ -128,18 +132,22 @@ function topicTokenOverlapRatio(a: string, b: string): number {
 
 const NEAR_DUPLICATE_TOKEN_OVERLAP_RATIO = 0.6;
 
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length === 0 || b.length === 0 || a.length !== b.length) return 0;
+function normalizeVector(v: number[]): number[] | null {
+  if (v.length === 0) return null;
+  let norm = 0;
+  for (let i = 0; i < v.length; i++) norm += v[i] * v[i];
+  if (norm === 0) return null;
+  const inv = 1 / Math.sqrt(norm);
+  const out = new Array<number>(v.length);
+  for (let i = 0; i < v.length; i++) out[i] = v[i] * inv;
+  return out;
+}
+
+function unitDot(a: number[], b: number[]): number {
+  if (a.length !== b.length) return 0;
   let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  if (normA === 0 || normB === 0) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot;
 }
 
 export function buildConsolidateCandidate(entry: MemoryEntry): ConsolidateCandidate {
@@ -155,6 +163,10 @@ export function buildConsolidateCandidate(entry: MemoryEntry): ConsolidateCandid
     factKey,
     source: meta.source,
     validFrom: meta.valid_from,
+    topicTokens: extractTopicTokens(abstract),
+    reversal: looksLikeReversal(abstract),
+    topicLinkEligible: isEligibleForTopicLink(abstract),
+    unitVector: normalizeVector(entry.vector),
   };
 }
 
@@ -163,9 +175,7 @@ function isDirectlyLinked(
   b: ConsolidateCandidate,
   similarityThreshold: number
 ): boolean {
-  const va = a.entry.vector;
-  const vb = b.entry.vector;
-  if (va.length > 0 && vb.length > 0 && cosineSimilarity(va, vb) >= similarityThreshold) {
+  if (a.unitVector && b.unitVector && unitDot(a.unitVector, b.unitVector) >= similarityThreshold) {
     return true;
   }
   if (a.factKey && a.factKey === b.factKey) {
@@ -179,12 +189,12 @@ function isDirectlyLinked(
   // about one topic, so it only widens linking for the exact case cosine +
   // fact_key miss, not for arbitrary unrelated or multi-topic narrative rows.
   if (
-    (looksLikeReversal(a.abstract) || looksLikeReversal(b.abstract)) &&
+    (a.reversal || b.reversal) &&
     a.memoryCategory &&
     a.memoryCategory === b.memoryCategory &&
-    isEligibleForTopicLink(a.abstract) &&
-    isEligibleForTopicLink(b.abstract) &&
-    shareSignificantTopicToken(a.abstract, b.abstract)
+    a.topicLinkEligible &&
+    b.topicLinkEligible &&
+    shareSignificantTopicToken(a.topicTokens, b.topicTokens)
   ) {
     return true;
   }
@@ -200,9 +210,9 @@ function isDirectlyLinked(
   if (
     a.memoryCategory &&
     a.memoryCategory === b.memoryCategory &&
-    isEligibleForTopicLink(a.abstract) &&
-    isEligibleForTopicLink(b.abstract) &&
-    topicTokenOverlapRatio(a.abstract, b.abstract) >= NEAR_DUPLICATE_TOKEN_OVERLAP_RATIO
+    a.topicLinkEligible &&
+    b.topicLinkEligible &&
+    topicTokenOverlapRatio(a.topicTokens, b.topicTokens) >= NEAR_DUPLICATE_TOKEN_OVERLAP_RATIO
   ) {
     return true;
   }
@@ -325,6 +335,16 @@ export interface ConsolidateAuditEntry {
   absorbedIds: string[];
   reason: string;
   scope: string;
+  /**
+   * Writes that failed inside an otherwise-applied cluster. The write order
+   * makes every partial state safe (merge: survivor carries the merged
+   * superset before any absorption; supersede: the survivor was never the
+   * row being invalidated), and a failed row simply stays ACTIVE — the
+   * pre-consolidate status quo — so a rerun re-clusters and retries it
+   * idempotently. Non-empty = the operator must be told, never silently
+   * counted as fully applied.
+   */
+  partialFailures?: Array<{ id: string; step: "invalidate-absorbed" | "annotate-survivor"; error: string }>;
 }
 
 // ============================================================================
@@ -411,6 +431,151 @@ export function formatConsolidatePlanForDisplay(clusters: ClusterPlanReport[]): 
 }
 
 // No `delete` method: no LLM verdict path may hard-delete a row. Both
+// ============================================================================
+// Settled-fingerprint ledger persistence (crash- and concurrency-safe)
+// ============================================================================
+
+export type SettledLedger = Record<string, Array<{ fp: string; at: number }>>;
+
+export const SETTLED_LEDGER_MAX_PER_SCOPE = 5000;
+export const SETTLED_LEDGER_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+export const SETTLED_LEDGER_LOCK_STALE_MS = 60_000;
+
+export function normalizeSettledLedger(parsed: unknown, now: number): SettledLedger {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  const out: SettledLedger = {};
+  for (const [scope, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!Array.isArray(value)) continue;
+    const entries: Array<{ fp: string; at: number }> = [];
+    for (const item of value) {
+      if (typeof item === "string") {
+        // Legacy format: bare fingerprint strings, stamped "now" so pruning
+        // ages them out from this run forward instead of dropping them cold.
+        entries.push({ fp: item, at: now });
+      } else if (item && typeof item === "object" && typeof (item as { fp?: unknown }).fp === "string") {
+        const at = typeof (item as { at?: unknown }).at === "number" ? (item as { at: number }).at : now;
+        entries.push({ fp: (item as { fp: string }).fp, at });
+      }
+    }
+    if (entries.length > 0) out[scope] = entries;
+  }
+  return out;
+}
+
+export function pruneSettledLedger(ledger: SettledLedger, now: number): void {
+  for (const scope of Object.keys(ledger)) {
+    const kept = ledger[scope]
+      .filter((e) => now - e.at <= SETTLED_LEDGER_MAX_AGE_MS)
+      .sort((a, b) => b.at - a.at)
+      .slice(0, SETTLED_LEDGER_MAX_PER_SCOPE);
+    if (kept.length === 0) delete ledger[scope];
+    else ledger[scope] = kept;
+  }
+}
+
+export async function loadConsolidateSettledLedger(ledgerPath: string): Promise<SettledLedger> {
+  let raw: string;
+  try {
+    raw = await readFile(ledgerPath, "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return {};
+    console.warn(`consolidate: could not read settled ledger (${String(err)}); continuing with an empty ledger`);
+    return {};
+  }
+  try {
+    return normalizeSettledLedger(JSON.parse(raw), Date.now());
+  } catch (err) {
+    // A corrupt ledger must be REPORTED, not silently treated as empty: the
+    // damaged file is set aside (so the evidence survives and the next write
+    // starts clean) and every previously settled cluster will be re-decided.
+    const asidePath = `${ledgerPath}.corrupt-${Date.now()}`;
+    try {
+      await rename(ledgerPath, asidePath);
+      console.warn(
+        `consolidate: settled ledger is corrupt (${String(err)}); moved it aside to ${asidePath}. Previously settled clusters will be re-decided.`,
+      );
+    } catch {
+      console.warn(`consolidate: settled ledger is corrupt (${String(err)}) and could not be moved aside; previously settled clusters will be re-decided.`);
+    }
+    return {};
+  }
+}
+
+/**
+ * Persist newly settled fingerprints with concurrency and crash safety:
+ * a mkdir-based lock (with stale takeover) serializes writers, the CURRENT
+ * file is re-read and merged under the lock so a concurrent agent's
+ * fingerprints are never lost, pruning bounds the ledger (per-scope cap +
+ * max age), and the write lands via temp file + atomic rename so a crash
+ * can truncate only the temp file, never the ledger itself.
+ */
+export async function saveConsolidateSettledLedger(
+  ledgerPath: string,
+  scope: string,
+  newlySettled: string[],
+): Promise<void> {
+  if (newlySettled.length === 0) return;
+  const lockPath = `${ledgerPath}.lock`;
+  const now = Date.now();
+  let locked = false;
+  try {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      try {
+        await mkdir(lockPath);
+        locked = true;
+        break;
+      } catch {
+        try {
+          const age = now - statSync(lockPath).mtimeMs;
+          if (age > SETTLED_LEDGER_LOCK_STALE_MS) {
+            await rm(lockPath, { recursive: true, force: true });
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    if (!locked) {
+      console.warn(`consolidate: could not acquire settled-ledger lock at ${lockPath}; skipping persist (fingerprints will be re-derived next run)`);
+      return;
+    }
+    const current = await loadConsolidateSettledLedger(ledgerPath);
+    const merged = new Map((current[scope] ?? []).map((e) => [e.fp, e] as const));
+    for (const fp of newlySettled) merged.set(fp, { fp, at: now });
+    current[scope] = [...merged.values()];
+    pruneSettledLedger(current, now);
+    const tmpPath = `${ledgerPath}.tmp-${process.pid}`;
+    await writeFile(tmpPath, JSON.stringify(current, null, 2), "utf-8");
+    await rename(tmpPath, ledgerPath);
+  } catch (err) {
+    console.warn(`consolidate: could not persist settled ledger: ${String(err)}`);
+  } finally {
+    if (locked) {
+      await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+/**
+ * consolidation_audit is an append-only ARRAY of audit events. Rows written
+ * by earlier consolidate versions may carry a single scalar object; it is
+ * wrapped, never overwritten, so no prior audit event is ever lost.
+ */
+export function appendConsolidationAudit(
+  existingMeta: object | undefined,
+  event: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  const prior = (existingMeta as { consolidation_audit?: unknown } | undefined)?.consolidation_audit;
+  const priorEntries = Array.isArray(prior)
+    ? prior
+    : prior && typeof prior === "object"
+      ? [prior as Record<string, unknown>]
+      : [];
+  return [...priorEntries, event];
+}
+
 // applyMergeVerdict and applySupersedeVerdict soft-invalidate absorbed rows
 // via `update` only. Hard delete stays an operator-only CLI command, wired
 // through a completely separate code path outside this pipeline.
@@ -538,6 +703,7 @@ async function writeMergeVerdict(
     absorbedIds.push(members[idx - 1].entry.id);
   }
 
+  const survivorExistingMeta = parseSmartMetadata(survivor.entry.metadata, survivor.entry);
   const patchedMeta = buildSmartMetadata(survivor.entry, {
     l0_abstract: abstract,
     l1_overview: overview,
@@ -545,7 +711,9 @@ async function writeMergeVerdict(
   });
   const auditedMeta = {
     ...patchedMeta,
-    consolidation_audit: { action: "merge", absorbedIds, reason: verdict.reason, at: now },
+    consolidation_audit: appendConsolidationAudit(survivorExistingMeta, {
+      action: "merge", absorbedIds, reason: verdict.reason, at: now,
+    }),
   };
   await deps.update(
     survivor.entry.id,
@@ -560,22 +728,42 @@ async function writeMergeVerdict(
   // independently inspectable without cross-referencing the survivor's
   // audit. No LLM verdict path may call a hard delete; hard delete stays an
   // operator-only CLI command.
+  // Ordered for failure-safety: the survivor above now carries the merged
+  // SUPERSET, so an absorbed row whose invalidation fails below merely stays
+  // active as a duplicate — the pre-consolidate status quo. Each invalidation
+  // is attempted independently (one failure never abandons the rest), the
+  // failures ride the audit entry for operator-visible reporting, and a rerun
+  // re-clusters the still-active rows and retries idempotently.
+  const partialFailures: NonNullable<ConsolidateAuditEntry["partialFailures"]> = [];
   for (const idx of verdict.absorbedIndices!) {
     const absorbed = members[idx - 1];
-    const existingMeta = parseSmartMetadata(absorbed.entry.metadata, absorbed.entry);
-    const invalidatedMeta = buildSmartMetadata(absorbed.entry, {
-      invalidated_at: now,
-      superseded_by: survivor.entry.id,
-      relations: appendRelation(existingMeta.relations, { type: "superseded_by", targetId: survivor.entry.id }),
-    });
-    const auditedAbsorbedMeta = {
-      ...invalidatedMeta,
-      consolidation_audit: { action: "merge", survivorId: survivor.entry.id, reason: verdict.reason, at: now },
-    };
-    await deps.update(absorbed.entry.id, { metadata: stringifySmartMetadata(auditedAbsorbedMeta) }, scopeFilter);
+    try {
+      const existingMeta = parseSmartMetadata(absorbed.entry.metadata, absorbed.entry);
+      const invalidatedMeta = buildSmartMetadata(absorbed.entry, {
+        invalidated_at: now,
+        superseded_by: survivor.entry.id,
+        relations: appendRelation(existingMeta.relations, { type: "superseded_by", targetId: survivor.entry.id }),
+      });
+      const auditedAbsorbedMeta = {
+        ...invalidatedMeta,
+        consolidation_audit: appendConsolidationAudit(existingMeta, {
+          action: "merge", survivorId: survivor.entry.id, reason: verdict.reason, at: now,
+        }),
+      };
+      await deps.update(absorbed.entry.id, { metadata: stringifySmartMetadata(auditedAbsorbedMeta) }, scopeFilter);
+    } catch (err) {
+      partialFailures.push({ id: absorbed.entry.id, step: "invalidate-absorbed", error: String(err) });
+    }
   }
 
-  return { action: "merge", survivorId: survivor.entry.id, absorbedIds, reason: verdict.reason, scope: survivor.entry.scope };
+  return {
+    action: "merge",
+    survivorId: survivor.entry.id,
+    absorbedIds,
+    reason: verdict.reason,
+    scope: survivor.entry.scope,
+    ...(partialFailures.length > 0 ? { partialFailures } : {}),
+  };
 }
 
 async function applySupersedeVerdict(
@@ -588,18 +776,33 @@ async function applySupersedeVerdict(
   const survivor = members[verdict.survivorIndex! - 1];
   const factKey = survivor.factKey || members[verdict.absorbedIndices![0] - 1].factKey || "";
   const absorbedIds: string[] = [];
+  // Failure-safety mirror of the merge path: the survivor is never the row
+  // being invalidated, so a failed absorbed write leaves that row active (a
+  // surviving duplicate, the status quo) while the rest still proceed. A
+  // cluster where EVERY absorbed write failed applied nothing and throws so
+  // the caller reports it as a failed cluster rather than an applied one.
+  const partialFailures: NonNullable<ConsolidateAuditEntry["partialFailures"]> = [];
 
   for (const idx of verdict.absorbedIndices!) {
     const absorbed = members[idx - 1];
-    const existingMeta = parseSmartMetadata(absorbed.entry.metadata, absorbed.entry);
-    const invalidatedMetadata = buildSmartMetadata(absorbed.entry, {
-      fact_key: factKey || existingMeta.fact_key,
-      invalidated_at: now,
-      superseded_by: survivor.entry.id,
-      relations: appendRelation(existingMeta.relations, { type: "superseded_by", targetId: survivor.entry.id }),
-    });
-    await deps.update(absorbed.entry.id, { metadata: stringifySmartMetadata(invalidatedMetadata) }, scopeFilter);
-    absorbedIds.push(absorbed.entry.id);
+    try {
+      const existingMeta = parseSmartMetadata(absorbed.entry.metadata, absorbed.entry);
+      const invalidatedMetadata = buildSmartMetadata(absorbed.entry, {
+        fact_key: factKey || existingMeta.fact_key,
+        invalidated_at: now,
+        superseded_by: survivor.entry.id,
+        relations: appendRelation(existingMeta.relations, { type: "superseded_by", targetId: survivor.entry.id }),
+      });
+      await deps.update(absorbed.entry.id, { metadata: stringifySmartMetadata(invalidatedMetadata) }, scopeFilter);
+      absorbedIds.push(absorbed.entry.id);
+    } catch (err) {
+      partialFailures.push({ id: absorbed.entry.id, step: "invalidate-absorbed", error: String(err) });
+    }
+  }
+  if (absorbedIds.length === 0 && partialFailures.length > 0) {
+    throw new Error(
+      `supersede applied nothing: every absorbed invalidation failed (${partialFailures.map((f) => f.error).join("; ")})`,
+    );
   }
 
   // An append-only (events/cases) survivor is left byte-untouched: the shield
@@ -610,18 +813,34 @@ async function applySupersedeVerdict(
     survivor.memoryCategory && APPEND_ONLY_CATEGORIES.has(survivor.memoryCategory),
   );
   if (!survivorIsAppendOnly) {
-    const survivorMeta = parseSmartMetadata(survivor.entry.metadata, survivor.entry);
-    const patchedSurvivorMeta = buildSmartMetadata(survivor.entry, {
-      fact_key: factKey || survivorMeta.fact_key,
-    });
-    const auditedMeta = {
-      ...patchedSurvivorMeta,
-      consolidation_audit: { action: "supersede", absorbedIds, reason: verdict.reason, at: now },
-    };
-    await deps.update(survivor.entry.id, { metadata: stringifySmartMetadata(auditedMeta) }, scopeFilter);
+    try {
+      const survivorMeta = parseSmartMetadata(survivor.entry.metadata, survivor.entry);
+      const patchedSurvivorMeta = buildSmartMetadata(survivor.entry, {
+        fact_key: factKey || survivorMeta.fact_key,
+      });
+      const auditedMeta = {
+        ...patchedSurvivorMeta,
+        consolidation_audit: appendConsolidationAudit(survivorMeta, {
+          action: "supersede", absorbedIds, reason: verdict.reason, at: now,
+        }),
+      };
+      await deps.update(survivor.entry.id, { metadata: stringifySmartMetadata(auditedMeta) }, scopeFilter);
+    } catch (err) {
+      // Cosmetic annotation only: the invalidations above are what change
+      // retrieval, so a failed survivor patch degrades to a reported partial,
+      // never to unwinding the applied invalidations.
+      partialFailures.push({ id: survivor.entry.id, step: "annotate-survivor", error: String(err) });
+    }
   }
 
-  return { action: "supersede", survivorId: survivor.entry.id, absorbedIds, reason: verdict.reason, scope: survivor.entry.scope };
+  return {
+    action: "supersede",
+    survivorId: survivor.entry.id,
+    absorbedIds,
+    reason: verdict.reason,
+    scope: survivor.entry.scope,
+    ...(partialFailures.length > 0 ? { partialFailures } : {}),
+  };
 }
 
 export interface ClusterPlanReport {
@@ -646,8 +865,8 @@ export interface ClusterPlanReport {
   absorbedIds?: string[];
   /** Item 8: precomputed at plan-build time, applied verbatim at execution. */
   mergedContent?: ConsolidateMergedContent;
-  /** Snapshot used by the item-8 staleness guard: each member's id + exact metadata string at plan-build time. */
-  staleness: Array<{ id: string; metadata: string | undefined }>;
+  /** Snapshot used by the item-8 staleness guard: each member's id + exact text + exact metadata string at plan-build time. */
+  staleness: Array<{ id: string; text: string; metadata: string | undefined }>;
 }
 
 export interface RunConsolidateOptions {
@@ -662,6 +881,14 @@ export interface RunConsolidateOptions {
   now?: number;
   /** --yes: bypasses the item-7 cost gate without ever calling confirmCost. */
   autoConfirm?: boolean;
+  /**
+   * Row-scan bound (default DEFAULT_SCAN_LIMIT). The clustering pass is
+   * O(n^2) in the candidate count, so an unbounded scan over a huge scope
+   * gets pathologically expensive before the first LLM call; a truncated
+   * scan is reported via scanTruncated and the operator can raise the bound
+   * explicitly (--scan-limit) when a full pass is genuinely wanted.
+   */
+  scanLimit?: number;
   /**
    * Fingerprints of clusters settled by previous runs (skip/contradict
    * verdicts and shield-blocked verdicts). Matching clusters are dropped
@@ -707,6 +934,10 @@ export interface RunConsolidateResult {
   executed: boolean;
   /** Clusters withheld at execution time because a member row changed or disappeared since the plan was built. */
   staleSkipped: Array<{ clusterIndex: number; memberIds: string[] }>;
+  /** Clusters whose apply wrote NOTHING (first write failed); unsettled, retried by the next run. */
+  applyFailed: Array<{ clusterIndex: number; memberIds: string[]; action: "merge" | "supersede"; error: string }>;
+  /** True when fetchRows returned more rows than the scan limit: the scan was truncated to the limit. */
+  scanTruncated: boolean;
   /** Clusters whose verdict was missing/unparseable while the decide call itself succeeded. */
   skippedMalformed: number;
   /** Clusters left undecided because the decide call returned no response at all. */
@@ -720,7 +951,15 @@ export interface RunConsolidateResult {
 
 const DEFAULT_SIMILARITY_THRESHOLD = 0.86;
 const DEFAULT_CLUSTER_CAP = 8;
-const DEFAULT_SCAN_LIMIT = 100_000;
+/**
+ * Default row-scan bound. Clustering is O(n^2) pairwise (dot products over
+ * unit vectors plus memoized token overlap), so the default keeps a worst
+ * case in the low millions of cheap pair checks; operators consolidating a
+ * genuinely larger scope raise it explicitly per run (--scan-limit).
+ */
+export const DEFAULT_SCAN_LIMIT = 2_500;
+/** Max clusters judged in one consolidate-decide LLM call; larger plans are chunked. */
+export const CONSOLIDATE_DECIDE_BATCH_MAX_SIZE = 10;
 
 function abortedResult(
   reason: string,
@@ -739,6 +978,8 @@ function abortedResult(
     applied: [],
     executed: false,
     staleSkipped: [],
+    applyFailed: [],
+    scanTruncated: false,
     skippedMalformed: 0,
     undecidedCallFailed: 0,
     settledSkipped: 0,
@@ -755,10 +996,13 @@ function abortedResult(
  * content moved on.
  */
 export function computeClusterFingerprint(
-  members: Array<{ id: string; metadata: string | undefined }>,
+  members: Array<{ id: string; text: string; metadata: string | undefined }>,
 ): string {
+  // The text rides the fingerprint alongside the metadata: a text-only
+  // update (which also re-embeds, so the vector follows the text) must
+  // re-open a settled cluster, and metadata alone does not see it.
   const parts = members
-    .map((m) => `${m.id}\n${m.metadata ?? ""}`)
+    .map((m) => `${m.id}\n${m.text}\n${m.metadata ?? ""}`)
     .sort()
     .join("\u0000");
   return createHash("sha256").update(parts).digest("hex");
@@ -781,6 +1025,7 @@ async function isClusterFresh(
   for (const snapshot of entry.staleness) {
     const current = await deps.getById(snapshot.id, scopeFilter);
     if (!current) return false;
+    if (current.text !== snapshot.text) return false;
     if (current.metadata !== snapshot.metadata) return false;
   }
   return true;
@@ -792,9 +1037,14 @@ async function executePlan(
   membersByCluster: Map<number, ConsolidateCandidate[]>,
   scopeFilter: string[] | undefined,
   now: number
-): Promise<{ applied: ConsolidateAuditEntry[]; staleSkipped: Array<{ clusterIndex: number; memberIds: string[] }> }> {
+): Promise<{
+  applied: ConsolidateAuditEntry[];
+  staleSkipped: Array<{ clusterIndex: number; memberIds: string[] }>;
+  applyFailed: Array<{ clusterIndex: number; memberIds: string[]; action: "merge" | "supersede"; error: string }>;
+}> {
   const applied: ConsolidateAuditEntry[] = [];
   const staleSkipped: Array<{ clusterIndex: number; memberIds: string[] }> = [];
+  const applyFailed: Array<{ clusterIndex: number; memberIds: string[]; action: "merge" | "supersede"; error: string }> = [];
 
   for (const entry of clusters) {
     if (!entry.action || !entry.verdict) continue;
@@ -816,13 +1066,29 @@ async function executePlan(
           ? await writeMergeVerdict(deps, members, entry.verdict, entry.mergedContent!, scopeFilter, now)
           : await applySupersedeVerdict(deps, members, entry.verdict, scopeFilter, now);
       applied.push(audit);
+      if (audit.partialFailures?.length) {
+        deps.log?.(
+          `memory-consolidate: cluster ${entry.clusterIndex} PARTIALLY applied: ${audit.partialFailures.length} write(s) failed (${audit.partialFailures.map((f) => `${f.step} ${f.id.slice(0, 8)}: ${f.error}`).join("; ")}); failed rows stay active and a rerun retries them`
+        );
+      }
       await deps.onAudit?.(audit);
     } catch (err) {
-      deps.log?.(`memory-consolidate: failed to apply ${entry.action} verdict: ${String(err)}`);
+      // The write functions throw only when NOTHING was applied for the
+      // cluster (merge: the survivor rewrite itself failed before any
+      // absorption; supersede: every absorbed invalidation failed), so a
+      // thrown cluster is reported as failed-not-applied and left unsettled
+      // for the next run to retry.
+      applyFailed.push({
+        clusterIndex: entry.clusterIndex,
+        memberIds: entry.memberIds,
+        action: entry.action,
+        error: String(err),
+      });
+      deps.log?.(`memory-consolidate: cluster ${entry.clusterIndex} FAILED to apply ${entry.action} (nothing written): ${String(err)}`);
     }
   }
 
-  return { applied, staleSkipped };
+  return { applied, staleSkipped, applyFailed };
 }
 
 export async function runConsolidate(
@@ -832,7 +1098,17 @@ export async function runConsolidate(
   const now = options.now ?? Date.now();
   const scopeFilter = options.scopeFilter ?? [options.scope];
 
-  const rawEntries = await deps.fetchRows(scopeFilter, now, DEFAULT_SCAN_LIMIT);
+  const scanLimit = Math.max(1, Math.trunc(options.scanLimit ?? DEFAULT_SCAN_LIMIT));
+  // Fetch one past the limit purely to DETECT truncation; the extra row
+  // never participates in the scan.
+  const fetchedEntries = await deps.fetchRows(scopeFilter, now, scanLimit + 1);
+  const scanTruncated = fetchedEntries.length > scanLimit;
+  const rawEntries = scanTruncated ? fetchedEntries.slice(0, scanLimit) : fetchedEntries;
+  if (scanTruncated) {
+    deps.log?.(
+      `memory-consolidate: scan truncated at ${scanLimit} rows (scope holds more); rerun with a higher --scan-limit to cover the rest`
+    );
+  }
 
   const filtered = rawEntries.filter((entry) => {
     if (entry.category === "reflection" && !options.includeReflectionSlices) return false;
@@ -889,7 +1165,9 @@ export async function runConsolidate(
   for (const unit of units) {
     fingerprintByUnit.set(
       unit,
-      computeClusterFingerprint(unit.members.map((m) => ({ id: m.entry.id, metadata: m.entry.metadata }))),
+      computeClusterFingerprint(
+        unit.members.map((m) => ({ id: m.entry.id, text: m.entry.text, metadata: m.entry.metadata })),
+      ),
     );
   }
   let settledSkipped = 0;
@@ -939,37 +1217,53 @@ export async function runConsolidate(
   }> = [];
   let skippedMalformed = 0;
   let undecidedCallFailed = 0;
-  let decideCallFailed = false;
   const newlySettled: string[] = [];
 
+  const callFailedUnits = new Set<number>();
   if (units.length > 0) {
-    const batchClusters: ConsolidateBatchCluster[] = units.map((unit) => ({
-      clusterIndex: unit.clusterIndex,
-      members: unit.members.map((m, i) => ({
-        index: i + 1,
-        category: m.memoryCategory || "preferences",
-        abstract: m.abstract,
-        overview: m.overview,
-        content: m.content,
-        source: m.source,
-        timestamp: m.entry.timestamp,
-        validFrom: m.validFrom,
-      })),
-    }));
-    const prompt = buildConsolidateBatchPrompt(batchClusters);
-    const raw = await deps.completeJson<Record<string, unknown>>(prompt.user, "consolidate-decide", prompt.system, 0);
-    decideCallFailed = raw === null || raw === undefined;
-    if (decideCallFailed) {
-      deps.log?.(
-        `memory-consolidate: consolidate-decide call returned no response (provider error or timeout); ${units.length} cluster(s) left undecided`
+    // The decide prompt is CHUNKED (CONSOLIDATE_DECIDE_BATCH_MAX_SIZE
+    // clusters per call): a plan-sized single prompt grows without bound and
+    // a single provider rejection would strand every cluster at once. Each
+    // chunk's call is also caught: a thrown completion (provider rejection,
+    // network error) degrades exactly that chunk's clusters to call-failed,
+    // identical to the null-response path.
+    const verdictMap = new Map<number, ConsolidateVerdictResult>();
+    for (let chunkStart = 0; chunkStart < units.length; chunkStart += CONSOLIDATE_DECIDE_BATCH_MAX_SIZE) {
+      const chunkUnits = units.slice(chunkStart, chunkStart + CONSOLIDATE_DECIDE_BATCH_MAX_SIZE);
+      const batchClusters: ConsolidateBatchCluster[] = chunkUnits.map((unit) => ({
+        clusterIndex: unit.clusterIndex,
+        members: unit.members.map((m, i) => ({
+          index: i + 1,
+          category: m.memoryCategory || "preferences",
+          abstract: m.abstract,
+          overview: m.overview,
+          content: m.content,
+          source: m.source,
+          timestamp: m.entry.timestamp,
+          validFrom: m.validFrom,
+        })),
+      }));
+      const prompt = buildConsolidateBatchPrompt(batchClusters);
+      let raw: Record<string, unknown> | null = null;
+      try {
+        raw = await deps.completeJson<Record<string, unknown>>(prompt.user, "consolidate-decide", prompt.system, 0);
+      } catch (err) {
+        deps.log?.(`memory-consolidate: consolidate-decide call threw (${String(err)}); treating this chunk as undecided`);
+        raw = null;
+      }
+      if (raw === null || raw === undefined) {
+        for (const unit of chunkUnits) callFailedUnits.add(unit.clusterIndex);
+        deps.log?.(
+          `memory-consolidate: consolidate-decide call returned no response (provider error or timeout); ${chunkUnits.length} cluster(s) left undecided`
+        );
+        continue;
+      }
+      const chunkVerdicts = parseConsolidateBatchVerdicts(
+        raw,
+        chunkUnits.map((u) => ({ clusterIndex: u.clusterIndex, memberCount: u.members.length }))
       );
+      for (const [clusterIndex, verdict] of chunkVerdicts) verdictMap.set(clusterIndex, verdict);
     }
-    const verdictMap = !decideCallFailed
-      ? parseConsolidateBatchVerdicts(
-          raw!,
-          units.map((u) => ({ clusterIndex: u.clusterIndex, memberCount: u.members.length }))
-        )
-      : new Map<number, ConsolidateVerdictResult>();
 
     // Build the COMPLETE plan now, regardless of apply/dry-run --
     // every merge verdict gets its content generated here (moved from
@@ -982,7 +1276,7 @@ export async function runConsolidate(
       membersByCluster.set(unit.clusterIndex, members);
 
       if (!verdict) {
-        if (decideCallFailed) {
+        if (callFailedUnits.has(unit.clusterIndex)) {
           undecidedCallFailed += 1;
         } else {
           skippedMalformed += 1;
@@ -996,15 +1290,15 @@ export async function runConsolidate(
           memberTexts: members.map((m) => m.abstract),
           verdict: null,
           malformed: true,
-          failure: decideCallFailed ? "call-failed" : "malformed-verdict",
+          failure: callFailedUnits.has(unit.clusterIndex) ? "call-failed" : "malformed-verdict",
           fingerprint,
           action: null,
-          staleness: members.map((m) => ({ id: m.entry.id, metadata: m.entry.metadata })),
+          staleness: members.map((m) => ({ id: m.entry.id, text: m.entry.text, metadata: m.entry.metadata })),
         });
         continue;
       }
 
-      const staleness = members.map((m) => ({ id: m.entry.id, metadata: m.entry.metadata }));
+      const staleness = members.map((m) => ({ id: m.entry.id, text: m.entry.text, metadata: m.entry.metadata }));
 
       if (verdict.verdict === "skip" || verdict.verdict === "contradict") {
         newlySettled.push(fingerprint);
@@ -1103,7 +1397,7 @@ export async function runConsolidate(
 
   // Item 8: direct --apply executes the plan immediately, no second prompt.
   if (options.apply) {
-    const { applied, staleSkipped } = await executePlan(deps, actionable, membersByCluster, scopeFilter, now);
+    const { applied, staleSkipped, applyFailed } = await executePlan(deps, actionable, membersByCluster, scopeFilter, now);
     return {
       status: "completed",
       scanned: rawEntries.length,
@@ -1113,6 +1407,8 @@ export async function runConsolidate(
       applied,
       executed: true,
       staleSkipped,
+      applyFailed,
+      scanTruncated,
       skippedMalformed,
       undecidedCallFailed,
       settledSkipped,
@@ -1129,7 +1425,7 @@ export async function runConsolidate(
     const message = `${pluralCount(actionable.length, "cluster")} ready to apply. Apply these now? (YES/no)`;
     const proceed = deps.confirmApply ? await deps.confirmApply(message, clusters) : false;
     if (proceed) {
-      const { applied, staleSkipped } = await executePlan(deps, actionable, membersByCluster, scopeFilter, now);
+      const { applied, staleSkipped, applyFailed } = await executePlan(deps, actionable, membersByCluster, scopeFilter, now);
       return {
         status: "completed",
         scanned: rawEntries.length,
@@ -1139,6 +1435,8 @@ export async function runConsolidate(
         applied,
         executed: true,
         staleSkipped,
+        applyFailed,
+        scanTruncated,
         skippedMalformed,
         undecidedCallFailed,
         settledSkipped,
@@ -1157,6 +1455,8 @@ export async function runConsolidate(
     applied: [],
     executed: false,
     staleSkipped: [],
+    applyFailed: [],
+    scanTruncated,
     skippedMalformed,
     undecidedCallFailed,
     settledSkipped,

@@ -879,8 +879,10 @@ describe("memory consolidate: orchestration", () => {
     assert.ok(absorbedMeta.invalidated_at, "the absorbed row must be marked invalidated");
     assert.equal(absorbedMeta.superseded_by, rows[0].id, "the absorbed row must point at the survivor");
     assert.ok(absorbedMeta.consolidation_audit, "the absorbed row must carry its own consolidation audit");
-    assert.equal(absorbedMeta.consolidation_audit.action, "merge");
-    assert.equal(absorbedMeta.consolidation_audit.survivorId, rows[0].id);
+    assert.ok(Array.isArray(absorbedMeta.consolidation_audit), "consolidation_audit is an append-only array of audit events");
+    const lastAudit = absorbedMeta.consolidation_audit.at(-1);
+    assert.equal(lastAudit.action, "merge");
+    assert.equal(lastAudit.survivorId, rows[0].id);
   });
 
   it("skips a cluster with a warning when the LLM response is malformed, without failing the run", async () => {

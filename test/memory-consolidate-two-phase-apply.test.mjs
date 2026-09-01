@@ -481,3 +481,298 @@ describe("memory consolidate: batched merge writer", () => {
     assert.doesNotMatch(prompt, /^ *- (Abstract|Overview|Content)/m, "no leading list markers");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round-1 review regressions: fault injection at every write position,
+// text-aware staleness/fingerprints, decide chunking, scan bound, and the
+// crash/concurrency-safe settled ledger.
+// ---------------------------------------------------------------------------
+
+const consolidateModule = jiti(path.join(testDir, "..", "src", "consolidate.ts"));
+const {
+  computeClusterFingerprint,
+  clusterConsolidateCandidates,
+  buildConsolidateCandidate,
+  loadConsolidateSettledLedger,
+  saveConsolidateSettledLedger,
+  CONSOLIDATE_DECIDE_BATCH_MAX_SIZE,
+  SETTLED_LEDGER_MAX_PER_SCOPE,
+} = consolidateModule;
+const runConsolidate2 = consolidateModule.runConsolidate;
+import { mkdtempSync as mkdtempSync2, rmSync as rmSync2, existsSync, readdirSync, writeFileSync, readFileSync as readFileSync2 } from "node:fs";
+import { tmpdir as tmpdir2 } from "node:os";
+
+function failingUpdateStore(initialRows, failOn) {
+  const store = makeFakeStore(initialRows);
+  const baseUpdate = store.update;
+  const updateCalls = [];
+  store.update = async (id, patch, scopeFilter) => {
+    updateCalls.push(id);
+    if (failOn(id, updateCalls.length)) {
+      throw new Error(`injected write failure for ${id}`);
+    }
+    return baseUpdate(id, patch, scopeFilter);
+  };
+  store.updateCalls = updateCalls;
+  return store;
+}
+
+function threeMemberMergeRows() {
+  const ts = 1_700_000_000_000;
+  return [
+    makeRow({ abstract: "Coffee order: oat milk latte", content: "a", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts }),
+    makeRow({ abstract: "Coffee order: oat milk latte, extra hot", content: "b", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 1000 }),
+    makeRow({ abstract: "Coffee order: oat milk latte, always double shot", content: "c", factKey: "preferences:coffee order", vector: [1, 0], timestamp: ts + 2000 }),
+  ];
+}
+
+function threeMemberMergeLlm() {
+  return {
+    completeJson: async (_prompt, label) => {
+      if (label === "consolidate-decide") {
+        return { verdicts: [{ cluster_index: 1, verdict: "merge", survivor_index: 1, absorbed_indices: [2, 3], reason: "same fact" }] };
+      }
+      return { results: [{ index: 1, abstract: "Coffee order: merged", overview: "", content: "merged content" }] };
+    },
+  };
+}
+
+function supersedeLlm() {
+  return {
+    completeJson: async (_prompt, label) => {
+      if (label === "consolidate-decide") {
+        return { verdicts: [{ cluster_index: 1, verdict: "supersede", survivor_index: 3, absorbed_indices: [1, 2], reason: "newest wins" }] };
+      }
+      return { results: [] };
+    },
+  };
+}
+
+describe("fault injection: partial-apply safety at every write position", () => {
+  it("merge: survivor write (first position) fails -> cluster reported failed, nothing applied, absorbed rows untouched", async () => {
+    const rows = threeMemberMergeRows();
+    const store = failingUpdateStore(rows, (id) => id === rows[0].id);
+    const result = await runConsolidate2({ ...store, ...threeMemberMergeLlm() }, { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 });
+    assert.equal(result.applied.length, 0, "a failed survivor write applies nothing");
+    assert.equal(result.applyFailed.length, 1);
+    assert.equal(result.applyFailed[0].action, "merge");
+    for (const absorbed of [rows[1], rows[2]]) {
+      const row = store.rows.find((r) => r.id === absorbed.id);
+      assert.ok(!JSON.parse(row.metadata).invalidated_at, "no absorbed row may be invalidated when the survivor write failed first");
+    }
+  });
+
+  it("merge: one absorbed invalidation (middle position) fails -> applied with partialFailures, the other absorbed row still invalidated", async () => {
+    const rows = threeMemberMergeRows();
+    const store = failingUpdateStore(rows, (id) => id === rows[1].id);
+    const result = await runConsolidate2({ ...store, ...threeMemberMergeLlm() }, { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 });
+    assert.equal(result.applied.length, 1);
+    assert.equal(result.applyFailed.length, 0);
+    const partial = result.applied[0].partialFailures;
+    assert.ok(partial && partial.length === 1, "the failed absorbed write must be reported");
+    assert.equal(partial[0].id, rows[1].id);
+    assert.equal(partial[0].step, "invalidate-absorbed");
+    const failedRow = store.rows.find((r) => r.id === rows[1].id);
+    assert.ok(!JSON.parse(failedRow.metadata).invalidated_at, "the failed row stays ACTIVE (pre-consolidate status quo)");
+    const okRow = store.rows.find((r) => r.id === rows[2].id);
+    assert.ok(JSON.parse(okRow.metadata).invalidated_at, "one absorbed failure must not abandon the remaining invalidations");
+  });
+
+  it("supersede: one absorbed invalidation fails -> applied with partialFailures, remaining writes proceed", async () => {
+    const rows = threeMemberMergeRows();
+    const store = failingUpdateStore(rows, (id) => id === rows[0].id);
+    const result = await runConsolidate2({ ...store, ...supersedeLlm() }, { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 });
+    assert.equal(result.applied.length, 1);
+    const partial = result.applied[0].partialFailures;
+    assert.ok(partial && partial.some((f) => f.id === rows[0].id && f.step === "invalidate-absorbed"));
+    const okRow = store.rows.find((r) => r.id === rows[1].id);
+    assert.ok(JSON.parse(okRow.metadata).invalidated_at);
+  });
+
+  it("supersede: EVERY absorbed invalidation fails -> cluster reported failed, nothing applied", async () => {
+    const rows = threeMemberMergeRows();
+    const store = failingUpdateStore(rows, (id) => id === rows[0].id || id === rows[1].id);
+    const result = await runConsolidate2({ ...store, ...supersedeLlm() }, { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 });
+    assert.equal(result.applied.length, 0);
+    assert.equal(result.applyFailed.length, 1);
+    assert.equal(result.applyFailed[0].action, "supersede");
+  });
+
+  it("supersede: survivor annotation (last position) fails -> applied with an annotate-survivor partial, invalidations preserved", async () => {
+    const rows = threeMemberMergeRows();
+    const store = failingUpdateStore(rows, (id) => id === rows[2].id);
+    const result = await runConsolidate2({ ...store, ...supersedeLlm() }, { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 });
+    assert.equal(result.applied.length, 1);
+    const partial = result.applied[0].partialFailures;
+    assert.ok(partial && partial.some((f) => f.id === rows[2].id && f.step === "annotate-survivor"));
+    for (const absorbed of [rows[0], rows[1]]) {
+      const row = store.rows.find((r) => r.id === absorbed.id);
+      assert.ok(JSON.parse(row.metadata).invalidated_at, "a cosmetic survivor-annotation failure must never unwind applied invalidations");
+    }
+  });
+});
+
+describe("text-aware staleness and settled fingerprints", () => {
+  it("a concurrent text-only change makes the cluster stale at execution time", async () => {
+    const rows = twoMemberMergeRows();
+    const store = makeFakeStore(rows);
+    const llm = mergeDeciderLlm();
+    const baseGetById = store.getById;
+    store.getById = async (id) => {
+      const row = await baseGetById(id);
+      if (row && row.id === rows[1].id) {
+        return { ...row, text: "Coffee order: switched to black americano" };
+      }
+      return row;
+    };
+    const result = await runConsolidate2({ ...store, completeJson: llm.completeJson }, { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 });
+    assert.equal(result.applied.length, 0, "a text-only concurrent change must not be overwritten by a stale plan");
+    assert.equal(result.staleSkipped.length, 1);
+  });
+
+  it("a text-only change re-opens a previously settled cluster (fingerprint covers the text)", () => {
+    const membersBefore = [
+      { id: "row-a", text: "favorite drink: cola", metadata: "{}" },
+      { id: "row-b", text: "favorite drink: cola zero", metadata: "{}" },
+    ];
+    const before = computeClusterFingerprint(membersBefore);
+    const after = computeClusterFingerprint([
+      membersBefore[0],
+      { ...membersBefore[1], text: "favorite drink: switched to water" },
+    ]);
+    assert.notEqual(before, after, "same ids + same metadata with different text must produce a different fingerprint");
+  });
+});
+
+describe("decide-call chunking and failure isolation", () => {
+  // One unique topic word per pair (and no shared content words across
+  // pairs), so the near-duplicate topic-overlap fallback cannot bridge
+  // unrelated pairs into one mega-cluster: each pair clusters via its own
+  // factKey and yields exactly one decision unit.
+  const PAIR_TOPIC_WORDS = [
+    "amber", "basalt", "cobalt", "damson", "fennel", "garnet", "hazel",
+    "jade", "kelp", "lilac", "maple", "nectar", "onyx", "quartz", "rowan",
+    "sage", "tulip", "umber", "violet", "wren", "yarrow", "zinnia",
+  ];
+
+  function manyPairRows(pairCount) {
+    const ts = 1_700_000_000_000;
+    const rows = [];
+    for (let i = 0; i < pairCount; i++) {
+      const word = PAIR_TOPIC_WORDS[i % PAIR_TOPIC_WORDS.length];
+      const key = `preferences:${word}`;
+      rows.push(makeRow({ abstract: `${word} v1`, content: "a", factKey: key, vector: [], timestamp: ts + i }));
+      rows.push(makeRow({ abstract: `${word} v2`, content: "b", factKey: key, vector: [], timestamp: ts + i + 500 }));
+    }
+    return rows;
+  }
+
+  it("chunks the decide prompt and a thrown chunk strands only its own clusters", async () => {
+    const pairCount = CONSOLIDATE_DECIDE_BATCH_MAX_SIZE + 3;
+    const store = makeFakeStore(manyPairRows(pairCount));
+    let decideCalls = 0;
+    const completeJson = async (_prompt, label) => {
+      if (label !== "consolidate-decide") return { results: [] };
+      decideCalls += 1;
+      if (decideCalls === 1) throw new Error("injected provider rejection");
+      return { verdicts: [] };
+    };
+    const logs = [];
+    const result = await runConsolidate2(
+      { ...store, completeJson, log: (m) => logs.push(m) },
+      { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 },
+    );
+    assert.equal(decideCalls, 2, "clusters beyond the batch size must go to a second decide call");
+    assert.equal(result.undecidedCallFailed, CONSOLIDATE_DECIDE_BATCH_MAX_SIZE, "only the thrown chunk's clusters are call-failed");
+    assert.equal(result.skippedMalformed, 3, "the surviving chunk's clusters get normal (here: missing-verdict) handling");
+    assert.ok(logs.some((l) => l.includes("consolidate-decide call threw")));
+  });
+});
+
+describe("scan bound", () => {
+  it("truncates the scan at scanLimit and reports it", async () => {
+    const rows = [];
+    for (let i = 0; i < 30; i++) {
+      rows.push(makeRow({ abstract: `Unrelated synthetic fact number ${i}`, content: "x", factKey: `preferences:distinct ${i}`, vector: [], timestamp: 1_700_000_000_000 + i }));
+    }
+    const store = makeFakeStore(rows);
+    const logs = [];
+    const result = await runConsolidate2(
+      { ...store, completeJson: async () => ({ verdicts: [] }), log: (m) => logs.push(m) },
+      { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000, scanLimit: 10 },
+    );
+    assert.equal(result.scanTruncated, true);
+    assert.equal(result.scanned, 10);
+    assert.ok(logs.some((l) => l.includes("scan truncated at 10 rows")));
+  });
+
+  it("clusters a realistically large scope quickly (memoized tokens + unit-vector dot products)", () => {
+    const candidates = [];
+    for (let i = 0; i < 1200; i++) {
+      const angle = (i / 1200) * Math.PI;
+      candidates.push(
+        buildConsolidateCandidate({
+          id: `bulk-${i}`,
+          text: `Synthetic bulk fact ${i} about workshop shelf ${i % 40}`,
+          vector: [Math.cos(angle), Math.sin(angle)],
+          category: "preference",
+          scope: "global",
+          importance: 0.5,
+          timestamp: 1_700_000_000_000 + i,
+          metadata: JSON.stringify({ memory_category: "preferences", l0_abstract: `Synthetic bulk fact ${i} about workshop shelf ${i % 40}` }),
+        }),
+      );
+    }
+    const startedAt = process.hrtime.bigint();
+    clusterConsolidateCandidates(candidates, 0.9999);
+    const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    assert.ok(elapsedMs < 10_000, `1200-candidate clustering should stay in interactive time (took ${Math.round(elapsedMs)}ms)`);
+  });
+});
+
+describe("settled ledger persistence (crash- and concurrency-safe)", () => {
+  let dir;
+  it("setup", () => {
+    dir = mkdtempSync2(path.join(tmpdir2(), "consolidate-ledger-"));
+  });
+
+  it("merges with the CURRENT on-disk ledger instead of overwriting concurrent writers", async () => {
+    const ledgerPath = path.join(dir, "consolidate-settled.json");
+    await saveConsolidateSettledLedger(ledgerPath, "agent:one", ["fp-one"]);
+    await saveConsolidateSettledLedger(ledgerPath, "agent:two", ["fp-two"]);
+    const loaded = await loadConsolidateSettledLedger(ledgerPath);
+    assert.ok(loaded["agent:one"]?.some((e) => e.fp === "fp-one"), "an earlier writer's scope must survive a later writer's save");
+    assert.ok(loaded["agent:two"]?.some((e) => e.fp === "fp-two"));
+    assert.ok(!existsSync(`${ledgerPath}.lock`), "the lock must be released");
+    assert.ok(readdirSync(dir).every((f) => !f.includes(".tmp-")), "the atomic temp file must not linger");
+  });
+
+  it("reports and sets aside a corrupt ledger instead of silently treating it as empty", async () => {
+    const ledgerPath = path.join(dir, "corrupt-ledger.json");
+    writeFileSync(ledgerPath, "{ this is not json", "utf-8");
+    const loaded = await loadConsolidateSettledLedger(ledgerPath);
+    assert.deepEqual(loaded, {});
+    assert.ok(!existsSync(ledgerPath), "the corrupt file must be moved aside, not left in place");
+    assert.ok(readdirSync(dir).some((f) => f.startsWith("corrupt-ledger.json.corrupt-")), "the damaged file must survive for inspection");
+  });
+
+  it("normalizes the legacy bare-string format", async () => {
+    const ledgerPath = path.join(dir, "legacy-ledger.json");
+    writeFileSync(ledgerPath, JSON.stringify({ "agent:legacy": ["legacy-fp-1", "legacy-fp-2"] }), "utf-8");
+    const loaded = await loadConsolidateSettledLedger(ledgerPath);
+    assert.equal(loaded["agent:legacy"].length, 2);
+    assert.ok(loaded["agent:legacy"].every((e) => typeof e.fp === "string" && typeof e.at === "number"));
+  });
+
+  it("prunes the ledger to the per-scope cap on save", async () => {
+    const ledgerPath = path.join(dir, "prune-ledger.json");
+    const bulk = Array.from({ length: SETTLED_LEDGER_MAX_PER_SCOPE + 50 }, (_, i) => `bulk-fp-${i}`);
+    await saveConsolidateSettledLedger(ledgerPath, "agent:bulk", bulk);
+    const loaded = await loadConsolidateSettledLedger(ledgerPath);
+    assert.equal(loaded["agent:bulk"].length, SETTLED_LEDGER_MAX_PER_SCOPE);
+  });
+
+  it("teardown", () => {
+    rmSync2(dir, { recursive: true, force: true });
+  });
+});

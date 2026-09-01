@@ -404,7 +404,10 @@ async function collectFactQueryMatches(
   const hasFactKeySelector = Boolean(factKey?.trim());
 
   for (let offset = 0; ; offset += FACT_QUERY_PAGE_SIZE) {
-    const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset);
+    // excludeInactive:false -- this walk implements includeHistory itself
+    // (superseded/expired facts are the history), so the store must hand it
+    // inactive rows; the live-only default would silently break history.
+    const page = await store.list(scopeFilter, undefined, FACT_QUERY_PAGE_SIZE, offset, { excludeInactive: false });
     if (page.length === 0) break;
 
     let newRows = 0;

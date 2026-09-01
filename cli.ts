@@ -4,7 +4,7 @@
 
 import type { Command } from "commander";
 import { readFileSync, type Dirent } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import * as readline from "node:readline";
@@ -16,7 +16,7 @@ import type { MemoryMigrator } from "./src/migrate.js";
 import { createMemoryUpgrader, isCurrentReflectionMemory } from "./src/memory-upgrader.js";
 import type { LlmClient } from "./src/llm-client.js";
 import type { MdMirrorWriter } from "./src/tools.js";
-import { runConsolidate, formatConsolidateCostPreview, formatConsolidatePlanForDisplay, pluralCount } from "./src/consolidate.js";
+import { runConsolidate, formatConsolidateCostPreview, formatConsolidatePlanForDisplay, pluralCount, DEFAULT_SCAN_LIMIT, loadConsolidateSettledLedger, saveConsolidateSettledLedger } from "./src/consolidate.js";
 import {
   getDefaultOauthModelForProvider,
   getOAuthProviderLabel,
@@ -2482,32 +2482,6 @@ export function createConsolidateConfirm(streams?: {
 }
 
 /** Item 8: renders the full plan (verdict, member ids, survivor, exact merge content) for user review before the apply prompt. */
-async function loadConsolidateSettledLedger(ledgerPath: string): Promise<Record<string, string[]>> {
-  try {
-    const raw = await readFile(ledgerPath, "utf-8");
-    const parsed = JSON.parse(raw) as Record<string, string[]>;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-async function saveConsolidateSettledLedger(
-  ledgerPath: string,
-  ledger: Record<string, string[]>,
-  scope: string,
-  newlySettled: string[],
-): Promise<void> {
-  if (newlySettled.length === 0) return;
-  try {
-    const merged = new Set([...(ledger[scope] ?? []), ...newlySettled]);
-    ledger[scope] = [...merged];
-    await writeFile(ledgerPath, JSON.stringify(ledger, null, 2), "utf-8");
-  } catch (err) {
-    console.warn(`consolidate: could not persist settled ledger: ${String(err)}`);
-  }
-}
-
 function registerConsolidateCommand(memory: Command, context: CLIContext) {
   memory
     .command("consolidate")
@@ -2518,6 +2492,7 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
     .option("--apply", "Apply the consolidation plan immediately (default is a dry-run preview with an interactive apply prompt)", false)
     .option("--yes", "Skip the LLM-cost confirmation prompt (required for non-interactive/automated runs)", false)
     .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
+    .option("--scan-limit <n>", `Maximum rows to scan before clustering (default ${DEFAULT_SCAN_LIMIT}; clustering is O(n^2), raise deliberately)`)
     .action(async (options: {
       category?: string;
       since?: string;
@@ -2525,6 +2500,7 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
       yes: boolean;
       includeReflectionSlices: boolean;
       agent: string;
+      scanLimit?: string;
     }) => {
       try {
         if (!context.llmClient) {
@@ -2546,6 +2522,15 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
             process.exit(1);
           }
           sinceMs = parsed;
+        }
+
+        let scanLimit: number | undefined;
+        if (options.scanLimit !== undefined) {
+          scanLimit = Number.parseInt(options.scanLimit, 10);
+          if (!Number.isInteger(scanLimit) || scanLimit < 1) {
+            console.error(`consolidate: invalid --scan-limit "${options.scanLimit}" (positive integer required)`);
+            process.exit(1);
+          }
         }
 
         const mdMirror = context.mdMirror;
@@ -2592,7 +2577,8 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
             includeReflectionSlices: options.includeReflectionSlices,
             apply: options.apply === true,
             autoConfirm: options.yes === true,
-            settledFingerprints: new Set(settledLedger[scope] ?? []),
+            settledFingerprints: new Set((settledLedger[scope] ?? []).map((e) => e.fp)),
+            scanLimit,
           },
         );
 
@@ -2636,7 +2622,11 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
         }
 
         if (result.status === "completed" && settledLedgerPath) {
-          await saveConsolidateSettledLedger(settledLedgerPath, settledLedger, scope, result.newlySettled);
+          await saveConsolidateSettledLedger(settledLedgerPath, scope, result.newlySettled);
+        }
+
+        if (result.scanTruncated) {
+          console.log(`\nNote: the scan stopped at the row limit; rerun with a higher --scan-limit to cover the whole scope.`);
         }
 
         if (!result.executed) {
@@ -2649,7 +2639,18 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
         const failureNotes: string[] = [];
         if (result.skippedMalformed > 0) failureNotes.push(`${pluralCount(result.skippedMalformed, "cluster")} skipped due to malformed verdicts`);
         if (result.undecidedCallFailed > 0) failureNotes.push(`${pluralCount(result.undecidedCallFailed, "cluster")} undecided because the decide call failed`);
+        const partial = result.applied.filter((a) => a.partialFailures?.length);
+        if (partial.length > 0) failureNotes.push(`${pluralCount(partial.length, "cluster")} PARTIALLY applied (failed rows stay active; rerun retries them)`);
+        if (result.applyFailed.length > 0) failureNotes.push(`${pluralCount(result.applyFailed.length, "cluster")} FAILED to apply (nothing written; rerun retries them)`);
         console.log(`\nApplied ${pluralCount(result.applied.length, "action")}${failureNotes.length ? "; " + failureNotes.join("; ") : ""}.`);
+        for (const cluster of partial) {
+          for (const failure of cluster.partialFailures!) {
+            console.log(`  partial: ${failure.step} ${failure.id.slice(0, 8)} — ${failure.error}`);
+          }
+        }
+        for (const failed of result.applyFailed) {
+          console.log(`  failed: cluster of ${pluralCount(failed.memberIds.length, "row")} (${failed.action}) — ${failed.error}`);
+        }
       } catch (error) {
         console.error("consolidate failed:", error);
         process.exit(1);
