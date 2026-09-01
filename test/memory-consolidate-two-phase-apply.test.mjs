@@ -776,3 +776,124 @@ describe("settled ledger persistence (crash- and concurrency-safe)", () => {
     rmSync2(dir, { recursive: true, force: true });
   });
 });
+
+describe("round-2 regressions: topic-fallback false positives, audit-mirror isolation, malformed duplicates", () => {
+  const { parseConsolidateVerdict } = consolidateModule;
+
+  function candidateWithAbstract(abstract, id) {
+    return buildConsolidateCandidate({
+      id,
+      text: abstract,
+      vector: [],
+      category: "preference",
+      scope: "global",
+      importance: 0.5,
+      timestamp: 1_700_000_000_000,
+      metadata: JSON.stringify({ memory_category: "preferences", l0_abstract: abstract }),
+    });
+  }
+
+  it("boundary token semantics: port must not bridge support/report rows", () => {
+    const a = candidateWithAbstract("harbor port schedule pinned", "fp-a");
+    const b = candidateWithAbstract("weekly support rotation summary", "fp-b");
+    const c = candidateWithAbstract("quarterly report cadence chosen", "fp-c");
+    assert.deepEqual(clusterConsolidateCandidates([a, b], 0.9999), [], "port/support raw-substring bridging must be gone");
+    assert.deepEqual(clusterConsolidateCandidates([a, c], 0.9999), [], "port/report raw-substring bridging must be gone");
+  });
+
+  it("compound-boundary containment still links abbreviated brand tokens", () => {
+    const a = candidateWithAbstract("Favorite drink: cola", "brand-a");
+    const b = candidateWithAbstract("coca-cola bottles restocked weekly", "brand-b");
+    const clusters = clusterConsolidateCandidates([a, b], 0.9999);
+    assert.equal(clusters.length, 1, "cola must still match the coca-cola compound part");
+  });
+
+  it("two-sided overlap: one shared token cannot bridge multi-token rows", () => {
+    const a = candidateWithAbstract("cobalt shelf paint order", "ms-a");
+    const b = candidateWithAbstract("cobalt earring gift wrapped yesterday evening", "ms-b");
+    assert.deepEqual(
+      clusterConsolidateCandidates([a, b], 0.9999),
+      [],
+      "sharing only 'cobalt' between two multi-token rows must not make them the same fact",
+    );
+  });
+
+  it("the motivating single-token cross-lane case still clusters", () => {
+    const a = candidateWithAbstract("Favorite drink: cola", "mv-a");
+    const b = candidateWithAbstract("Cola is what gets ordered most evenings", "mv-b");
+    const clusters = clusterConsolidateCandidates([a, b], 0.9999);
+    assert.equal(clusters.length, 1, "the PR's motivating paraphrase pair must keep clustering");
+  });
+
+  it("a rejecting audit mirror never re-classifies an applied cluster as failed", async () => {
+    const store = makeFakeStore(twoMemberMergeRows());
+    const llm = mergeDeciderLlm();
+    const logs = [];
+    const result = await runConsolidate2(
+      {
+        ...store,
+        completeJson: llm.completeJson,
+        log: (m) => logs.push(m),
+        onAudit: async () => {
+          throw new Error("injected mirror failure");
+        },
+      },
+      { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 },
+    );
+    assert.equal(result.applied.length, 1, "the store writes applied; the mirror is not part of that classification");
+    assert.equal(result.applyFailed.length, 0, "a mirror failure must not appear as an apply failure");
+    assert.ok(logs.some((l) => l.includes("audit mirror failed")), "the mirror failure must still be reported");
+  });
+
+  it("a verdict with duplicate absorbed indices is malformed", () => {
+    assert.equal(
+      parseConsolidateVerdict(
+        { verdict: "merge", reason: "dup", survivor_index: 1, absorbed_indices: [2, 2] },
+        3,
+      ),
+      null,
+    );
+  });
+
+  it("a contradiction is never persisted as settled", async () => {
+    const rows = twoMemberMergeRows();
+    const store = makeFakeStore(rows);
+    const completeJson = async (_prompt, label) =>
+      label === "consolidate-decide"
+        ? { verdicts: [{ cluster_index: 1, verdict: "contradict", reason: "live conflict" }] }
+        : { results: [] };
+    const result = await runConsolidate2({ ...store, completeJson }, { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000 });
+    assert.equal(result.newlySettled.length, 0, "a contradiction is unresolved work; settling it would hide it for the ledger's retention");
+    const again = await runConsolidate2(
+      { ...store, completeJson },
+      { scope: "global", apply: true, autoConfirm: true, now: 1_700_100_000_000, settledFingerprints: new Set(result.newlySettled) },
+    );
+    assert.equal(again.settledSkipped, 0, "the contradiction must re-surface on the next run");
+    assert.equal(again.clusters.length, 1);
+  });
+
+  it("clusters production-dimension vectors in interactive time", () => {
+    const DIMS = 2560;
+    const candidates = [];
+    for (let i = 0; i < 600; i++) {
+      const vector = new Array(DIMS).fill(0);
+      vector[i % DIMS] = 1;
+      candidates.push(
+        buildConsolidateCandidate({
+          id: `dim-${i}`,
+          text: `distinct highdim fixture row ${i}`,
+          vector,
+          category: "preference",
+          scope: "global",
+          importance: 0.5,
+          timestamp: 1_700_000_000_000 + i,
+          metadata: JSON.stringify({ memory_category: "preferences", l0_abstract: `distinct highdim fixture row ${i}` }),
+        }),
+      );
+    }
+    const startedAt = process.hrtime.bigint();
+    clusterConsolidateCandidates(candidates, 0.86);
+    const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    assert.ok(elapsedMs < 15_000, `600 production-dimension candidates should cluster in interactive time (took ${Math.round(elapsedMs)}ms)`);
+  });
+});

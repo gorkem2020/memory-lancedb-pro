@@ -2129,7 +2129,10 @@ function registerConsolidateCommand(memory, context) {
                 : undefined;
             const settledLedger = settledLedgerPath ? await loadConsolidateSettledLedger(settledLedgerPath) : {};
             const result = await runConsolidate({
-                fetchRows: (scopeFilter, maxTimestamp, limit) => context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit),
+                fetchRows: (scopeFilter, maxTimestamp, limit) => 
+                // Live-only is this feature's explicit choice, not a store-wide
+                // default: consolidate must never cluster already-dead rows.
+                context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit, { excludeInactive: true }),
                 update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
                 getById: (id, scopeFilter) => context.store.getById(id, scopeFilter),
                 embed: (text) => embedder.embedPassage(text),

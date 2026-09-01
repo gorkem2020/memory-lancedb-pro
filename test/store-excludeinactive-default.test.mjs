@@ -64,15 +64,19 @@ async function storeLiveAndInvalidatedPair(store) {
   return { live, dead };
 }
 
-describe("store.ts: excludeInactive defaults to true (item 6 choke point)", () => {
-  it("vectorSearch excludes the invalidated row by default", async () => {
+describe("store.ts: excludeInactive keeps the pre-#946 default (false); live-only is explicit opt-in", () => {
+  it("vectorSearch includes the invalidated row by default and excludes it only with the explicit opt-in", async () => {
     const { store, dir } = makeStore("excl-vs-");
     try {
       const { live, dead } = await storeLiveAndInvalidatedPair(store);
-      const results = await store.vectorSearch([1, 0, 0, 0], 10, 0, ["test"]);
-      const ids = results.map((r) => r.entry.id);
-      assert.ok(ids.includes(live.id), "the live row must be returned");
-      assert.ok(!ids.includes(dead.id), "the invalidated row must NOT be returned by default");
+      const byDefault = await store.vectorSearch([1, 0, 0, 0], 10, 0, ["test"]);
+      const defaultIds = byDefault.map((r) => r.entry.id);
+      assert.ok(defaultIds.includes(live.id), "the live row must be returned");
+      assert.ok(defaultIds.includes(dead.id), "the pre-#946 default is preserved: omitting options must not change the population");
+      const liveOnly = await store.vectorSearch([1, 0, 0, 0], 10, 0, ["test"], { excludeInactive: true });
+      const liveOnlyIds = liveOnly.map((r) => r.entry.id);
+      assert.ok(liveOnlyIds.includes(live.id));
+      assert.ok(!liveOnlyIds.includes(dead.id), "the explicit opt-in must exclude the invalidated row");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -91,27 +95,35 @@ describe("store.ts: excludeInactive defaults to true (item 6 choke point)", () =
     }
   });
 
-  it("bm25Search excludes the invalidated row by default", async () => {
+  it("bm25Search includes the invalidated row by default and excludes it only with the explicit opt-in", async () => {
     const { store, dir } = makeStore("excl-bm-");
     try {
       const { live, dead } = await storeLiveAndInvalidatedPair(store);
-      const results = await store.bm25Search("fact", 10, ["test"]);
-      const ids = results.map((r) => r.entry.id);
-      assert.ok(ids.includes(live.id));
-      assert.ok(!ids.includes(dead.id), "the invalidated row must NOT be returned by default");
+      const byDefault = await store.bm25Search("fact", 10, ["test"]);
+      const defaultIds = byDefault.map((r) => r.entry.id);
+      assert.ok(defaultIds.includes(live.id));
+      assert.ok(defaultIds.includes(dead.id), "the pre-#946 default is preserved");
+      const liveOnly = await store.bm25Search("fact", 10, ["test"], { excludeInactive: true });
+      const liveOnlyIds = liveOnly.map((r) => r.entry.id);
+      assert.ok(liveOnlyIds.includes(live.id));
+      assert.ok(!liveOnlyIds.includes(dead.id), "the explicit opt-in must exclude the invalidated row");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("list() excludes the invalidated row by default", async () => {
+  it("list() includes the invalidated row by default and excludes it only with the explicit opt-in", async () => {
     const { store, dir } = makeStore("excl-list-");
     try {
       const { live, dead } = await storeLiveAndInvalidatedPair(store);
-      const results = await store.list(["test"], undefined, 20, 0);
-      const ids = results.map((r) => r.id);
-      assert.ok(ids.includes(live.id));
-      assert.ok(!ids.includes(dead.id), "list() must exclude invalidated rows by default");
+      const byDefault = await store.list(["test"], undefined, 20, 0);
+      const defaultIds = byDefault.map((r) => r.id);
+      assert.ok(defaultIds.includes(live.id));
+      assert.ok(defaultIds.includes(dead.id), "the pre-#946 default is preserved");
+      const liveOnly = await store.list(["test"], undefined, 20, 0, { excludeInactive: true });
+      const liveOnlyIds = liveOnly.map((r) => r.id);
+      assert.ok(liveOnlyIds.includes(live.id));
+      assert.ok(!liveOnlyIds.includes(dead.id), "the explicit opt-in must exclude the invalidated row");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -130,14 +142,18 @@ describe("store.ts: excludeInactive defaults to true (item 6 choke point)", () =
     }
   });
 
-  it("fetchForCompaction() excludes the invalidated row by default", async () => {
+  it("fetchForCompaction() includes the invalidated row by default and excludes it only with the explicit opt-in", async () => {
     const { store, dir } = makeStore("excl-fc-");
     try {
       const { live, dead } = await storeLiveAndInvalidatedPair(store);
-      const results = await store.fetchForCompaction(Date.now() + 1000, ["test"], 200);
-      const ids = results.map((r) => r.id);
-      assert.ok(ids.includes(live.id));
-      assert.ok(!ids.includes(dead.id), "fetchForCompaction() must exclude invalidated rows by default");
+      const byDefault = await store.fetchForCompaction(Date.now() + 1000, ["test"], 200);
+      const defaultIds = byDefault.map((r) => r.id);
+      assert.ok(defaultIds.includes(live.id));
+      assert.ok(defaultIds.includes(dead.id), "the pre-#946 default is preserved");
+      const liveOnly = await store.fetchForCompaction(Date.now() + 1000, ["test"], 200, { excludeInactive: true });
+      const liveOnlyIds = liveOnly.map((r) => r.id);
+      assert.ok(liveOnlyIds.includes(live.id));
+      assert.ok(!liveOnlyIds.includes(dead.id), "the explicit opt-in (what the consolidate CLI passes) must exclude the invalidated row");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

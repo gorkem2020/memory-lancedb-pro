@@ -50,7 +50,15 @@ function tokensMatch(a, b) {
         return true;
     const shorter = a.length <= b.length ? a : b;
     const longer = a.length <= b.length ? b : a;
-    return shorter.length >= 4 && longer.includes(shorter);
+    if (shorter.length < 4)
+        return false;
+    // Containment only at compound-token boundaries: "cola" matches
+    // "coca-cola" because it is a delimiter-separated PART of it, while raw
+    // substring matching let "port" match "support" and "report" and bridge
+    // unrelated rows.
+    if (!longer.includes("-") && !longer.includes("'"))
+        return false;
+    return longer.split(/[-']/).some((part) => part === shorter);
 }
 function shareSignificantTopicToken(tokensA, tokensB) {
     for (const tokenA of tokensA) {
@@ -69,9 +77,7 @@ function shareSignificantTopicToken(tokensA, tokensB) {
 // evenings" both reduce to essentially {"cola"}); two short statements
 // about DIFFERENT facts rarely do, which is what keeps this fallback from
 // bridging unrelated rows the way a single-shared-token check would.
-function topicTokenOverlapRatio(tokensA, tokensB) {
-    if (tokensA.size === 0 || tokensB.size === 0)
-        return 0;
+function topicTokenOverlapCounts(tokensA, tokensB) {
     let matches = 0;
     for (const tokenA of tokensA) {
         for (const tokenB of tokensB) {
@@ -81,9 +87,36 @@ function topicTokenOverlapRatio(tokensA, tokensB) {
             }
         }
     }
-    return matches / Math.min(tokensA.size, tokensB.size);
+    return { matches, minSize: Math.min(tokensA.size, tokensB.size), maxSize: Math.max(tokensA.size, tokensB.size) };
 }
 const NEAR_DUPLICATE_TOKEN_OVERLAP_RATIO = 0.6;
+// Two-sided guard: the smaller-set ratio alone lets ONE shared token bridge
+// a single-token row onto any larger row mentioning that word. The larger
+// set must also be mostly covered before two rows count as the same fact.
+const NEAR_DUPLICATE_MAJOR_OVERLAP_RATIO = 0.5;
+function topicTokensNearDuplicate(tokensA, tokensB) {
+    if (tokensA.size === 0 || tokensB.size === 0)
+        return false;
+    const smaller = tokensA.size <= tokensB.size ? tokensA : tokensB;
+    const larger = tokensA.size <= tokensB.size ? tokensB : tokensA;
+    if (smaller.size === 1) {
+        // Single-topic-token rows are the motivating cross-lane case ("Favorite
+        // drink: cola" against a paraphrase whose only content token is cola).
+        // The lone anchor must match a WHOLE token (equality, or a
+        // delimiter-separated compound part like cola in coca-cola) -- a raw
+        // substring fragment can never be the entire bridge -- and clustering
+        // only nominates the pair; the decider and the append-only shield still
+        // adjudicate it.
+        const [only] = smaller;
+        for (const token of larger) {
+            if (tokensMatch(only, token))
+                return true;
+        }
+        return false;
+    }
+    const { matches, minSize, maxSize } = topicTokenOverlapCounts(tokensA, tokensB);
+    return matches / minSize >= NEAR_DUPLICATE_TOKEN_OVERLAP_RATIO && matches / maxSize >= NEAR_DUPLICATE_MAJOR_OVERLAP_RATIO;
+}
 function normalizeVector(v) {
     if (v.length === 0)
         return null;
@@ -160,7 +193,7 @@ function isDirectlyLinked(a, b, similarityThreshold) {
         a.memoryCategory === b.memoryCategory &&
         a.topicLinkEligible &&
         b.topicLinkEligible &&
-        topicTokenOverlapRatio(a.topicTokens, b.topicTokens) >= NEAR_DUPLICATE_TOKEN_OVERLAP_RATIO) {
+        topicTokensNearDuplicate(a.topicTokens, b.topicTokens)) {
         return true;
     }
     return false;
@@ -226,6 +259,11 @@ export function parseConsolidateVerdict(raw, memberCount) {
         return null;
     const absorbedIndices = absorbedRaw.map((v) => Number(v));
     if (absorbedIndices.some((i) => !Number.isInteger(i) || i < 1 || i > memberCount || i === survivorIndex)) {
+        return null;
+    }
+    // A duplicated absorbed index would issue duplicate invalidation writes
+    // for the same row; treat the verdict as malformed instead.
+    if (new Set(absorbedIndices).size !== absorbedIndices.length) {
         return null;
     }
     return { verdict, reason, survivorIndex, absorbedIndices };
@@ -416,7 +454,10 @@ export async function saveConsolidateSettledLedger(ledgerPath, scope, newlySettl
             }
             catch {
                 try {
-                    const age = now - statSync(lockPath).mtimeMs;
+                    // Recomputed per attempt: the loop can sit in 100ms waits for
+                    // seconds, and a stale-age judged from the initial timestamp would
+                    // takeover a lock that is actually fresh.
+                    const age = Date.now() - statSync(lockPath).mtimeMs;
                     if (age > SETTLED_LEDGER_LOCK_STALE_MS) {
                         await rm(lockPath, { recursive: true, force: true });
                         continue;
@@ -757,15 +798,12 @@ async function executePlan(deps, clusters, membersByCluster, scopeFilter, now) {
             deps.log?.(`memory-consolidate: cluster ${entry.clusterIndex} changed since the plan was built (stale); skipping, never partially applied`);
             continue;
         }
+        let audit;
         try {
-            const audit = entry.action === "merge"
-                ? await writeMergeVerdict(deps, members, entry.verdict, entry.mergedContent, scopeFilter, now)
-                : await applySupersedeVerdict(deps, members, entry.verdict, scopeFilter, now);
-            applied.push(audit);
-            if (audit.partialFailures?.length) {
-                deps.log?.(`memory-consolidate: cluster ${entry.clusterIndex} PARTIALLY applied: ${audit.partialFailures.length} write(s) failed (${audit.partialFailures.map((f) => `${f.step} ${f.id.slice(0, 8)}: ${f.error}`).join("; ")}); failed rows stay active and a rerun retries them`);
-            }
-            await deps.onAudit?.(audit);
+            audit =
+                entry.action === "merge"
+                    ? await writeMergeVerdict(deps, members, entry.verdict, entry.mergedContent, scopeFilter, now)
+                    : await applySupersedeVerdict(deps, members, entry.verdict, scopeFilter, now);
         }
         catch (err) {
             // The write functions throw only when NOTHING was applied for the
@@ -780,6 +818,20 @@ async function executePlan(deps, clusters, membersByCluster, scopeFilter, now) {
                 error: String(err),
             });
             deps.log?.(`memory-consolidate: cluster ${entry.clusterIndex} FAILED to apply ${entry.action} (nothing written): ${String(err)}`);
+            continue;
+        }
+        applied.push(audit);
+        if (audit.partialFailures?.length) {
+            deps.log?.(`memory-consolidate: cluster ${entry.clusterIndex} PARTIALLY applied: ${audit.partialFailures.length} write(s) failed (${audit.partialFailures.map((f) => `${f.step} ${f.id.slice(0, 8)}: ${f.error}`).join("; ")}); failed rows stay active and a rerun retries them`);
+        }
+        // The store writes above are already applied and classified: a failing
+        // audit MIRROR (markdown journal etc.) is its own problem and must never
+        // re-classify the cluster as an apply failure.
+        try {
+            await deps.onAudit?.(audit);
+        }
+        catch (err) {
+            deps.log?.(`memory-consolidate: audit mirror failed for cluster ${entry.clusterIndex} (store writes already applied): ${String(err)}`);
         }
     }
     return { applied, staleSkipped, applyFailed };
@@ -961,7 +1013,14 @@ export async function runConsolidate(deps, options) {
             }
             const staleness = members.map((m) => ({ id: m.entry.id, text: m.entry.text, metadata: m.entry.metadata }));
             if (verdict.verdict === "skip" || verdict.verdict === "contradict") {
-                newlySettled.push(fingerprint);
+                // Only SKIP settles: a contradiction is an unresolved live conflict,
+                // and settling it would hide it from every later run for the ledger's
+                // whole retention. Leaving it unsettled IS the retry workflow -- each
+                // run re-surfaces it in the plan output until the operator resolves
+                // the underlying rows.
+                if (verdict.verdict === "skip") {
+                    newlySettled.push(fingerprint);
+                }
                 clusters.push({
                     clusterIndex: unit.clusterIndex,
                     memberIds: members.map((m) => m.entry.id),

@@ -1880,9 +1880,11 @@ export class MemoryStore {
     const safeLimit = clampInt(limit, 1, 20);
     // Over-fetch more aggressively when filtering inactive records,
     // because superseded historical rows can crowd out active ones.
-    // excludeInactive defaults to true: invalidated/superseded rows are
+    // excludeInactive preserves the pre-#946 API default (false): live-only
+    // reads are an explicit per-caller opt-in (retriever, dedup prefilter,
+    // consolidate), so existing whole-store callers keep their population.
     // invisible unless a caller opts out explicitly (item 6, PR #946).
-    const inactiveFilter = options?.excludeInactive ?? true;
+    const inactiveFilter = options?.excludeInactive ?? false;
     const overFetchMultiplier = inactiveFilter ? 20 : 10;
     const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
 
@@ -1978,8 +1980,8 @@ export class MemoryStore {
     if (isExplicitDenyAllScopeFilter(scopeFilter)) return [];
 
     const safeLimit = clampInt(limit, 1, 20);
-    // excludeInactive defaults to true: see vectorSearch above (item 6, PR #946).
-    const inactiveFilter = options?.excludeInactive ?? true;
+    // excludeInactive keeps the pre-#946 default (false): see vectorSearch above.
+    const inactiveFilter = options?.excludeInactive ?? false;
     // Over-fetch when filtering inactive records to avoid crowding
     const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
 
@@ -2104,8 +2106,8 @@ export class MemoryStore {
       const metadata = parseSmartMetadata(entry.metadata, entry);
 
       // Skip inactive (superseded) records unless explicitly opted out
-      // (excludeInactive defaults to true -- item 6, PR #946).
-      if ((options?.excludeInactive ?? true) && !isMemoryActiveAt(metadata)) {
+      // (excludeInactive keeps the pre-#946 default: false).
+      if ((options?.excludeInactive ?? false) && !isMemoryActiveAt(metadata)) {
         continue;
       }
 
@@ -2246,9 +2248,11 @@ export class MemoryStore {
         }),
       );
 
-    // excludeInactive defaults to true: invalidated/superseded rows are
+    // excludeInactive preserves the pre-#946 API default (false): live-only
+    // reads are an explicit per-caller opt-in (retriever, dedup prefilter,
+    // consolidate), so existing whole-store callers keep their population.
     // invisible to list() unless a caller opts out explicitly (item 6, PR #946).
-    const excludeInactive = options?.excludeInactive ?? true;
+    const excludeInactive = options?.excludeInactive ?? false;
     const activeEntries = excludeInactive
       ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
       : entries;
@@ -3516,14 +3520,46 @@ export class MemoryStore {
 
     const whereClause = conditions.join(" AND ");
 
-    const results = await this.table!
+    // Two-phase read so the scan limit actually bounds materialization: the
+    // full-table pass fetches ONLY the light columns needed to rank and
+    // filter (no vector column crosses the wire), and the heavy rows --
+    // vectors included -- are fetched afterwards for just the `limit` newest
+    // survivors. A full .toArray() with vectors converted for every matching
+    // row spikes the heap on exactly the large stores the limit exists for.
+    const lightRows = await this.table!
       .query()
       .where(whereClause)
+      .select(["id", "timestamp", "metadata"])
       .toArray();
 
-    const entries = results
-      .map(
-        (row): MemoryEntry => ({
+    // excludeInactive keeps the pre-#946 default (false); the consolidate
+    // CLI opts in to live-only explicitly.
+    const excludeInactive = options?.excludeInactive ?? false;
+    const ranked = lightRows
+      .map((row) => ({
+        id: row.id as string,
+        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
+        metadata: (row.metadata as string) || "{}",
+      }))
+      .filter((row) =>
+        excludeInactive ? isMemoryActiveAt(parseSmartMetadata(row.metadata, { id: row.id } as MemoryEntry)) : true,
+      )
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, limit);
+
+    if (ranked.length === 0) return [];
+
+    const entriesById = new Map<string, MemoryEntry>();
+    const ID_CHUNK = 500;
+    for (let i = 0; i < ranked.length; i += ID_CHUNK) {
+      const chunk = ranked.slice(i, i + ID_CHUNK);
+      const idList = chunk.map((row) => `'${escapeSqlLiteral(row.id)}'`).join(", ");
+      const fullRows = await this.table!
+        .query()
+        .where(`${whereClause} AND id IN (${idList})`)
+        .toArray();
+      for (const row of fullRows) {
+        entriesById.set(row.id as string, {
           id: row.id as string,
           text: row.text as string,
           vector: toNumberVector(row.vector),
@@ -3532,19 +3568,15 @@ export class MemoryStore {
           importance: clampImportance(Number(row.importance)),
           timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
           metadata: (row.metadata as string) || "{}",
-        }),
-      );
+        });
+      }
+    }
 
-    // excludeInactive defaults to true: a background compactor or
-    // consolidate run must not cluster already-dead rows (item 6, PR #946).
-    const excludeInactive = options?.excludeInactive ?? true;
-    const activeEntries = excludeInactive
-      ? entries.filter((entry) => isMemoryActiveAt(parseSmartMetadata(entry.metadata, entry)))
-      : entries;
-
-    return activeEntries
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, limit);
+    // Order and membership come from the ranked light pass; a row deleted
+    // between the two passes simply drops out.
+    return ranked
+      .map((row) => entriesById.get(row.id))
+      .filter((entry): entry is MemoryEntry => entry !== undefined);
   }
 
   /**
