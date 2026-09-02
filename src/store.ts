@@ -2349,6 +2349,21 @@ export class MemoryStore {
     return await applyFilters(this.table!.query()).toArray();
   }
 
+  /**
+   * Liveness for stats() without a full metadata parse where the answer is
+   * already determined: a blob carrying neither activity key parses to
+   * valid_from = the row timestamp and no invalidated_at, so it is live iff
+   * that timestamp is not in the future. Any blob that mentions either key
+   * (a substring hit inside a text value merely takes the slow path) is
+   * parsed and judged exactly as before.
+   */
+  private isLiveRow(rawMetadata: string, timestamp: number, at: number): boolean {
+    if (!rawMetadata.includes('"invalidated_at"') && !rawMetadata.includes('"valid_from"')) {
+      return timestamp <= at;
+    }
+    return isMemoryActiveAt(parseSmartMetadata(rawMetadata, { timestamp }), at);
+  }
+
   async stats(scopeFilter?: string[]): Promise<{
     totalCount: number;
     liveCount: number;
@@ -2392,6 +2407,7 @@ export class MemoryStore {
     const scopeCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};
     let liveCount = 0;
+    const now = Date.now();
 
     for (const row of results) {
       const scope = (row.scope as string | undefined) ?? "global";
@@ -2400,10 +2416,9 @@ export class MemoryStore {
       scopeCounts[scope] = (scopeCounts[scope] || 0) + 1;
       categoryCounts[category] = (categoryCounts[category] || 0) + 1;
 
-      const metadata = parseSmartMetadata((row.metadata as string) || "{}", {
-        timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-      });
-      if (isMemoryActiveAt(metadata)) liveCount += 1;
+      if (this.isLiveRow((row.metadata as string) || "{}", normalizeMemoryTimestamp(row.timestamp, 0), now)) {
+        liveCount += 1;
+      }
     }
 
     return {
@@ -3526,11 +3541,14 @@ export class MemoryStore {
     // vectors included -- are fetched afterwards for just the `limit` newest
     // survivors. A full .toArray() with vectors converted for every matching
     // row spikes the heap on exactly the large stores the limit exists for.
-    const lightRows = await this.table!
-      .query()
-      .where(whereClause)
-      .select(["id", "timestamp", "metadata"])
-      .toArray();
+    // Routed through the same projection fallback as list()/stats(): on the
+    // LanceDB versions that return an empty projected metadata read for a
+    // populated table, a bare .select() here makes consolidate report
+    // "Scanned 0 rows" and silently do nothing.
+    const lightRows = await this.queryRowsWithProjectionFallback(
+      (query: any) => query.where(whereClause),
+      ["id", "timestamp", "metadata"],
+    );
 
     // excludeInactive keeps the pre-#946 default (false); the consolidate
     // CLI opts in to live-only explicitly.
@@ -3559,21 +3577,27 @@ export class MemoryStore {
         .where(`${whereClause} AND id IN (${idList})`)
         .toArray();
       for (const row of fullRows) {
-        entriesById.set(row.id as string, {
-          id: row.id as string,
+        const id = row.id as string;
+        const timestamp = normalizeMemoryTimestamp(row.timestamp, 0);
+        const metadata = (row.metadata as string) || "{}";
+        // Re-judged on the FRESH metadata: a row invalidated between the two
+        // passes cleared the light filter but must not enter consolidation live.
+        if (excludeInactive && !isMemoryActiveAt(parseSmartMetadata(metadata, { id, timestamp } as MemoryEntry))) continue;
+        entriesById.set(id, {
+          id,
           text: row.text as string,
           vector: toNumberVector(row.vector),
           category: row.category as MemoryEntry["category"],
           scope: (row.scope as string | undefined) ?? "global",
           importance: clampImportance(Number(row.importance)),
-          timestamp: normalizeMemoryTimestamp(row.timestamp, 0),
-          metadata: (row.metadata as string) || "{}",
+          timestamp,
+          metadata,
         });
       }
     }
 
-    // Order and membership come from the ranked light pass; a row deleted
-    // between the two passes simply drops out.
+    // Order and membership come from the ranked light pass; a row deleted (or,
+    // under excludeInactive, invalidated) between the two passes simply drops out.
     return ranked
       .map((row) => entriesById.get(row.id))
       .filter((entry): entry is MemoryEntry => entry !== undefined);

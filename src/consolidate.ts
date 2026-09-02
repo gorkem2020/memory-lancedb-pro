@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import type { MemoryEntry } from "./store.js";
 import {
   parseSmartMetadata,
@@ -588,14 +589,47 @@ export async function saveConsolidateSettledLedger(
     for (const fp of newlySettled) merged.set(fp, { fp, at: now });
     current[scope] = [...merged.values()];
     pruneSettledLedger(current, now);
+    await sweepAbandonedLedgerTemps(ledgerPath, now);
     const tmpPath = `${ledgerPath}.tmp-${process.pid}`;
-    await writeFile(tmpPath, JSON.stringify(current, null, 2), "utf-8");
-    await rename(tmpPath, ledgerPath);
+    try {
+      await writeFile(tmpPath, JSON.stringify(current, null, 2), "utf-8");
+      await rename(tmpPath, ledgerPath);
+    } catch (err) {
+      await rm(tmpPath, { force: true }).catch(() => {});
+      throw err;
+    }
   } catch (err) {
     console.warn(`consolidate: could not persist settled ledger: ${String(err)}`);
   } finally {
     if (locked) {
       await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+/**
+ * A writer that died between its temp write and the rename leaves
+ * `<ledger>.tmp-<pid>` behind for good. Swept under the ledger lock; a temp
+ * younger than the lock-stale window may belong to a live writer and is kept.
+ */
+async function sweepAbandonedLedgerTemps(ledgerPath: string, now: number): Promise<void> {
+  const dir = dirname(ledgerPath);
+  const prefix = `${basename(ledgerPath)}.tmp-`;
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const tmpPath = join(dir, name);
+    try {
+      if (now - (await stat(tmpPath)).mtimeMs > SETTLED_LEDGER_LOCK_STALE_MS) {
+        await rm(tmpPath, { force: true });
+      }
+    } catch {
+      // raced with its owner or already gone
     }
   }
 }
@@ -932,8 +966,8 @@ export interface RunConsolidateOptions {
    */
   scanLimit?: number;
   /**
-   * Fingerprints of clusters settled by previous runs (skip/contradict
-   * verdicts and shield-blocked verdicts). Matching clusters are dropped
+   * Fingerprints of clusters settled by previous runs (skip verdicts and
+   * shield-blocked verdicts; a contradiction never settles). Matching clusters are dropped
    * before the cost gate and never reach the decider, so repeated runs
    * converge to zero clusters. A fingerprint covers each member's exact
    * metadata, so any member change re-opens its cluster automatically.
@@ -986,7 +1020,11 @@ export interface RunConsolidateResult {
   undecidedCallFailed: number;
   /** Clusters dropped before the decider because a previous run already settled them. */
   settledSkipped: number;
-  /** Fingerprints newly settled by this run (skip/contradict/shield-blocked outcomes). */
+  /**
+   * Fingerprints this run JUDGED settled (skip and shield-blocked outcomes).
+   * Reported for every run; callers persist them only after a commit
+   * (`executed` is true), so a dry-run never mutates the settled ledger.
+   */
   newlySettled: string[];
   apply: boolean;
 }

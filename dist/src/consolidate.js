@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { parseSmartMetadata, buildSmartMetadata, stringifySmartMetadata, appendRelation, deriveFactKey, isMemoryActiveAt, } from "./smart-metadata.js";
 import { APPEND_ONLY_CATEGORIES } from "./memory-categories.js";
 import { buildConsolidateBatchPrompt, buildConsolidateBatchMergePrompt, } from "./extraction-prompts.js";
@@ -479,9 +480,16 @@ export async function saveConsolidateSettledLedger(ledgerPath, scope, newlySettl
             merged.set(fp, { fp, at: now });
         current[scope] = [...merged.values()];
         pruneSettledLedger(current, now);
+        await sweepAbandonedLedgerTemps(ledgerPath, now);
         const tmpPath = `${ledgerPath}.tmp-${process.pid}`;
-        await writeFile(tmpPath, JSON.stringify(current, null, 2), "utf-8");
-        await rename(tmpPath, ledgerPath);
+        try {
+            await writeFile(tmpPath, JSON.stringify(current, null, 2), "utf-8");
+            await rename(tmpPath, ledgerPath);
+        }
+        catch (err) {
+            await rm(tmpPath, { force: true }).catch(() => { });
+            throw err;
+        }
     }
     catch (err) {
         console.warn(`consolidate: could not persist settled ledger: ${String(err)}`);
@@ -489,6 +497,35 @@ export async function saveConsolidateSettledLedger(ledgerPath, scope, newlySettl
     finally {
         if (locked) {
             await rm(lockPath, { recursive: true, force: true }).catch(() => { });
+        }
+    }
+}
+/**
+ * A writer that died between its temp write and the rename leaves
+ * `<ledger>.tmp-<pid>` behind for good. Swept under the ledger lock; a temp
+ * younger than the lock-stale window may belong to a live writer and is kept.
+ */
+async function sweepAbandonedLedgerTemps(ledgerPath, now) {
+    const dir = dirname(ledgerPath);
+    const prefix = `${basename(ledgerPath)}.tmp-`;
+    let names;
+    try {
+        names = await readdir(dir);
+    }
+    catch {
+        return;
+    }
+    for (const name of names) {
+        if (!name.startsWith(prefix))
+            continue;
+        const tmpPath = join(dir, name);
+        try {
+            if (now - (await stat(tmpPath)).mtimeMs > SETTLED_LEDGER_LOCK_STALE_MS) {
+                await rm(tmpPath, { force: true });
+            }
+        }
+        catch {
+            // raced with its owner or already gone
         }
     }
 }

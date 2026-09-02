@@ -2489,8 +2489,8 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
     .requiredOption("--agent <agentId>", "Agent whose memory to consolidate (scope agent:<agentId>; journal-mirror writes route to this agent's workspace)")
     .option("--category <category>", "Limit to one smart category (profile|preferences|entities|events|cases|patterns)")
     .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
-    .option("--apply", "Apply the consolidation plan immediately (default is a dry-run preview with an interactive apply prompt)", false)
-    .option("--yes", "Skip the LLM-cost confirmation prompt (required for non-interactive/automated runs)", false)
+    .option("--apply", "Apply the consolidation plan immediately and record settled clusters (default is a dry-run preview with an interactive apply prompt; a dry-run never writes the store or the settled ledger)", false)
+    .option("--yes", "Skip the LLM-cost confirmation prompt. Automation needs BOTH --yes and --apply: without --apply a non-interactive run pays for a plan it can never apply", false)
     .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
     .option("--scan-limit <n>", `Maximum rows to scan before clustering (default ${DEFAULT_SCAN_LIMIT}; clustering is O(n^2), raise deliberately)`)
     .action(async (options: {
@@ -2588,13 +2588,13 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
           const declined = (result.abortReason ?? "").includes("cost gate declined");
           if (declined) {
             console.log(`consolidate: cancelled at the cost gate — no LLM calls were made.`);
-            console.log(`Pass --yes to skip this prompt (e.g. for automation).`);
+            console.log(`Pass --yes to skip this prompt (automation: --yes together with --apply).`);
           } else {
             console.error(`consolidate: aborted -- ${result.abortReason}`);
             if (result.costPreview) {
               console.error(formatConsolidateCostPreview(result.costPreview));
             }
-            console.error(`Pass --yes to skip this prompt (e.g. for automation), or re-run interactively and type YES.`);
+            console.error(`Pass --yes to skip this prompt (automation: --yes together with --apply), or re-run interactively and type YES.`);
           }
           process.exit(1);
         }
@@ -2623,7 +2623,10 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
           console.log(`\n${pluralCount(result.staleSkipped.length, "cluster")} skipped: changed since the plan was built (stale).`);
         }
 
-        if (result.status === "completed" && settledLedgerPath) {
+        // Settlement is durable state, so only a run that COMMITTED (--apply,
+        // or an interactive YES) writes it. A dry-run that judged a cluster
+        // "skip" must not hide that cluster from every later preview and apply.
+        if (result.status === "completed" && result.executed && settledLedgerPath) {
           await saveConsolidateSettledLedger(settledLedgerPath, scope, result.newlySettled);
         }
 
@@ -2634,6 +2637,9 @@ function registerConsolidateCommand(memory: Command, context: CLIContext) {
         if (!result.executed) {
           if (!options.apply) {
             console.log(`\nNo changes applied.`);
+          }
+          if (result.newlySettled.length > 0) {
+            console.log(`${pluralCount(result.newlySettled.length, "skip verdict")} not recorded as settled: a dry-run never writes the settled ledger. Rerun with --apply to commit them so later runs skip these clusters.`);
           }
           return;
         }
