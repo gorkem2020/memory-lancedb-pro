@@ -455,7 +455,7 @@ export class SmartExtractor {
             return stats;
         }
         // Step 1: LLM extraction
-        const extraction = await this.extractCandidates(conversationText, policyMode, options.conversationTurns, options.protectedPrefixTurns, options.contextWindowActive, options.captureAssistantActive);
+        const extraction = await this.extractCandidates(conversationText, policyMode, options.conversationTurns, options.protectedPrefixTurns);
         let candidates = extraction.candidates;
         // Echo guard: candidates near-identical to a recent manual
         // memory_store/memory_update text are echoes of a row that already
@@ -1276,11 +1276,9 @@ export class SmartExtractor {
     /**
      * Call LLM to extract candidate memories from conversation text.
      */
-    async extractCandidates(conversationText, policyMode = "full", conversationTurns, protectedPrefixTurns, contextWindowActive, captureAssistantActive) {
+    async extractCandidates(conversationText, policyMode = "full", conversationTurns, protectedPrefixTurns) {
         const maxChars = this.config.extractMaxChars ?? 8000;
         const user = this.config.user ?? "User";
-        const windowActive = contextWindowActive ?? this.config.contextWindowEnabled === true;
-        const assistantEligibleActive = captureAssistantActive ?? this.config.captureAssistantEligible === true;
         // Strip platform envelope metadata injected by OpenClaw channels
         // (e.g. "System: [2026-03-18 14:21:36 GMT+8] Feishu[default] DM | ou_...")
         // These pollute extraction if treated as conversation content. Callers
@@ -1315,7 +1313,7 @@ export class SmartExtractor {
         // over-budget case does not render the whole delta a second time.
         const { transcript, fullLength, protectedPrefixKept } = buildBoundedTranscriptWithStats(turns, maxChars, {
             protectedPrefixTurns: protectedKeptTurns,
-            assistantContextOnly: windowActive && !assistantEligibleActive,
+            assistantContextOnly: this.config.contextWindowEnabled === true && this.config.captureAssistantEligible !== true,
         });
         if (transcript.length < fullLength) {
             this.debugLog(`memory-lancedb-pro: smart-extractor: transcript bounded to extractMaxChars=${maxChars} (${fullLength - transcript.length} of ${fullLength} rendered chars dropped)`);
@@ -1331,8 +1329,8 @@ export class SmartExtractor {
             return { status: "empty_input", candidates: [] };
         }
         const { system, user: userPrompt } = buildExtractionPrompt(transcript, user, {
-            assistantEligible: assistantEligibleActive,
-            contextWindow: windowActive,
+            assistantEligible: this.config.captureAssistantEligible === true,
+            contextWindow: this.config.contextWindowEnabled === true,
         });
         const extractCall = await completeJsonWithTransientRetry({
             llm: this.llm,

@@ -10,7 +10,7 @@ import { loadLanceDB } from "./src/store.js";
 import { resolveOpenClawStateDir } from "./src/openclaw-paths.js";
 import { createRetriever } from "./src/retriever.js";
 import { createMemoryUpgrader, isCurrentReflectionMemory } from "./src/memory-upgrader.js";
-import { runConsolidate, formatConsolidateCostPreview, formatConsolidatePlanForDisplay, pluralCount } from "./src/consolidate.js";
+import { runConsolidate, formatConsolidateCostPreview, formatConsolidatePlanForDisplay, pluralCount, DEFAULT_SCAN_LIMIT, loadConsolidateSettledLedger, saveConsolidateSettledLedger } from "./src/consolidate.js";
 import { getDefaultOauthModelForProvider, getOAuthProviderLabel, isOauthModelSupported, listOAuthProviders, normalizeOauthModel, normalizeOAuthProviderId, performOAuthLogin, } from "./src/llm-oauth.js";
 // ============================================================================
 // Utility Functions
@@ -2100,28 +2100,6 @@ export function createConsolidateConfirm(streams) {
     };
 }
 /** Item 8: renders the full plan (verdict, member ids, survivor, exact merge content) for user review before the apply prompt. */
-async function loadConsolidateSettledLedger(ledgerPath) {
-    try {
-        const raw = await readFile(ledgerPath, "utf-8");
-        const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === "object" ? parsed : {};
-    }
-    catch {
-        return {};
-    }
-}
-async function saveConsolidateSettledLedger(ledgerPath, ledger, scope, newlySettled) {
-    if (newlySettled.length === 0)
-        return;
-    try {
-        const merged = new Set([...(ledger[scope] ?? []), ...newlySettled]);
-        ledger[scope] = [...merged];
-        await writeFile(ledgerPath, JSON.stringify(ledger, null, 2), "utf-8");
-    }
-    catch (err) {
-        console.warn(`consolidate: could not persist settled ledger: ${String(err)}`);
-    }
-}
 function registerConsolidateCommand(memory, context) {
     memory
         .command("consolidate")
@@ -2129,9 +2107,10 @@ function registerConsolidateCommand(memory, context) {
         .requiredOption("--agent <agentId>", "Agent whose memory to consolidate (scope agent:<agentId>; journal-mirror writes route to this agent's workspace)")
         .option("--category <category>", "Limit to one smart category (profile|preferences|entities|events|cases|patterns)")
         .option("--since <iso>", "Only consider rows stored at or after this ISO timestamp")
-        .option("--apply", "Apply the consolidation plan immediately (default is a dry-run preview with an interactive apply prompt)", false)
-        .option("--yes", "Skip the LLM-cost confirmation prompt (required for non-interactive/automated runs)", false)
+        .option("--apply", "Apply the consolidation plan immediately and record settled clusters (default is a dry-run preview with an interactive apply prompt; a dry-run never writes the store or the settled ledger); exits with status 1 when any cluster failed or was only partially applied", false)
+        .option("--yes", "Skip the LLM-cost confirmation prompt. Automation needs BOTH --yes and --apply: without --apply a non-interactive run pays for a plan it can never apply", false)
         .option("--include-reflection-slices", "Include reflection writer-2 slice rows in the scan (excluded by default)", false)
+        .option("--scan-limit <n>", `Maximum rows to scan before clustering (default ${DEFAULT_SCAN_LIMIT}; clustering is O(n^2), raise deliberately)`)
         .action(async (options) => {
         try {
             if (!context.llmClient) {
@@ -2153,6 +2132,14 @@ function registerConsolidateCommand(memory, context) {
                 }
                 sinceMs = parsed;
             }
+            let scanLimit;
+            if (options.scanLimit !== undefined) {
+                scanLimit = Number.parseInt(options.scanLimit, 10);
+                if (!Number.isInteger(scanLimit) || scanLimit < 1) {
+                    console.error(`consolidate: invalid --scan-limit "${options.scanLimit}" (positive integer required)`);
+                    process.exit(1);
+                }
+            }
             const mdMirror = context.mdMirror;
             const confirm = createConsolidateConfirm();
             const scope = `agent:${options.agent}`;
@@ -2161,7 +2148,10 @@ function registerConsolidateCommand(memory, context) {
                 : undefined;
             const settledLedger = settledLedgerPath ? await loadConsolidateSettledLedger(settledLedgerPath) : {};
             const result = await runConsolidate({
-                fetchRows: (scopeFilter, maxTimestamp, limit) => context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit),
+                fetchRows: (scopeFilter, maxTimestamp, limit) => 
+                // Live-only is this feature's explicit choice, not a store-wide
+                // default: consolidate must never cluster already-dead rows.
+                context.store.fetchForCompaction(maxTimestamp, scopeFilter, limit, { excludeInactive: true }),
                 update: (id, patch, scopeFilter) => context.store.update(id, patch, scopeFilter),
                 getById: (id, scopeFilter) => context.store.getById(id, scopeFilter),
                 embed: (text) => embedder.embedPassage(text),
@@ -2189,20 +2179,21 @@ function registerConsolidateCommand(memory, context) {
                 includeReflectionSlices: options.includeReflectionSlices,
                 apply: options.apply === true,
                 autoConfirm: options.yes === true,
-                settledFingerprints: new Set(settledLedger[scope] ?? []),
+                settledFingerprints: new Set((settledLedger[scope] ?? []).map((e) => e.fp)),
+                scanLimit,
             });
             if (result.status === "aborted") {
                 const declined = (result.abortReason ?? "").includes("cost gate declined");
                 if (declined) {
                     console.log(`consolidate: cancelled at the cost gate — no LLM calls were made.`);
-                    console.log(`Pass --yes to skip this prompt (e.g. for automation).`);
+                    console.log(`Pass --yes to skip this prompt (automation: --yes together with --apply).`);
                 }
                 else {
                     console.error(`consolidate: aborted -- ${result.abortReason}`);
                     if (result.costPreview) {
                         console.error(formatConsolidateCostPreview(result.costPreview));
                     }
-                    console.error(`Pass --yes to skip this prompt (e.g. for automation), or re-run interactively and type YES.`);
+                    console.error(`Pass --yes to skip this prompt (automation: --yes together with --apply), or re-run interactively and type YES.`);
                 }
                 process.exit(1);
             }
@@ -2230,12 +2221,21 @@ function registerConsolidateCommand(memory, context) {
             if (result.staleSkipped.length > 0) {
                 console.log(`\n${pluralCount(result.staleSkipped.length, "cluster")} skipped: changed since the plan was built (stale).`);
             }
-            if (result.status === "completed" && settledLedgerPath) {
-                await saveConsolidateSettledLedger(settledLedgerPath, settledLedger, scope, result.newlySettled);
+            // Settlement is durable state, so only a run that COMMITTED (--apply,
+            // or an interactive YES) writes it. A dry-run that judged a cluster
+            // "skip" must not hide that cluster from every later preview and apply.
+            if (result.status === "completed" && result.executed && settledLedgerPath) {
+                await saveConsolidateSettledLedger(settledLedgerPath, scope, result.newlySettled);
+            }
+            if (result.scanTruncated) {
+                console.log(`\nNote: the scan stopped at the row limit; rerun with a higher --scan-limit to cover the whole scope.`);
             }
             if (!result.executed) {
                 if (!options.apply) {
                     console.log(`\nNo changes applied.`);
+                }
+                if (result.newlySettled.length > 0) {
+                    console.log(`${pluralCount(result.newlySettled.length, "skip verdict")} not recorded as settled: a dry-run never writes the settled ledger. Rerun with --apply to commit them so later runs skip these clusters.`);
                 }
                 return;
             }
@@ -2244,7 +2244,26 @@ function registerConsolidateCommand(memory, context) {
                 failureNotes.push(`${pluralCount(result.skippedMalformed, "cluster")} skipped due to malformed verdicts`);
             if (result.undecidedCallFailed > 0)
                 failureNotes.push(`${pluralCount(result.undecidedCallFailed, "cluster")} undecided because the decide call failed`);
+            const partial = result.applied.filter((a) => a.partialFailures?.length);
+            if (partial.length > 0)
+                failureNotes.push(`${pluralCount(partial.length, "cluster")} PARTIALLY applied (failed rows stay active; rerun retries them)`);
+            if (result.applyFailed.length > 0)
+                failureNotes.push(`${pluralCount(result.applyFailed.length, "cluster")} FAILED to apply (nothing written; rerun retries them)`);
             console.log(`\nApplied ${pluralCount(result.applied.length, "action")}${failureNotes.length ? "; " + failureNotes.join("; ") : ""}.`);
+            for (const cluster of partial) {
+                for (const failure of cluster.partialFailures) {
+                    console.log(`  partial: ${failure.step} ${failure.id.slice(0, 8)} — ${failure.error}`);
+                }
+            }
+            for (const failed of result.applyFailed) {
+                console.log(`  failed: cluster of ${pluralCount(failed.memberIds.length, "row")} (${failed.action}) — ${failed.error}`);
+            }
+            if (partial.length > 0 || result.applyFailed.length > 0) {
+                // An incomplete apply must not look like success to cron, CI, or scripts:
+                // exit non-zero, but via exitCode so the report above is fully flushed.
+                console.error(`consolidate: apply incomplete (${pluralCount(partial.length, "cluster")} partially applied, ${pluralCount(result.applyFailed.length, "cluster")} failed); exiting with status 1.`);
+                process.exitCode = 1;
+            }
         }
         catch (error) {
             console.error("consolidate failed:", error);
