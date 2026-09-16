@@ -175,6 +175,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/cli-metadata-registration.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/extraction-transient-retry.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/autocapture-terminal-flush-retry.test.mjs", args: ["--test"] },
+  { group: "core-regression", runner: "node", file: "test/memory-runtime-provenance-classification.test.mjs", args: ["--test"] },
 ];
 
 export function getEntriesForGroup(group) {
